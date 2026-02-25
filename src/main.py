@@ -1,19 +1,18 @@
 # Necessary libraries for the pipeline. Ensure these are installed before running the scripts.
 # !pip install catboost folktables scikit-learn pandas numpy mlxtend
 
-
 import os
 import warnings
 import pandas as pd
 from pathlib import Path
 from sklearn.model_selection import train_test_split
+
 import create_dataset
 import feature_importance
 import data_mining
 
 os.environ['PYTHONWARNINGS'] = 'ignore'
 warnings.filterwarnings("ignore")
-
 
 def main():
     # Set up paths for both local and Colab environments
@@ -62,12 +61,21 @@ def main():
     else:
         print(f"Transactions already exist at {transactions_file}")
 
-    print("\n--- Data Mining & Fairness Audit ---")
+    print("\n--- Data Mining & Fairness Audit ---\n")
     
+    # 1. Microscopic Data Mining (Label=Value)
+    print("[1/3] Microscopic Analysis (Label=Value)")
     miner = data_mining.InteractionMiner(min_support=0.01, min_confidence=0.1)
     miner.execute(transactions_file, results_dir)
 
+    # 2. Macroscopic Data Mining (Quantitative & Weighted Label Multiplicity)
+    print("[2/3] Macroscopic Analysis (Label:Count)")
+    macro_miner = data_mining.MacroscopicMiner(min_support=0.01, min_confidence=0.1, min_w_support=0.005)
+    macro_miner.execute(transactions_file, results_dir)
+
+    # 3. Audits and Visualizations
     if rules_file.exists():
+        print("[3/3] Fairness & Bias Audit")
         sens_features = ['SEX', 'RAC1P']
 
         # Direct bias audit
@@ -82,7 +90,7 @@ def main():
         if not fairness_report.empty:
             fairness_report = fairness_report.sort_values(by='Conf_Difference', ascending=False)
             fairness_report.to_csv(results_dir / "fairness_audit_results.csv", index=False)
-            print("Fairness audit report saved.")
+            print("    - Fairness audit report saved.")
             
             data_mining.FairnessVisualizer.plot_bias_barchart(fairness_report, results_dir, top_n=10)
 
@@ -92,7 +100,7 @@ def main():
         
         if not proxy_report.empty:
             proxy_report.to_csv(results_dir / "proxy_variables_detected.csv", index=False)
-            print("Proxy variables report saved.")
+            print("    - Proxy variables report saved.")
 
     print("\nPipeline execution completed successfully.")
 
