@@ -32,18 +32,23 @@ if __name__ == "__main__":
     print("Starting the ML Explainability & Fairness Pipeline...")
     total_start_time = time.time()
     
-    current_dir = Path.cwd()
-    data_dir = current_dir / "data"
+    data_dir = Path(__file__).resolve().parent.parent / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
+    results_dir = Path(__file__).resolve().parent.parent / "results"
+    results_dir.mkdir(parents=True, exist_ok=True)
+    if not data_dir.exists(): 
+        data_dir = Path("/content/data")  # Fallback for Colab
+    if not results_dir.exists(): 
+        results_dir = Path("/content/results")  # Fallback for Colab
     
     # 1. Dataset Generation and Preprocessing
-    run_script("create_dataset.py")
+    run_script("src/create_dataset.py")
     
     # 2. Model Training and Counterfactual Extraction
-    run_script("feature_importance.py")
+    run_script("src/feature_importance.py")
     
     # 3. Association Rules Mining and Bias Auditing
-    run_script("data_mining.py")
+    run_script("src/data_mining.py")
     
     total_time = time.time() - total_start_time
     print(f"\n{'='*50}")

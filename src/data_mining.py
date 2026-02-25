@@ -270,37 +270,47 @@ class FairnessVisualizer:
         print(f"Plot saved to {plot_path}")
 
 if __name__ == "__main__":
-    current_dir = Path.cwd()
-    data_dir = current_dir / "data"
+    # Detect the environment (Local vs Colab)
+    if Path("/content").exists():
+        data_dir = Path("/content/data")
+        results_dir = Path("/content/results")
+    else:
+        base_dir = Path(__file__).resolve().parent.parent
+        data_dir = base_dir / "data"
+        results_dir = base_dir / "results"
+
+    # Ensure that the folders always exist
+    data_dir.mkdir(parents=True, exist_ok=True)
+    results_dir.mkdir(parents=True, exist_ok=True)
     
-    transactions_file = data_dir / "transactions_values.csv"
-    rules_file = data_dir / "microscopic_level_association_rules.csv"
-    original_data = data_dir / "ACSIncome_NY_2018_categorized.csv"
+    transactions_file = results_dir / "transactions_values.csv"
+    rules_file = results_dir / "microscopic_level_association_rules.csv"
+    categorized_data = data_dir / "ACSIncome_NY_2018_categorized.csv" 
 
     if transactions_file.exists():
-        InteractionMiner(min_support=0.01, min_confidence=0.1).execute(transactions_file, data_dir)
+        InteractionMiner(min_support=0.01, min_confidence=0.1).execute(transactions_file, results_dir)
 
     if rules_file.exists():
         auditor_sens = SensitiveAuditMiner(sensitive_features=['SEX', 'RAC1P'])
         if auditor_sens.load_rules(rules_file): 
-            auditor_sens.run_audit(data_dir)
+            auditor_sens.run_audit(results_dir)
 
-    if rules_file.exists() and original_data.exists():
+    if rules_file.exists() and categorized_data.exists():
         # Passing multiple features to compute worst-case disparity across both Race and Sex
         auditor_fair = FairnessAuditor(sensitive_features=['SEX', 'RAC1P'])
-        fairness_report = auditor_fair.audit_rules(rules_file, original_data)
+        fairness_report = auditor_fair.audit_rules(rules_file, categorized_data)
         fairness_report = fairness_report.sort_values(by='Conf_Difference', ascending=False)
         
-        output_fairness_file = data_dir / "fairness_audit_results.csv"
+        output_fairness_file = results_dir / "fairness_audit_results.csv"
         fairness_report.to_csv(output_fairness_file, index=False)
         print("Fairness audit completed.")
 
         proxy_detector = SensitiveProxyDetector(sensitive_features=['SEX', 'RAC1P'])
-        proxy_report = proxy_detector.detect_proxies(rules_file, original_data, lift_threshold=1.5)
+        proxy_report = proxy_detector.detect_proxies(rules_file, categorized_data, lift_threshold=1.5)
         
         if not proxy_report.empty:
-            proxy_report.to_csv(data_dir / "proxy_variables_detected.csv", index=False)
+            proxy_report.to_csv(results_dir / "proxy_variables_detected.csv", index=False)
             print("Proxy detection completed.")
 
         if not fairness_report.empty:
-            FairnessVisualizer.plot_bias_barchart(fairness_report, data_dir, top_n=10)
+            FairnessVisualizer.plot_bias_barchart(fairness_report, results_dir, top_n=10)

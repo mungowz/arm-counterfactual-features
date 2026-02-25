@@ -79,12 +79,19 @@ def categorize_dataset(input_path, output_path):
 
 
 if __name__ == "__main__":
-    current_dir = Path.cwd()
-    data_dir = current_dir / "data"
+    # Detect the environment (Local vs Colab) and set paths accordingly
+    if Path("/content").exists():
+        data_dir = Path("/content/data")
+    else:
+        data_dir = Path(__file__).resolve().parent.parent / "data"
+
+    # Ensure data directory exists    
     data_dir.mkdir(parents=True, exist_ok=True)
 
+    # Define paths for raw and categorized datasets
     raw_csv = data_dir / "ACSIncome_NY_2018_clean.csv"
     cat_csv = data_dir / "ACSIncome_NY_2018_categorized.csv"
+    
 
     if not raw_csv.exists():
         create_ny_2018_dataset().to_csv(raw_csv, index=False)

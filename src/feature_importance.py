@@ -88,10 +88,21 @@ class CategoricalBoCSoR:
 
 
 if __name__ == "__main__":
-    current_dir = Path.cwd()
-    data_dir = current_dir / "data"
-    if not data_dir.exists(): 
+    # Detect the environment (Local vs Colab) and set paths accordingly
+    if Path("/content").exists():
         data_dir = Path("/content/data")
+        results_dir = Path("/content/results")
+    else:
+        base_dir = Path(__file__).resolve().parent.parent
+        data_dir = base_dir / "data"
+        results_dir = base_dir / "results"
+
+    # Ensure directories exist
+    data_dir.mkdir(parents=True, exist_ok=True)
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    df = pd.read_csv(data_dir / "ACSIncome_NY_2018_categorized.csv")
+    X, y = df.drop(columns=['target']), df['target']
 
     df = pd.read_csv(data_dir / "ACSIncome_NY_2018_categorized.csv")
     X, y = df.drop(columns=['target']), df['target']
@@ -102,6 +113,6 @@ if __name__ == "__main__":
     explainer = CategoricalBoCSoR().fit(X_tr, y_tr)
     transactions = explainer.explain(X_te, y_te)
 
-    output_path = data_dir / "transactions_values.csv"
+    output_path = results_dir / "transactions_values.csv"
     transactions.to_csv(output_path, index=False)
     print(f"Counterfactual transactions extracted and saved to {output_path}")
