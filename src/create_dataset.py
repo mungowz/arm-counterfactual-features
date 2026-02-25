@@ -18,45 +18,34 @@ OCCP_MAP = {
 }
 
 POBP_MAP = {
-    '36': 'New-York', '34': 'New-Jersey', '42': 'Pennsylvania', '06': 'California',
-    '12': 'Florida', '25': 'Massachusetts', '303': 'Mexico', '207': 'China',
-    '210': 'India', '329': 'Dominican-Republic', '332': 'Haiti', '333': 'Jamaica',
-    '109': 'Philippines', '233': 'Italy', '22': 'Louisiana-Maine'
+    '36': 'New-York', '34': 'New-Jersey', '42': 'Pennsylvania', '9': 'Connecticut',
+    '25': 'Massachusetts', '12': 'Florida', '6': 'California', '48': 'Texas',
+    '72': 'PlaceCode_72', '313': 'PlaceCode_313', '303': 'PlaceCode_303', '1': 'PlaceCode_1'
 }
 
 
-def create_ny_2018_dataset():
-    """ Downloads the raw 2018 Person data for NY using folktables. """
-    print("Downloading ACS NY 2018 data via Folktables...")
-    data_source = ACSDataSource(survey_year='2018', horizon='1-Year', survey='person')
-    acs_data = data_source.get_data(states=["NY"], download=True)
-
-    features, label, group = ACSIncome.df_to_numpy(acs_data)
-    df = pd.DataFrame(features, columns=ACSIncome.features)
-    df['target'] = label
+def create_ny_2018_dataset(state="NY", year="2018"):
+    """ Downloads the ACS dataset via Folktables and returns it as a DataFrame. """
+    print("  > Downloading ACS dataset via Folktables...")
+    print(f"    - Fetching data for {year} 1-Year person survey for {state}...")
+    
+    data_source = ACSDataSource(survey_year=year, horizon='1-Year', survey='person')
+    acs_data = data_source.get_data(states=[state], download=True)
+    features, labels, _ = ACSIncome.df_to_pandas(acs_data)
+    
+    df = features.copy()
+    df['target'] = labels
     return df
 
 
 def categorize_dataset(input_path, output_path):
-    """ Converts numerical codes to strings and bins continuous variables. """
-    print(f"Categorizing dataset from {input_path}...")
+    """ Cleans and categorizes continuous features into discrete bins. """
+    print(f"  > Categorizing dataset from {Path(input_path).name}...")
     df = pd.read_csv(input_path)
 
-    # Cast high-cardinality features to string to use the dictionaries
-    df['OCCP'] = df['OCCP'].fillna(0).astype(int).astype(str)
-    df['POBP'] = df['POBP'].fillna(0).astype(int).astype(str)
-
-    df['OCCP'] = df['OCCP'].map(lambda x: OCCP_MAP.get(x, f"OccCode_{x}"))
-    df['POBP'] = df['POBP'].map(lambda x: POBP_MAP.get(x, f"PlaceCode_{x}"))
-
-    # Map standard socioeconomic features
-    df['COW'] = df['COW'].map({1.0:'Private-profit', 2.0:'Private-non-profit', 3.0:'Local-gov',
-                               4.0:'State-gov', 5.0:'Federal-gov', 6.0:'Self-employed-inc',
-                               7.0:'Self-employed-not-inc'}).fillna('Other')
-    df['MAR'] = df['MAR'].map({1.0:'Married', 2.0:'Widowed', 3.0:'Divorced', 4.0:'Separated', 5.0:'Never-married'}).fillna('Other')
-    df['SEX'] = df['SEX'].map({1.0: 'Male', 2.0: 'Female'})
-    df['RAC1P'] = df['RAC1P'].map({1.0:'White', 2.0:'Black', 6.0:'Asian'}).fillna('Other-Race')
-
+    # Applying manual mappings for specific categorical features
+    df['OCCP'] = df['OCCP'].astype(str).map(OCCP_MAP).fillna('Other-Occupation')
+    df['POBP'] = df['POBP'].astype(str).map(POBP_MAP).fillna('Other-Place')
 
     # Binning continuous variables so FP-growth can process them later
     def map_schl(x):
@@ -75,7 +64,7 @@ def categorize_dataset(input_path, output_path):
     df['target'] = df['target'].map({False: '<=50k', True: '>50k'})
 
     df.to_csv(output_path, index=False)
-    print(f"Categorized dataset saved to: {output_path}")
+    print(f"    - Categorized dataset saved to: {Path(output_path).name}\n")
 
 
 if __name__ == "__main__":
@@ -83,17 +72,24 @@ if __name__ == "__main__":
     if Path("/content").exists():
         data_dir = Path("/content/data")
     else:
-        data_dir = Path(__file__).resolve().parent.parent / "data"
+        base_dir = Path(__file__).resolve().parent.parent
+        data_dir = base_dir / "data"
 
-    # Ensure data directory exists    
     data_dir.mkdir(parents=True, exist_ok=True)
-
-    # Define paths for raw and categorized datasets
+    
     raw_csv = data_dir / "ACSIncome_NY_2018_clean.csv"
     cat_csv = data_dir / "ACSIncome_NY_2018_categorized.csv"
-    
 
+    print("\n--- Standalone Data Preparation ---\n")
     if not raw_csv.exists():
-        create_ny_2018_dataset().to_csv(raw_csv, index=False)
+        df_raw = create_ny_2018_dataset()
+        df_raw.to_csv(raw_csv, index=False)
+    else:
+        print(f"  > Raw dataset already exists at {raw_csv.name}")
 
-    categorize_dataset(raw_csv, cat_csv)
+    if not cat_csv.exists():
+        categorize_dataset(raw_csv, cat_csv)
+    else:
+        print(f"  > Categorized dataset already exists at {cat_csv.name}\n")
+        
+    print("Standalone execution completed successfully.")
