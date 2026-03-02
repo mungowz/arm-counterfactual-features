@@ -21,7 +21,7 @@ class CategoricalBoCSoR:
         self.trees = {}
 
     def fit(self, X, y):
-        print("Training CatBoost and building BallTrees...")
+        print("  > Training CatBoost and building BallTrees...")
         self.feature_names = X.columns.tolist()
         
         # Encode target and features to int for CatBoost and Hamming distance
@@ -32,76 +32,96 @@ class CategoricalBoCSoR:
 
         # Train model specifying all features are categorical
         self.model = CatBoostClassifier(iterations=100, depth=6, learning_rate=0.1, verbose=0, allow_writing_files=False)
-        self.model.fit(X_train, y_train, cat_features=list(range(X_train.shape[1])))
+        self.model.fit(X_train, y_train, cat_features=list(range(X_enc.shape[1])), eval_set=(X_val, y_val))
 
-        # Build a separate tree for each class to quickly find opposite-class neighbors
-        for cls in np.unique(y_enc):
-            self.trees[cls] = BallTree(X_train[y_train == cls], metric='hamming')
-
-        self.X_train_encoded = X_train
-        self.y_train_encoded = y_train
-        return self
+        # Build a separate BallTree for each target class using Hamming distance
+        for label in np.unique(y_enc):
+            idx = np.where(y_train == label)[0]
+            self.trees[label] = BallTree(X_train[idx], metric='hamming')
+            
+        self.X_train_enc = X_train
+        self.y_train_enc = y_train
 
     def explain(self, X_test, y_test):
-        print("Extracting 1-sparse counterfactuals near the decision boundary...")
-        X_enc = self.feature_encoder.transform(X_test).astype(int)
-        y_enc = self.label_encoder.transform(y_test)
-
-        # Compute distance to the closest counterfactual to identify boundary samples
-        dists = []
-        for i in range(len(X_enc)):
-            target_cls = 1 - y_enc[i]
-            d, _ = self.trees[target_cls].query(X_enc[i].reshape(1,-1), k=1)
-            dists.append(d[0][0])
-
-        # Filter instances based on the percentile threshold
-        threshold = np.percentile(dists, self.perc_threshold)
-        boundary_idx = [i for i, d in enumerate(dists) if d <= threshold]
-
-        results = {}
-        for idx in boundary_idx:
-            sample = X_enc[idx].copy()
-            orig_label = y_enc[idx]
-            target_cls = 1 - orig_label
-
-            # Get k neighbors from the target class
-            _, n_idx = self.trees[target_cls].query(sample.reshape(1,-1), k=self.k_neighbors)
-            candidates = self.X_train_encoded[self.y_train_encoded == target_cls][n_idx[0]]
-
-            results[idx] = set()
-            for cand in candidates:
-                diff_feats = np.where(sample != cand)[0]
+        print("  > Extracting 1-sparse counterfactuals near the decision boundary...")
+        X_test_enc = self.feature_encoder.transform(X_test)
+        y_test_enc = self.label_encoder.transform(y_test)
+        
+        results = {i: set() for i in range(len(X_test_enc))}
+        
+        for label in np.unique(y_test_enc):
+            idx = np.where(y_test_enc == label)[0]
+            if len(idx) == 0: continue
+            
+            # Query the tree for the opposite class
+            opp_label = 1 - label
+            tree = self.trees.get(opp_label)
+            if tree is None: continue
+            
+            # Retrieve the k nearest neighbors from the opposite class
+            dist, ind = tree.query(X_test_enc[idx], k=self.k_neighbors)
+            
+            for i, sample_idx in enumerate(idx):
+                orig_sample = X_test_enc[sample_idx]
+                neighbors_idx = ind[i]
+                neighbors = self.X_train_enc[np.where(self.y_train_enc == opp_label)[0][neighbors_idx]]
                 
-                # Test single feature swaps to see if they cross the boundary
-                for f_idx in diff_feats:
-                    test_sample = sample.copy()
-                    test_sample[f_idx] = cand[f_idx]
+                # Compute distances to neighbors
+                dists = np.sum(neighbors != orig_sample, axis=1)
+                min_dist = np.min(dists)
+                
+                # 1-sparse extraction: we only care about counterfactuals that differ by exactly 1 feature
+                if min_dist != 1: continue 
+                
+                closest = neighbors[dists == min_dist]
+                
+                for cand in closest:
+                    diff_mask = cand != orig_sample
+                    f_idx = np.where(diff_mask)[0][0]
                     
-                    if self.model.predict(test_sample.reshape(1,-1))[0] != orig_label:
-                        # Revert the integer code to the original string label
-                        val_str = self.feature_encoder.categories_[f_idx][cand[f_idx]]
-                        results[idx].add(f"{self.feature_names[f_idx]}={val_str}")
+                    # Use inverse transform to get the original categorical value
+                    val_str = self.feature_encoder.categories_[f_idx][cand[f_idx]]
+                    results[sample_idx].add(f"{self.feature_names[f_idx]}={val_str}")
 
         # Format output as a list of itemsets for FP-growth
         rows = [{'Sample_ID': k, 'Counterfactual_Values': list(v)} for k, v in results.items() if v]
+        print("    - Extraction completed successfully.\n")
         return pd.DataFrame(rows)
 
 
 if __name__ == "__main__":
-    current_dir = Path.cwd()
-    data_dir = current_dir / "data"
-    if not data_dir.exists(): 
+    # Detect the environment (Local vs Colab) and set paths accordingly
+    if Path("/content").exists():
         data_dir = Path("/content/data")
+        results_dir = Path("/content/results")
+    else:
+        base_dir = Path(__file__).resolve().parent.parent
+        data_dir = base_dir / "data"
+        results_dir = base_dir / "results"
 
-    df = pd.read_csv(data_dir / "ACSIncome_NY_2018_categorized.csv")
-    X, y = df.drop(columns=['target']), df['target']
+    # Ensure directories exist
+    data_dir.mkdir(parents=True, exist_ok=True)
+    results_dir.mkdir(parents=True, exist_ok=True)
 
-    # Using standard split, the model is evaluated on unseen data
-    X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+    print("\n--- Standalone Counterfactual Extraction ---\n")
 
-    explainer = CategoricalBoCSoR().fit(X_tr, y_tr)
-    transactions = explainer.explain(X_te, y_te)
+    data_path = data_dir / "ACSIncome_NY_2018_categorized.csv"
+    out_path = results_dir / "transactions_values.csv"
 
-    output_path = data_dir / "transactions_values.csv"
-    transactions.to_csv(output_path, index=False)
-    print(f"Counterfactual transactions extracted and saved to {output_path}")
+    if not data_path.exists():
+        print(f"  > Error: Required dataset not found at {data_path.name}")
+    else:
+        df = pd.read_csv(data_path)
+        X, y = df.drop(columns=['target']), df['target']
+
+        # Using standard split, the model is evaluated on unseen data
+        X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+        
+        explainer = CategoricalBoCSoR(k_neighbors=10, perc_threshold=10)
+        explainer.fit(X_tr, y_tr)
+        transactions = explainer.explain(X_te, y_te)
+        
+        transactions.to_csv(out_path, index=False)
+        print(f"  > Counterfactual transactions saved to {out_path.name}\n")
+    
+    print("Standalone execution completed successfully.")

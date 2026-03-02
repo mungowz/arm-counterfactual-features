@@ -7,6 +7,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import textwrap
 from pathlib import Path
+from collections import Counter
+from itertools import combinations
 from mlxtend.preprocessing import TransactionEncoder
 from mlxtend.frequent_patterns import fpgrowth, association_rules
 
@@ -16,14 +18,14 @@ warnings.filterwarnings("ignore")
 logging.getLogger('jupyter_client').setLevel(logging.ERROR)
 
 class InteractionMiner:
-    """ Mines association rules from the extracted counterfactual transactions. """
+    """ Mines association rules from the extracted counterfactual transactions (Microscopic Level). """
     def __init__(self, min_support=0.01, min_confidence=0.1):
         self.min_support = min_support
         self.min_confidence = min_confidence
         self.te = TransactionEncoder()
 
     def execute(self, filepath, output_dir):
-        print(f"Mining frequent itemsets from {filepath}...")
+        print(f"  > Mining frequent itemsets from {Path(filepath).name}...")
         df = pd.read_csv(filepath)
         df['Counterfactual_Values'] = df['Counterfactual_Values'].apply(ast.literal_eval)
         
@@ -35,22 +37,103 @@ class InteractionMiner:
         freq_itemsets = fpgrowth(df_enc, min_support=self.min_support, use_colnames=True)
         rules = association_rules(freq_itemsets, metric="confidence", min_threshold=self.min_confidence)
 
-        '''
-        if not rules.empty:
-            # Filter out rules where antecedent and consequent belong to the same base feature
-            def is_cross_feature(row):
-                ant_feats = set(i.split('=')[0] for i in row['antecedents'])
-                con_feats = set(i.split('=')[0] for i in row['consequents'])
-                return len(ant_feats.intersection(con_feats)) == 0
-
-            rules = rules[rules.apply(is_cross_feature, axis=1)]
-            rules = rules.sort_values(by='lift', ascending=False)
-        '''
-            
         freq_itemsets.to_csv(output_dir / "frequent_values.csv", index=False)
         if not rules.empty:
             rules.to_csv(output_dir / "microscopic_level_association_rules.csv", index=False)
-        print("Rule mining completed.")
+        print("  > Microscopic rule mining completed.\n")
+
+
+class MacroscopicMiner:
+    """ Mines association rules focusing on feature labels and their multiplicity (Macroscopic Level). """
+    def __init__(self, min_support=0.01, min_confidence=0.1, min_w_support=0.005):
+        self.min_support = min_support
+        self.min_confidence = min_confidence
+        self.min_w_support = min_w_support
+        self.te = TransactionEncoder()
+
+    def execute(self, filepath, output_dir):
+        print(f"  > Mining macroscopic itemsets from {Path(filepath).name}...")
+        df = pd.read_csv(filepath)
+        
+        def parse_to_counts(row_str):
+            try:
+                items = ast.literal_eval(row_str)
+                labels = [item.split('=')[0] for item in items]
+                return Counter(labels)
+            except Exception:
+                return Counter()
+
+        transactions_counts = df['Counterfactual_Values'].apply(parse_to_counts).tolist()
+
+        # --- 1. Quantitative Analysis (Cumulative Logic) ---
+        print("    - Executing quantitative analysis (FP-Growth)...")
+        transactions_cumulative = []
+        for counts in transactions_counts:
+            expanded = []
+            for label, count in counts.items():
+                for i in range(1, count + 1):
+                    expanded.append(f"{label}:{i}")
+            transactions_cumulative.append(expanded)
+
+        te_ary = self.te.fit(transactions_cumulative).transform(transactions_cumulative)
+        df_encoded = pd.DataFrame(te_ary, columns=self.te.columns_)
+
+        freq_itemsets = fpgrowth(df_encoded, min_support=self.min_support, use_colnames=True)
+
+        # Filter out redundant quantitative rules (e.g., OCCP:2 -> OCCP:1)
+        def is_valid_itemset(itemset):
+            base_labels = [item.split(':')[0] for item in itemset]
+            return len(set(base_labels)) == len(base_labels)
+
+        freq_itemsets = freq_itemsets[freq_itemsets['itemsets'].apply(is_valid_itemset)]
+        quant_rules = association_rules(freq_itemsets, metric="confidence", min_threshold=self.min_confidence)
+        
+        if not quant_rules.empty:
+            quant_rules = quant_rules.sort_values(by='lift', ascending=False)
+            quant_rules['antecedents'] = quant_rules['antecedents'].apply(lambda x: ', '.join(list(x)))
+            quant_rules['consequents'] = quant_rules['consequents'].apply(lambda x: ', '.join(list(x)))
+            quant_rules.to_csv(output_dir / "macroscopic_quantitative_rules.csv", index=False)
+
+        # --- 2. Weighted Analysis (Global Feature Mass) ---
+        print("    - Executing weighted support analysis...")
+        total_item_mass = {}
+        for counts in transactions_counts:
+            for label, q in counts.items():
+                total_item_mass[label] = total_item_mass.get(label, 0) + q
+
+        total_mass_sum = sum(total_item_mass.values())
+
+        def get_weighted_support(labels_list, trans_counts_list):
+            w_sum = sum(sum(t[l] for l in labels_list) for t in trans_counts_list if all(l in t for l in labels_list))
+            return w_sum / total_mass_sum if total_mass_sum > 0 else 0
+
+        weighted_rules = []
+        for a, b in combinations(total_item_mass.keys(), 2):
+            w_sup_a = total_item_mass[a] / total_mass_sum
+            w_sup_b = total_item_mass[b] / total_mass_sum
+            w_sup_ab = get_weighted_support([a, b], transactions_counts)
+            
+            if w_sup_ab >= self.min_w_support:
+                conf_a_b = w_sup_ab / w_sup_a if w_sup_a > 0 else 0
+                conf_b_a = w_sup_ab / w_sup_b if w_sup_b > 0 else 0
+                
+                if conf_a_b >= self.min_confidence:
+                    weighted_rules.append({
+                        'Antecedent': a, 'Consequent': b, 
+                        'W-Support': w_sup_ab, 'W-Confidence': conf_a_b, 'W-Lift': conf_a_b / w_sup_b if w_sup_b > 0 else 0
+                    })
+                if conf_b_a >= self.min_confidence:
+                    weighted_rules.append({
+                        'Antecedent': b, 'Consequent': a, 
+                        'W-Support': w_sup_ab, 'W-Confidence': conf_b_a, 'W-Lift': conf_b_a / w_sup_a if w_sup_a > 0 else 0
+                    })
+
+        if weighted_rules:
+            weighted_rules_df = pd.DataFrame(weighted_rules).sort_values(by='W-Lift', ascending=False)
+            weighted_rules_df.to_csv(output_dir / "macroscopic_weighted_rules.csv", index=False)
+
+        print("  > Macroscopic rule mining completed.\n")
+
 
 class SensitiveAuditMiner:
     """ Checks if sensitive attributes are explicitly present in the extracted rules. """
@@ -65,7 +148,7 @@ class SensitiveAuditMiner:
         return True
 
     def run_audit(self, output_dir):
-        print(f"Auditing for direct bias (features: {self.sensitive_features})...")
+        print(f"  > Auditing for direct bias (features: {self.sensitive_features})...")
         
         def contains_sensitive(row):
             combined_rule = str(row['antecedents']) + str(row['consequents'])
@@ -76,9 +159,10 @@ class SensitiveAuditMiner:
 
         if not sensitive_subset.empty:
             sensitive_subset.to_csv(output_dir / "sensitive_audit_report.csv", index=False)
-            print("Direct sensitive rules found and saved.")
+            print("    - Direct sensitive rules found and saved.")
         else:
-            print("No direct sensitive rules found.")
+            print("    - No direct sensitive rules found.")
+
 
 class FairnessAuditor:
     """ Computes the worst-case confidence difference across multiple sensitive features. """
@@ -86,7 +170,7 @@ class FairnessAuditor:
         self.sensitive_features = sensitive_features
 
     def audit_rules(self, rules_path, data_path):
-        print(f"Evaluating conditional fairness across {self.sensitive_features} groups...")
+        print(f"  > Evaluating conditional fairness across {self.sensitive_features} groups...")
         df_rules = pd.read_csv(rules_path)
         df_data = pd.read_csv(data_path)
         audit_results = []
@@ -151,13 +235,14 @@ class FairnessAuditor:
 
         return pd.DataFrame(audit_results)
 
+
 class SensitiveProxyDetector:
     """ Identifies if an antecedent acts as a statistical proxy for a sensitive attribute. """
     def __init__(self, sensitive_features=['SEX', 'RAC1P']):
         self.sensitive_features = sensitive_features
 
     def detect_proxies(self, rules_path, data_path, lift_threshold=1.5):
-        print(f"Calculating Proxy Lift for {self.sensitive_features}...")
+        print(f"  > Calculating Proxy Lift for {self.sensitive_features}...")
         df_rules = pd.read_csv(rules_path)
         df_data = pd.read_csv(data_path)
         proxy_results = []
@@ -205,14 +290,15 @@ class SensitiveProxyDetector:
             report_df = report_df.sort_values(by='Proxy_Lift', ascending=False).drop_duplicates()
         return report_df
 
+
 class FairnessVisualizer:
     """ Plots horizontal bar charts visualizing the worst-case confidence disparities. """
     @staticmethod
     def plot_bias_barchart(report_df, output_dir, top_n=10):
-        print("Generating fairness visualizations...")
+        print("  > Generating fairness visualizations...")
 
         if report_df.empty:
-            print("No data available to plot.")
+            print("    - No data available to plot.")
             return
 
         top_rules = report_df.head(top_n).copy()
@@ -267,40 +353,63 @@ class FairnessVisualizer:
         plt.tight_layout()
         plot_path = output_dir / "fairness_bias_barchart.png"
         fig.savefig(plot_path, dpi=300, bbox_inches='tight')
-        print(f"Plot saved to {plot_path}")
+        print(f"    - Plot saved to {Path(plot_path).name}")
 
 if __name__ == "__main__":
-    current_dir = Path.cwd()
-    data_dir = current_dir / "data"
+    # Detect the environment (Local vs Colab)
+    if Path("/content").exists():
+        data_dir = Path("/content/data")
+        results_dir = Path("/content/results")
+    else:
+        base_dir = Path(__file__).resolve().parent.parent
+        data_dir = base_dir / "data"
+        results_dir = base_dir / "results"
+
+    # Ensure that the folders always exist
+    data_dir.mkdir(parents=True, exist_ok=True)
+    results_dir.mkdir(parents=True, exist_ok=True)
     
-    transactions_file = data_dir / "transactions_values.csv"
-    rules_file = data_dir / "microscopic_level_association_rules.csv"
-    original_data = data_dir / "ACSIncome_NY_2018_categorized.csv"
+    transactions_file = results_dir / "transactions_values.csv"
+    rules_file = results_dir / "microscopic_level_association_rules.csv"
+    categorized_data = data_dir / "ACSIncome_NY_2018_categorized.csv" 
+
+    print("\n--- Standalone Data Mining & Fairness Audit ---\n")
 
     if transactions_file.exists():
-        InteractionMiner(min_support=0.01, min_confidence=0.1).execute(transactions_file, data_dir)
+        print("[1/3] Microscopic Analysis (Label=Value)")
+        InteractionMiner(min_support=0.01, min_confidence=0.1).execute(transactions_file, results_dir)
+        
+        print("[2/3] Macroscopic Analysis (Label:Count)")
+        MacroscopicMiner(min_support=0.01, min_confidence=0.1, min_w_support=0.005).execute(transactions_file, results_dir)
+    else:
+        print(f"Error: Required file not found at {transactions_file}")
 
     if rules_file.exists():
-        auditor_sens = SensitiveAuditMiner(sensitive_features=['SEX', 'RAC1P'])
+        print("[3/3] Fairness & Bias Audit")
+        sens_features = ['SEX', 'RAC1P']
+        
+        auditor_sens = SensitiveAuditMiner(sensitive_features=sens_features)
         if auditor_sens.load_rules(rules_file): 
-            auditor_sens.run_audit(data_dir)
+            auditor_sens.run_audit(results_dir)
 
-    if rules_file.exists() and original_data.exists():
-        # Passing multiple features to compute worst-case disparity across both Race and Sex
-        auditor_fair = FairnessAuditor(sensitive_features=['SEX', 'RAC1P'])
-        fairness_report = auditor_fair.audit_rules(rules_file, original_data)
-        fairness_report = fairness_report.sort_values(by='Conf_Difference', ascending=False)
-        
-        output_fairness_file = data_dir / "fairness_audit_results.csv"
-        fairness_report.to_csv(output_fairness_file, index=False)
-        print("Fairness audit completed.")
+        if categorized_data.exists():
+            auditor_fair = FairnessAuditor(sensitive_features=sens_features)
+            fairness_report = auditor_fair.audit_rules(rules_file, categorized_data)
+            
+            if not fairness_report.empty:
+                fairness_report = fairness_report.sort_values(by='Conf_Difference', ascending=False)
+                fairness_report.to_csv(results_dir / "fairness_audit_results.csv", index=False)
+                print("    - Fairness audit report saved.")
+                
+                FairnessVisualizer.plot_bias_barchart(fairness_report, results_dir, top_n=10)
 
-        proxy_detector = SensitiveProxyDetector(sensitive_features=['SEX', 'RAC1P'])
-        proxy_report = proxy_detector.detect_proxies(rules_file, original_data, lift_threshold=1.5)
-        
-        if not proxy_report.empty:
-            proxy_report.to_csv(data_dir / "proxy_variables_detected.csv", index=False)
-            print("Proxy detection completed.")
+            proxy_detector = SensitiveProxyDetector(sensitive_features=sens_features)
+            proxy_report = proxy_detector.detect_proxies(rules_file, categorized_data, lift_threshold=1.5)
+            
+            if not proxy_report.empty:
+                proxy_report.to_csv(results_dir / "proxy_variables_detected.csv", index=False)
+                print("    - Proxy variables report saved.")
+        else:
+            print(f"Error: Required dataset for fairness missing at {categorized_data}")
 
-        if not fairness_report.empty:
-            FairnessVisualizer.plot_bias_barchart(fairness_report, data_dir, top_n=10)
+    print("\nStandalone execution completed successfully.")
