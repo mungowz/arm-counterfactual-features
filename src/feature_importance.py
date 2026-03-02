@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+import re
 from catboost import CatBoostClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import OrdinalEncoder, LabelEncoder
@@ -89,6 +90,30 @@ class CategoricalBoCSoR:
         return pd.DataFrame(rows)
 
 
+def extract_labels(results_dir):
+    """Extract only the labels from counterfactual values and save to CSV."""
+    print("  > Extracting labels from counterfactual values...")
+
+    input_file = results_dir / "transactions_values.csv"
+    output_file = results_dir / "labels_only.csv"
+
+    df = pd.read_csv(input_file)
+
+    labels_list = []
+    for idx, row in df.iterrows():
+        values_str = str(row['Counterfactual_Values'])
+        labels = re.findall(r'([A-Z]\w*)=', values_str)
+        labels_list.append(labels)
+
+    output_df = pd.DataFrame({
+        'Sample_ID': df['Sample_ID'],
+        'Labels': labels_list
+    })
+
+    output_df.to_csv(output_file, index=False)
+    print(f"  > Results saved to {Path(output_file).name}")
+
+
 if __name__ == "__main__":
     # Detect the environment (Local vs Colab) and set paths accordingly
     if Path("/content").exists():
@@ -120,8 +145,10 @@ if __name__ == "__main__":
         explainer = CategoricalBoCSoR(k_neighbors=10, perc_threshold=10)
         explainer.fit(X_tr, y_tr)
         transactions = explainer.explain(X_te, y_te)
-        
+
         transactions.to_csv(out_path, index=False)
         print(f"  > Counterfactual transactions saved to {out_path.name}\n")
+
+        extract_labels(results_dir)
     
     print("Standalone execution completed successfully.")
