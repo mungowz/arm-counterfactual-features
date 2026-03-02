@@ -1,0 +1,47 @@
+{
+  "experiments": [
+    {
+      "name": "Conservative (high thresholds)",
+      "min_support": 0.10,
+      "min_confidence": 0.70,
+      "min_lift": 1.2
+    },
+    {
+      "name": "Moderate (balanced)",
+      "min_support": 0.05,
+      "min_confidence": 0.50,
+      "min_lift": 1.0
+    },
+    {
+      "name": "Liberal (low thresholds)",
+      "min_support": 0.02,
+      "min_confidence": 0.30,
+      "min_lift": 0.8
+    },
+    {
+      "name": "High support focus",
+      "min_support": 0.15,
+      "min_confidence": 0.40,
+      "min_lift": 1.0
+    },
+    {
+      "name": "High confidence focus",
+      "min_support": 0.05,
+      "min_confidence": 0.80,
+      "min_lift": 1.0
+    },
+    {
+      "name": "High lift focus",
+      "min_support": 0.05,
+      "min_confidence": 0.40,
+      "min_lift": 1.5
+    },
+    {
+      "name": "Very low support (find rare)",
+      "min_support": 0.01,
+      "min_confidence": 0.30,
+      "min_lift": 0.9
+    }
+  ]
+}
+
