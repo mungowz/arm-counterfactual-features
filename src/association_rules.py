@@ -198,7 +198,9 @@ if __name__ == "__main__":
 
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    print("\n--- Association Rules Mining (FP-Growth) ---\n")
+    print("\n" + "="*70)
+    print("ASSOCIATION RULES MINING (FP-GROWTH)")
+    print("="*70 + "\n")
 
     labels_csv = results_dir / "labels_only_unique.csv"
 
@@ -231,7 +233,9 @@ if __name__ == "__main__":
                     # Format and display rules
                     formatted_rules = format_rules_output(rules)
 
-                    print("\n--- Top 10 Association Rules ---\n")
+                    print("\n" + "="*70)
+                    print("TOP 10 ASSOCIATION RULES")
+                    print("="*70 + "\n")
                     print(formatted_rules.head(10).to_string(index=False))
 
                     # Export results
@@ -241,4 +245,6 @@ if __name__ == "__main__":
             else:
                 print("  > No frequent itemsets generated")
 
-    print("\nExecution completed successfully.\n")
+    print("\n" + "="*70)
+    print("Execution completed successfully.")
+    print("="*70 + "\n")
