@@ -200,7 +200,7 @@ if __name__ == "__main__":
 
     print("\n--- Association Rules Mining (FP-Growth) ---\n")
 
-    labels_csv = results_dir / "labels_only.csv"
+    labels_csv = results_dir / "labels_only_unique.csv"
 
     if not labels_csv.exists():
         print(f"  > Error: Labels file not found at {labels_csv}")

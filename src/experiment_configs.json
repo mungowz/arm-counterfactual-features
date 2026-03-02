@@ -41,7 +41,240 @@
       "min_support": 0.01,
       "min_confidence": 0.30,
       "min_lift": 0.9
+    },
+    {
+      "name": "Support 0.03",
+      "min_support": 0.03,
+      "min_confidence": 0.50,
+      "min_lift": 1.0
+    },
+    {
+      "name": "Support 0.08",
+      "min_support": 0.08,
+      "min_confidence": 0.50,
+      "min_lift": 1.0
+    },
+    {
+      "name": "Support 0.12",
+      "min_support": 0.12,
+      "min_confidence": 0.50,
+      "min_lift": 1.0
+    },
+    {
+      "name": "Support 0.20",
+      "min_support": 0.20,
+      "min_confidence": 0.50,
+      "min_lift": 1.0
+    },
+    {
+      "name": "Confidence 0.40",
+      "min_support": 0.05,
+      "min_confidence": 0.40,
+      "min_lift": 1.0
+    },
+    {
+      "name": "Confidence 0.60",
+      "min_support": 0.05,
+      "min_confidence": 0.60,
+      "min_lift": 1.0
+    },
+    {
+      "name": "Confidence 0.75",
+      "min_support": 0.05,
+      "min_confidence": 0.75,
+      "min_lift": 1.0
+    },
+    {
+      "name": "Confidence 0.90",
+      "min_support": 0.05,
+      "min_confidence": 0.90,
+      "min_lift": 1.0
+    },
+    {
+      "name": "Lift 0.7",
+      "min_support": 0.05,
+      "min_confidence": 0.50,
+      "min_lift": 0.7
+    },
+    {
+      "name": "Lift 1.2",
+      "min_support": 0.05,
+      "min_confidence": 0.50,
+      "min_lift": 1.2
+    },
+    {
+      "name": "Lift 1.8",
+      "min_support": 0.05,
+      "min_confidence": 0.50,
+      "min_lift": 1.8
+    },
+    {
+      "name": "Lift 2.5",
+      "min_support": 0.05,
+      "min_confidence": 0.50,
+      "min_lift": 2.5
+    },
+    {
+      "name": "Extremely permissive",
+      "min_support": 0.005,
+      "min_confidence": 0.20,
+      "min_lift": 0.5
+    },
+    {
+      "name": "Extremely strict",
+      "min_support": 0.20,
+      "min_confidence": 0.90,
+      "min_lift": 2.0
+    },
+    {
+      "name": "Rare but reliable",
+      "min_support": 0.01,
+      "min_confidence": 0.75,
+      "min_lift": 1.3
+    },
+    {
+      "name": "Frequent but weak",
+      "min_support": 0.18,
+      "min_confidence": 0.35,
+      "min_lift": 0.8
+    },
+    {
+      "name": "Rare and weak",
+      "min_support": 0.01,
+      "min_confidence": 0.25,
+      "min_lift": 0.7
+    },
+    {
+      "name": "Frequent and strong",
+      "min_support": 0.15,
+      "min_confidence": 0.80,
+      "min_lift": 2.0
+    },
+    {
+      "name": "Low support high confidence",
+      "min_support": 0.02,
+      "min_confidence": 0.85,
+      "min_lift": 1.0
+    },
+    {
+      "name": "High support low confidence",
+      "min_support": 0.18,
+      "min_confidence": 0.30,
+      "min_lift": 1.0
+    },
+    {
+      "name": "Low support high lift",
+      "min_support": 0.02,
+      "min_confidence": 0.35,
+      "min_lift": 2.0
+    },
+    {
+      "name": "High support high lift",
+      "min_support": 0.12,
+      "min_confidence": 0.45,
+      "min_lift": 1.8
+    },
+    {
+      "name": "Medium exploration v1",
+      "min_support": 0.04,
+      "min_confidence": 0.55,
+      "min_lift": 1.1
+    },
+    {
+      "name": "Medium exploration v2",
+      "min_support": 0.06,
+      "min_confidence": 0.45,
+      "min_lift": 0.95
+    },
+    {
+      "name": "Medium exploration v3",
+      "min_support": 0.07,
+      "min_confidence": 0.65,
+      "min_lift": 1.25
+    },
+    {
+      "name": "Very strict lift",
+      "min_support": 0.05,
+      "min_confidence": 0.50,
+      "min_lift": 3.0
+    },
+    {
+      "name": "Minimal confidence",
+      "min_support": 0.05,
+      "min_confidence": 0.15,
+      "min_lift": 1.0
+    },
+    {
+      "name": "Minimal support",
+      "min_support": 0.005,
+      "min_confidence": 0.50,
+      "min_lift": 1.0
+    },
+    {
+      "name": "Ultra rare patterns",
+      "min_support": 0.002,
+      "min_confidence": 0.30,
+      "min_lift": 0.8
+    },
+    {
+      "name": "Support 0.06",
+      "min_support": 0.06,
+      "min_confidence": 0.50,
+      "min_lift": 1.0
+    },
+    {
+      "name": "Support 0.09",
+      "min_support": 0.09,
+      "min_confidence": 0.50,
+      "min_lift": 1.0
+    },
+    {
+      "name": "Confidence 0.35",
+      "min_support": 0.05,
+      "min_confidence": 0.35,
+      "min_lift": 1.0
+    },
+    {
+      "name": "Confidence 0.70",
+      "min_support": 0.05,
+      "min_confidence": 0.70,
+      "min_lift": 1.0
+    },
+    {
+      "name": "Lift 0.9",
+      "min_support": 0.05,
+      "min_confidence": 0.50,
+      "min_lift": 0.9
+    },
+    {
+      "name": "Lift 1.4",
+      "min_support": 0.05,
+      "min_confidence": 0.50,
+      "min_lift": 1.4
+    },
+    {
+      "name": "Lift 2.2",
+      "min_support": 0.05,
+      "min_confidence": 0.50,
+      "min_lift": 2.2
+    },
+    {
+      "name": "Support 0.025",
+      "min_support": 0.025,
+      "min_confidence": 0.50,
+      "min_lift": 1.0
+    },
+    {
+      "name": "Support 0.11",
+      "min_support": 0.11,
+      "min_confidence": 0.50,
+      "min_lift": 1.0
+    },
+    {
+      "name": "Support 0.16",
+      "min_support": 0.16,
+      "min_confidence": 0.50,
+      "min_lift": 1.0
     }
   ]
 }
-

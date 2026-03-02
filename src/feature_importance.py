@@ -96,22 +96,43 @@ def extract_labels(results_dir):
 
     input_file = results_dir / "transactions_values.csv"
     output_file = results_dir / "labels_only.csv"
+    output_file_unique = results_dir / "labels_only_unique.csv"
 
     df = pd.read_csv(input_file)
 
     labels_list = []
+    labels_unique_list = []
+
     for idx, row in df.iterrows():
         values_str = str(row['Counterfactual_Values'])
         labels = re.findall(r'([A-Z]\w*)=', values_str)
         labels_list.append(labels)
 
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_labels = []
+        for label in labels:
+            if label not in seen:
+                seen.add(label)
+                unique_labels.append(label)
+        labels_unique_list.append(unique_labels)
+
+    # Save labels with duplicates
     output_df = pd.DataFrame({
         'Sample_ID': df['Sample_ID'],
         'Labels': labels_list
     })
-
     output_df.to_csv(output_file, index=False)
-    print(f"  > Results saved to {Path(output_file).name}")
+    print(f"  > Labels (with duplicates) saved to {Path(output_file).name}")
+
+    # Save labels without duplicates
+    output_df_unique = pd.DataFrame({
+        'Sample_ID': df['Sample_ID'],
+        'Labels': labels_unique_list
+    })
+    output_df_unique.to_csv(output_file_unique, index=False)
+    print(f"  > Labels (unique only) saved to {Path(output_file_unique).name}")
+
 
 
 if __name__ == "__main__":
