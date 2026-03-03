@@ -171,27 +171,29 @@ def extract_labels(results_dir):
     print(f"    - Labels (unique only) saved to {Path(output_file_unique).name}")
 
 
-
 if __name__ == "__main__":
     # Detect the environment (Local vs Colab) and set paths accordingly
     if Path("/content").exists():
         data_dir = Path("/content/data")
         results_dir = Path("/content/results")
+        important_features_dir = Path("/content/results/important_features")
     else:
         base_dir = Path(__file__).resolve().parent.parent
         data_dir = base_dir / "data"
         results_dir = base_dir / "results"
+        important_features_dir = results_dir / "important_features"
 
     # Ensure directories exist
     data_dir.mkdir(parents=True, exist_ok=True)
     results_dir.mkdir(parents=True, exist_ok=True)
+    important_features_dir.mkdir(parents=True, exist_ok=True)
 
     print("\n" + "="*70)
     print("COUNTERFACTUAL EXTRACTION FOR FEATURE IMPORTANCE")
     print("="*70 + "\n")
 
     data_path = data_dir / "ACSIncome_NY_2018_categorized.csv"
-    out_path = results_dir / "transactions_values.csv"
+    out_path = important_features_dir / "transactions_values.csv"
 
     if not data_path.exists():
         print(f"  > Error: Required dataset not found at {data_path.name}")
@@ -215,7 +217,7 @@ if __name__ == "__main__":
         print(f"  > Counterfactual transactions saved to {out_path.name}\n")
 
         # Extract labels from counterfactuals
-        extract_labels(results_dir)
+        extract_labels(important_features_dir)
 
     print("="*70)
     print("Execution completed successfully.")
