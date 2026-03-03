@@ -1,4 +1,4 @@
-# Report — FP-Growth Association Rules
+# Parameter Rationale — FP-Growth Association Rules
 
 This document explains the reasoning behind the `min`, `max`, and `delta` values
 chosen for `support`, `confidence`, and `lift` in `explore_association_rules()`,
@@ -108,11 +108,11 @@ lift_min=0.0,  lift_max=7.0,  lift_delta=0.1
 
 The three lift regions and their interpretation:
 
-| Lift value  | Meaning                                                                                 |
-| ----------- | --------------------------------------------------------------------------------------- |
-| `lift < 1`  | Negative correlation — A and B co-occur *less* than by chance (they "avoid" each other) |
-| `lift = 1`  | Statistical independence — knowing A tells us nothing about B                           |
-| `lift > 1`  | Positive correlation — A and B co-occur *more* than by chance                           |
+| Lift value | Meaning                                                                                 |
+| ---------- | --------------------------------------------------------------------------------------- |
+| `lift < 1` | Negative correlation — A and B co-occur *less* than by chance (they "avoid" each other) |
+| `lift = 1` | Statistical independence — knowing A tells us nothing about B                           |
+| `lift > 1` | Positive correlation — A and B co-occur *more* than by chance                           |
 
 **`lift_min = 0.0`**
 The absolute theoretical minimum of lift is 0, which occurs when the antecedent
@@ -274,3 +274,141 @@ same criterion and are never filtered out solely because of their lift value.
 Both directions of a negative-correlation pair are evaluated and the one with
 higher confidence is kept, preserving the full signal about which features tend
 not to co-occur in counterfactual transactions.
+
+---
+
+## K-Variation Experiment
+
+### Why k matters
+
+`k_neighbors` controls how many candidates from the opposite class are considered
+when searching for counterfactuals. A larger k means more neighbors are examined,
+which increases the chances of finding a 1-sparse counterfactual (one that differs
+by exactly one feature) for each test sample. This directly affects the
+`labels_only_unique.csv` that feeds into the association rule mining:
+
+| k small                                                   | k large                                              |
+| --------------------------------------------------------- | ---------------------------------------------------- |
+| Fewer transactions (less chance of finding a 1-sparse CF) | More transactions                                    |
+| Items appear less frequently → lower support values       | Items appear more frequently → higher support values |
+| Sparser co-occurrences → fewer 2-itemsets                 | Denser co-occurrences → more 2-itemsets and rules    |
+
+### How the experiment is structured
+
+`feature_importance.py / run_for_k_values(k_values, ...)` runs the full
+counterfactual extraction pipeline for each k in the list, using the same
+train/test split for all k values (same `random_state=42`) so comparisons
+are fair. Output per k:
+
+```tree
+important_features_dir/
+├── k_3/
+│   ├── transactions_values.csv
+│   ├── labels_only.csv
+│   └── labels_only_unique.csv
+├── k_5/
+│   └── ...
+└── ...
+```
+
+The function returns a dict `{k: path_to_labels_only_unique.csv}` which is
+passed directly to `run_k_comparison()` in `association_rules.py`.
+
+`association_rules.py / run_k_comparison(k_labels_map, ...)` runs
+`explore_association_rules()` for each k under `output_dir/k_{k}/`, then
+aggregates results in `output_dir/k_comparison/`:
+
+```tree
+association_rules/
+├── k_3/          ← full exploration output for k=3
+├── k_5/
+├── ...
+└── k_comparison/
+    ├── k_comparison_summary.csv
+    ├── k_comparison_summary.txt
+    ├── heatmap_k_support.png      x=support,    y=k
+    ├── heatmap_k_confidence.png   x=confidence, y=k
+    └── heatmap_k_lift.png         x=lift,       y=k
+```
+
+### Why parameters must be recalibrated for each k
+
+The three parameters that depend on item frequencies change with k and must
+not be kept fixed across experiments:
+
+`sup_min` — the pairwise floor `P(rarest) × P(second_rarest)` changes because
+item frequencies shift when more or fewer transactions are extracted.
+
+`sup_max` — the threshold above which only length-1 itemsets survive depends
+on the co-occurrence density, which grows with k.
+
+`lift_max` — the theoretical ceiling `1 / support(rarest_item)` changes
+directly with the rarest item's frequency.
+
+`calibrate_parameters(encoded_df)` in `association_rules.py` recomputes all
+three automatically from the actual item frequencies of each k's dataset.
+`conf_min/max/delta` and the neutral window are never auto-tuned since they
+cover the full `[0, 1]` range by definition and are independent of k.
+
+---
+
+## Binning Corrections — create_dataset.py
+
+### AGEP
+
+The `ACSIncome` task in folktables automatically filters to `AGEP >= 16`
+(working-age population only). The original lower bin boundary of 0 included
+ages 0–15 which are never present in the filtered dataset. Corrected to 15
+so the first bin effectively starts at 16:
+
+```python
+# before
+bins=[0,  29, 44, 59, 150]
+# after
+bins=[15, 29, 44, 59, 150]
+```
+
+### WKHP
+
+The original thresholds did not match standard labor definitions. The BLS
+defines part-time as fewer than 35 hours per week, and the FLSA standard
+full-time workweek is 40 hours. The previous bins placed 30–34h in
+"Full-Time" and called 40–49h "Overtime" despite 40h being the standard:
+
+```python
+# before — misaligned with BLS/FLSA definitions
+bins=[-1, 29, 39, 49, 150]   # Part-Time 0-29, Full-Time 30-39, Overtime 40-49
+
+# after — aligned with BLS (< 35h = part-time) and FLSA (40h standard)
+bins=[-1, 34, 40, 49, 150]   # Part-Time 0-34, Full-Time 35-40, Overtime 41-49
+```
+
+| Label      | Before    | After     | Standard          |
+|------------|-----------|-----------|-------------------|
+| Part-Time  | 0–29 h    | 0–34 h    | BLS: < 35 h       |
+| Full-Time  | 30–39 h   | 35–40 h   | FLSA: 40 h/week   |
+| Overtime   | 40–49 h   | 41–49 h   | Beyond FLSA std.  |
+| Intensive  | 50+ h     | 50+ h     | unchanged         |
+
+---
+
+## Pipeline Orchestration — main.py
+
+`main.py` runs all three steps in sequence by importing functions directly
+from the sibling scripts. Each script remains fully executable standalone
+via its own `__main__` block — `main.py` only adds the orchestration layer.
+
+```tree
+main.py
+ ├── STEP 1  create_dataset.py
+ │           create_ny_2018_dataset() + categorize_dataset()
+ ├── STEP 2  feature_importance.py
+ │           run_for_k_values([1,3,5,7,9,11,13,15,17,19])
+ │           → k_labels_map {k: path_to_labels_only_unique.csv}
+ └── STEP 3  association_rules.py
+             run_k_comparison(k_labels_map, auto_calibrate=True)
+             → k_{k}/ per-k exploration + k_comparison/ cross-k summary
+```
+
+The train/test split in `run_for_k_values` uses `random_state=42` and is
+performed once before the k loop, so all k values see the same data.

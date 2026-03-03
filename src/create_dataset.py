@@ -3,8 +3,8 @@ import numpy as np
 from pathlib import Path
 from folktables import ACSDataSource, ACSIncome
 
-# Manual mapping dictionaries based on ACS 2018 documentation.
-# Hardcoding these to avoid API changes breaking the pipeline.
+# ACS PUMS code mappings — taken manually from the 2018 data dictionary
+# hardcoding these because the folktables API doesn't expose them directly
 OCCP_MAP = {
     '10': 'Chief-Executives', '20': 'General-Operations-Managers', '120': 'Financial-Managers',
     '440': 'Other-Operations-Managers', '800': 'Accountants', '710': 'Management-Analysts',
@@ -25,18 +25,8 @@ POBP_MAP = {
 
 
 def create_ny_2018_dataset(state="NY", year="2018"):
-    """
-    Download ACS dataset via Folktables and return as DataFrame.
-
-    Args:
-        state: State code (default "NY")
-        year: Survey year (default "2018")
-
-    Returns:
-        DataFrame with ACS features and target variable
-    """
-    print("  > Downloading ACS dataset via Folktables...")
-    print(f"    - Fetching data for {year} 1-Year person survey for {state}...")
+    """Download ACS data via folktables and return it as a DataFrame with the target column."""
+    print(f"  > Downloading ACS {year} 1-Year survey for {state}...")
 
     data_source = ACSDataSource(survey_year=year, horizon='1-Year', survey='person')
     acs_data = data_source.get_data(states=[state], download=True)
@@ -49,23 +39,17 @@ def create_ny_2018_dataset(state="NY", year="2018"):
 
 def categorize_dataset(input_path, output_path):
     """
-    Clean and categorize continuous features into discrete bins.
-
-    Args:
-        input_path: Path to raw dataset CSV
-        output_path: Path to save categorized dataset
-
-    Returns:
-        None (saves result to CSV)
+    Convert continuous/coded columns into readable categorical bins.
+    Needed because FP-Growth works on discrete items, not raw numbers.
     """
-    print(f"  > Categorizing dataset from {Path(input_path).name}...")
+    print(f"  > Categorizing {Path(input_path).name}...")
     df = pd.read_csv(input_path)
 
-    # Apply manual mappings for specific categorical features
+    # map occupation and place-of-birth codes to readable strings
     df['OCCP'] = df['OCCP'].astype(str).map(OCCP_MAP).fillna('Other-Occupation')
     df['POBP'] = df['POBP'].astype(str).map(POBP_MAP).fillna('Other-Place')
 
-    # Bin continuous variables for FP-growth compatibility
+    # SCHL: education level codes from the ACS codebook
     def map_schl(x):
         if x <= 15:
             return 'No-HS-Diploma'
@@ -78,21 +62,25 @@ def categorize_dataset(input_path, output_path):
         return 'Some-College-Vocational'
 
     df['SCHL'] = df['SCHL'].apply(map_schl)
-    df['AGEP'] = pd.cut(df['AGEP'], bins=[0, 29, 44, 59, 150], labels=['Young-Adults', 'Adults', 'Middle-Aged', 'Seniors'])
-    df['WKHP'] = pd.cut(df['WKHP'], bins=[-1, 29, 39, 49, 150], labels=['Part-Time', 'Full-Time', 'Overtime', 'Intensive'])
 
-    # Clean up and encode target
+    # AGEP: ACSIncome filters to 16+ so the lower bound starts at 15
+    df['AGEP'] = pd.cut(df['AGEP'], bins=[15, 29, 44, 59, 150],
+                        labels=['Young-Adults', 'Adults', 'Middle-Aged', 'Seniors'])
+
+    # WKHP: BLS defines part-time as <35h, FLSA standard full-time is 40h/week
+    df['WKHP'] = pd.cut(df['WKHP'], bins=[-1, 34, 40, 49, 150],
+                        labels=['Part-Time', 'Full-Time', 'Overtime', 'Intensive'])
+
+    # drop the group column folktables sometimes adds, encode target as strings
     if 'group' in df.columns:
         df.drop(columns=['group'], inplace=True)
     df['target'] = df['target'].map({False: '<=50k', True: '>50k'})
 
     df.to_csv(output_path, index=False)
-    print(f"    - Categorized dataset saved to: {Path(output_path).name}")
-
+    print(f"    - saved to {Path(output_path).name}")
 
 
 if __name__ == "__main__":
-    # Detect the environment (Local vs Colab) and set paths accordingly
     if Path("/content").exists():
         data_dir = Path("/content/data")
     else:
@@ -109,20 +97,18 @@ if __name__ == "__main__":
     cat_csv = data_dir / "ACSIncome_NY_2018_categorized.csv"
 
     if not raw_csv.exists():
-        print("  > Creating raw dataset...")
         df_raw = create_ny_2018_dataset()
         df_raw.to_csv(raw_csv, index=False)
-        print(f"    - Raw dataset saved to: {raw_csv.name}\n")
+        print(f"  > Raw dataset saved to {raw_csv.name}\n")
     else:
-        print(f"  > Raw dataset already exists at {raw_csv.name}\n")
+        print(f"  > Raw dataset already exists ({raw_csv.name}), skipping download.\n")
 
     if not cat_csv.exists():
-        print("  > Creating categorized dataset...")
         categorize_dataset(raw_csv, cat_csv)
         print()
     else:
-        print(f"  > Categorized dataset already exists at {cat_csv.name}\n")
+        print(f"  > Categorized dataset already exists ({cat_csv.name}), skipping.\n")
 
     print("="*70)
-    print("Data preparation completed successfully.")
+    print("Done.")
     print("="*70 + "\n")
