@@ -30,7 +30,7 @@ which serve as the anchors for every parameter decision below.
 
 The support of an itemset is the fraction of transactions that contain it.
 
-```pseudocode
+```psuedocode
 sup_min=0.02,  sup_max=0.50,  sup_delta=0.02
 ```
 
@@ -108,11 +108,11 @@ lift_min=0.0,  lift_max=7.0,  lift_delta=0.1
 
 The three lift regions and their interpretation:
 
-| Lift value | Meaning                                                                                 |
-| ---------- | --------------------------------------------------------------------------------------- |
-| `lift < 1` | Negative correlation — A and B co-occur *less* than by chance (they "avoid" each other) |
-| `lift = 1` | Statistical independence — knowing A tells us nothing about B                           |
-| `lift > 1` | Positive correlation — A and B co-occur *more* than by chance                           |
+| Lift value  | Meaning                                                                                 |
+| ----------- | --------------------------------------------------------------------------------------- |
+| `lift < 1`  | Negative correlation — A and B co-occur *less* than by chance (they "avoid" each other) |
+| `lift = 1`  | Statistical independence — knowing A tells us nothing about B                           |
+| `lift > 1`  | Positive correlation — A and B co-occur *more* than by chance                           |
 
 **`lift_min = 0.0`**
 The absolute theoretical minimum of lift is 0, which occurs when the antecedent
@@ -128,7 +128,7 @@ discarding part of the negative-correlation region without justification.
 The theoretical maximum lift for a rule involving the rarest item (SEX, support =
 0.1383) is:
 
-```pseudocode
+```pseudoce
 lift_max_theoretical = 1 / support(SEX) = 1 / 0.1383 ≈ 7.23
 ```
 
@@ -300,7 +300,7 @@ counterfactual extraction pipeline for each k in the list, using the same
 train/test split for all k values (same `random_state=42`) so comparisons
 are fair. Output per k:
 
-```tree
+```pseudocode
 important_features_dir/
 ├── k_3/
 │   ├── transactions_values.csv
@@ -398,7 +398,7 @@ bins=[-1, 34, 40, 49, 150]   # Part-Time 0-34, Full-Time 35-40, Overtime 41-49
 from the sibling scripts. Each script remains fully executable standalone
 via its own `__main__` block — `main.py` only adds the orchestration layer.
 
-```tree
+```pseudocode
 main.py
  ├── STEP 1  create_dataset.py
  │           create_ny_2018_dataset() + categorize_dataset()
@@ -412,3 +412,54 @@ main.py
 
 The train/test split in `run_for_k_values` uses `random_state=42` and is
 performed once before the k loop, so all k values see the same data.
+
+---
+
+## Empirical Results — K-Variation Experiment (ACSIncome NY 2018)
+
+Run on 20,605 test samples (80/20 split, `random_state=42`). All k values
+produced exactly 6,025 transactions — the number of samples with at least
+one 1-sparse counterfactual does not change with k (the 1-sparsity constraint
+is strict), but the *content* of each transaction grows with k as more
+neighbors are examined.
+
+### Calibrated parameters per k
+
+| k  | sup_max | lift_max | lift ceiling (raw) | combos w/ rules |
+|----|---------|----------|--------------------|-----------------|
+| 1  | —       | —        | —                  | skipped (sparse)|
+| 3  | 0.08    | 10.0     | 17.41              | 90              |
+| 5  | 0.10    | 10.0     | 10.97              | 208             |
+| 7  | 0.14    | 8.5      | 8.16               | 895             |
+| 9  | 0.16    | 7.5      | 7.06               | 2,020           |
+| 11 | 0.18    | 6.5      | 6.25               | 3,058           |
+| 13 | 0.20    | 6.0      | 5.83               | 3,806           |
+| 15 | 0.20    | 5.5      | 5.50               | 3,880           |
+| 17 | 0.22    | 5.5      | 5.23               | 4,404           |
+| 19 | 0.22    | 5.5      | 5.08               | 4,711           |
+
+### Key observations
+
+**k=1 is always skipped.** With only one neighbor candidate per sample, the
+probability that it is 1-sparse is low enough that the resulting transactions
+contain no co-occurrences above any support threshold. `calibrate_parameters`
+detects this (sup_max == sup_min after the scan) and returns `None`.
+
+**sup_max grows monotonically with k.** More neighbors → denser transactions
+→ feature pairs co-occur more frequently → 2-itemsets survive at higher
+support thresholds. Grows from 0.08 (k=3) to 0.22 (k=17,19).
+
+**lift_max decreases with k.** As k grows, even the rarest item (SEX) appears
+more often: support goes from 0.024 (k=1) to 0.197 (k=19), pushing the
+theoretical lift ceiling from 41 down to ~5. From k=13 onward lift_max
+stabilises at 5.5–6.0.
+
+**Rule count grows rapidly up to k≈13, then flattens.** The jump from k=9
+(2,020) to k=11 (3,058) to k=13 (3,806) is large; k=15→17→19 show
+diminishing returns (+74, +524, +307). This suggests k=13–15 is a reasonable
+sweet spot for this dataset if runtime is a concern.
+
+**Item support ordering is stable from k=7 onward:**
+SEX < MAR < AGEP ≈ RAC1P < RELP ≈ COW < WKHP < SCHL.
+This means the relative importance of features in the counterfactual
+transactions is consistent across higher k values.
