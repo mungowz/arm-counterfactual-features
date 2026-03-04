@@ -18,7 +18,7 @@ if __name__ == "__main__":
     data_dir = base_dir / "data"
     results_dir = base_dir / "results"
     important_features_dir = results_dir / "important_features"
-    ar_output_dir = important_features_dir / "association_rules"
+    ar_output_dir = results_dir / "association_rules"
 
     for d in [data_dir, results_dir, important_features_dir, ar_output_dir]:
         d.mkdir(parents=True, exist_ok=True)
