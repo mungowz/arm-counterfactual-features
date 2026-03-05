@@ -30,7 +30,7 @@ which serve as the anchors for every parameter decision below.
 
 The support of an itemset is the fraction of transactions that contain it.
 
-```psuedocode
+```
 sup_min=0.02,  sup_max=0.50,  sup_delta=0.02
 ```
 
@@ -38,7 +38,7 @@ sup_min=0.02,  sup_max=0.50,  sup_delta=0.02
 The rarest item is SEX at 13.83%. For a 2-item rule involving the two rarest
 items (SEX and MAR), the expected joint support under statistical independence is:
 
-```pseudocode
+```
 P(SEX) × P(MAR) = 0.1383 × 0.1652 ≈ 0.023
 ```
 
@@ -67,7 +67,7 @@ corresponds to a difference of roughly 61 transactions.
 The confidence of a rule `A → B` is the fraction of transactions containing `A`
 that also contain `B`, i.e. `P(B | A)`.
 
-```pseudocode
+```
 conf_min=0.10,  conf_max=1.00,  conf_delta=0.05
 ```
 
@@ -98,21 +98,21 @@ justify a finer resolution.
 The lift of a rule `A → B` measures how much more (or less) often `A` and `B`
 co-occur compared to what would be expected if they were statistically independent:
 
-```pseudocode
+```
 lift(A → B) = P(A ∪ B) / (P(A) × P(B))
 ```
 
-```pseudocode
+```
 lift_min=0.0,  lift_max=7.0,  lift_delta=0.1
 ```
 
 The three lift regions and their interpretation:
 
-| Lift value  | Meaning                                                                                 |
-| ----------- | --------------------------------------------------------------------------------------- |
-| `lift < 1`  | Negative correlation — A and B co-occur *less* than by chance (they "avoid" each other) |
-| `lift = 1`  | Statistical independence — knowing A tells us nothing about B                           |
-| `lift > 1`  | Positive correlation — A and B co-occur *more* than by chance                           |
+| Lift value  | Meaning |
+|-------------|---------|
+| `lift < 1`  | Negative correlation — A and B co-occur *less* than by chance (they "avoid" each other). |
+| `lift = 1`  | Statistical independence — knowing A tells us nothing about B. |
+| `lift > 1`  | Positive correlation — A and B co-occur *more* than by chance. |
 
 **`lift_min = 0.0`**
 The absolute theoretical minimum of lift is 0, which occurs when the antecedent
@@ -128,7 +128,7 @@ discarding part of the negative-correlation region without justification.
 The theoretical maximum lift for a rule involving the rarest item (SEX, support =
 0.1383) is:
 
-```pseudoce
+```
 lift_max_theoretical = 1 / support(SEX) = 1 / 0.1383 ≈ 7.23
 ```
 
@@ -147,7 +147,7 @@ variance at this dataset size.
 
 ## Neutral Lift Window Filter
 
-```pseudocode
+```
 lift_neutral_half_window=0.25  →  excluded window: [0.75, 1.25]
 ```
 
@@ -158,7 +158,7 @@ without contributing insight.
 
 The window is parameterised as a half-width around 1, so:
 
-```pseudocode
+```
 excluded: lift ∈ [1 - half_window, 1 + half_window] = [0.75, 1.25]
 retained: lift < 0.75  (meaningful negative correlation)
           lift > 1.25  (meaningful positive correlation)
@@ -227,11 +227,11 @@ summary = explore_association_rules(
 After the exploration and cleanup, `plot_heatmaps()` generates three PNG files
 saved under `output_dir/heatmaps/`:
 
-| File                             | Axes                        | Aggregation                          |
-| -------------------------------- | --------------------------- | ------------------------------------ |
-| `heatmap_support_confidence.png` | x = support, y = confidence | max rules over all lift thresholds   |
+| File | Axes | Aggregation |
+|------|------|-------------|
+| `heatmap_support_confidence.png` | x = support, y = confidence | max rules over all lift thresholds |
 | `heatmap_support_lift.png`       | x = support, y = lift       | max rules over all confidence values |
-| `heatmap_confidence_lift.png`    | x = confidence, y = lift    | max rules over all support values    |
+| `heatmap_confidence_lift.png`    | x = confidence, y = lift    | max rules over all support values |
 
 Each cell shows the **maximum** `Number_of_Rules` achievable for that 2D combination,
 regardless of the third parameter. This aggregation choice answers the question
@@ -254,7 +254,7 @@ before saving each `rules.csv` / `rules_detailed.csv`.
 For any pair of items A and B, the lift is mathematically identical in both
 directions:
 
-```pseudocode
+```
 lift(A → B) = P(A ∪ B) / (P(A) · P(B)) = lift(B → A)
 ```
 
@@ -287,11 +287,11 @@ which increases the chances of finding a 1-sparse counterfactual (one that diffe
 by exactly one feature) for each test sample. This directly affects the
 `labels_only_unique.csv` that feeds into the association rule mining:
 
-| k small                                                   | k large                                              |
-| --------------------------------------------------------- | ---------------------------------------------------- |
-| Fewer transactions (less chance of finding a 1-sparse CF) | More transactions                                    |
-| Items appear less frequently → lower support values       | Items appear more frequently → higher support values |
-| Sparser co-occurrences → fewer 2-itemsets                 | Denser co-occurrences → more 2-itemsets and rules    |
+| k small | k large |
+|---------|---------|
+| Fewer transactions (less chance of finding a 1-sparse CF) | More transactions |
+| Items appear less frequently → lower support values | Items appear more frequently → higher support values |
+| Sparser co-occurrences → fewer 2-itemsets | Denser co-occurrences → more 2-itemsets and rules |
 
 ### How the experiment is structured
 
@@ -300,7 +300,7 @@ counterfactual extraction pipeline for each k in the list, using the same
 train/test split for all k values (same `random_state=42`) so comparisons
 are fair. Output per k:
 
-```pseudocode
+```
 important_features_dir/
 ├── k_3/
 │   ├── transactions_values.csv
@@ -318,7 +318,7 @@ passed directly to `run_k_comparison()` in `association_rules.py`.
 `explore_association_rules()` for each k under `output_dir/k_{k}/`, then
 aggregates results in `output_dir/k_comparison/`:
 
-```tree
+```
 association_rules/
 ├── k_3/          ← full exploration output for k=3
 ├── k_5/
@@ -398,7 +398,7 @@ bins=[-1, 34, 40, 49, 150]   # Part-Time 0-34, Full-Time 35-40, Overtime 41-49
 from the sibling scripts. Each script remains fully executable standalone
 via its own `__main__` block — `main.py` only adds the orchestration layer.
 
-```pseudocode
+```
 main.py
  ├── STEP 1  create_dataset.py
  │           create_ny_2018_dataset() + categorize_dataset()
@@ -463,3 +463,71 @@ sweet spot for this dataset if runtime is a concern.
 SEX < MAR < AGEP ≈ RAC1P < RELP ≈ COW < WKHP < SCHL.
 This means the relative importance of features in the counterfactual
 transactions is consistent across higher k values.
+
+---
+
+## Dataset Redesign — Northeast vs South 2018
+
+### Motivation
+
+The original single-state dataset (NY 2018, ~103k samples, ~6k transactions)
+produced support values as low as 0.02, making most rules statistically weak
+and hard to interpret. The redesign addresses this by enlarging the dataset
+and introducing a geographic comparison axis.
+
+### Region composition
+
+Two regions were chosen to maximise socioeconomic contrast while maintaining
+internal coherence (same year, same federal law framework):
+
+| Region    | States                    | Est. employed population | Est. ACS samples |
+|-----------|---------------------------|--------------------------|------------------|
+| Northeast | NY, NJ, CT, MA, PA        | ~24.8M                   | ~500k            |
+| South     | TX, FL, GA, NC, SC        | ~35.1M                   | ~700k            |
+
+The Northeast was chosen for its high-wage, high-education, unionised labour
+market. The South was chosen as the sharpest contrast: lower median wages,
+higher part-time prevalence, right-to-work states, different demographic
+composition on RAC1P and SCHL — the two features most prominent in our rules.
+
+### Balancing
+
+The South dataset is ~1.4x larger than the Northeast. To make support values
+directly comparable across regions, the larger dataset is downsampled to match
+the smaller one using **stratified sampling on the target** (`>50k / <=50k`),
+preserving the class ratio. This is done after categorisation, on the final
+datasets used as input to `run_for_k_values()`.
+
+Estimated final size per region after balancing: **~500k samples**,
+producing approximately **~29k transactions** (assuming the same ~29%
+1-sparse counterfactual rate observed on NY alone).
+
+### Updated thresholds
+
+With ~29k transactions the parameter landscape changes substantially:
+
+| Parameter   | NY only (old) | Northeast/South (new) | Rationale |
+|-------------|---------------|-----------------------|-----------|
+| `sup_min`   | 0.02 (auto)   | ~0.10 (auto)          | 10% = ~2,900 transactions — statistically solid floor |
+| `conf_min`  | 0.10 → 0.30   | 0.50                  | with dense data, rules below 0.50 add noise not signal |
+| `conf_delta`| 0.05          | 0.05                  | unchanged |
+| `lift_neutral_half_window` | 0.25 | 0.25        | unchanged — 25% deviation from independence is still the threshold |
+
+`sup_min` and `sup_max` are still auto-calibrated per k via
+`calibrate_parameters()` — the 0.10 figure is the expected value based
+on the projected transaction count, not a hard-coded input.
+
+### Output structure
+
+```
+results/
+├── northeast/
+│   ├── important_features/   ← transactions + labels per k
+│   └── association_rules/    ← exploration + k_comparison
+└── south/
+    ├── important_features/
+    └── association_rules/
+```
+
+The two regions are processed identically and independently, making
+their `k_comparison_summary.csv` files directly comparable row by row.

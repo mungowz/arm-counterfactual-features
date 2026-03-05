@@ -188,50 +188,35 @@ def run_for_k_values(k_values, data_path, output_base_dir):
 
 
 if __name__ == "__main__":
+    # when run standalone, processes both regions independently
+    # expects the balanced CSVs produced by create_dataset.py to already exist
     if Path("/content").exists():
-        data_dir = Path("/content/data")
-        results_dir = Path("/content/results")
-        important_features_dir = Path("/content/results/important_features")
+        base_dir = Path("/content")
     else:
         base_dir = Path(__file__).resolve().parent.parent
-        data_dir = base_dir / "data"
-        results_dir = base_dir / "results"
-        important_features_dir = results_dir / "important_features"
 
-    data_dir.mkdir(parents=True, exist_ok=True)
-    results_dir.mkdir(parents=True, exist_ok=True)
-    important_features_dir.mkdir(parents=True, exist_ok=True)
+    data_dir = base_dir / "data"
+    results_dir = base_dir / "results"
 
-    data_path = data_dir / "ACSIncome_NY_2018_categorized.csv"
+    regions = {
+        'northeast': data_dir / "ACSIncome_northeast_2018_balanced.csv",
+        'south':     data_dir / "ACSIncome_south_2018_balanced.csv",
+    }
 
-    if not data_path.exists():
-        print(f"  > Error: dataset not found at {data_path.name}")
-    else:
-        # single run with default k=10
+    k_values = [1, 3, 5, 7, 9, 11, 13, 15, 17, 19]
+
+    for region, data_path in regions.items():
+        important_features_dir = results_dir / region / "important_features"
+        important_features_dir.mkdir(parents=True, exist_ok=True)
+
         print("\n" + "="*70)
-        print("COUNTERFACTUAL EXTRACTION FOR FEATURE IMPORTANCE")
+        print(f"COUNTERFACTUAL EXTRACTION — {region.upper()}")
         print("="*70 + "\n")
 
-        out_path = important_features_dir / "transactions_values.csv"
+        if not data_path.exists():
+            print(f"  > Error: {data_path.name} not found — run create_dataset.py first.")
+            continue
 
-        print("  > Loading and splitting dataset...")
-        df = pd.read_csv(data_path)
-        X, y = df.drop(columns=["target"]), df["target"]
-        X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
-        print(f"    - train: {len(X_tr)} samples, test: {len(X_te)} samples\n")
-
-        explainer = CategoricalBoCSoR(k_neighbors=10, perc_threshold=10)
-        explainer.fit(X_tr, y_tr)
-        transactions = explainer.explain(X_te, y_te)
-
-        transactions.to_csv(out_path, index=False)
-        print(f"  > Transactions saved to {out_path.name}\n")
-
-        extract_labels(important_features_dir)
-
-        # k-variation experiment — odd values from 1 to 19
-        # pass k_labels_map to run_k_comparison() in association_rules.py
-        k_values = [1, 3, 5, 7, 9, 11, 13, 15, 17, 19]
         k_labels_map = run_for_k_values(k_values, data_path, important_features_dir)
 
         print("  > k_labels_map ready:")

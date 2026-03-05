@@ -753,49 +753,53 @@ def run_k_comparison(k_labels_map, output_dir,
 
 
 if __name__ == "__main__":
+    # when run standalone, processes both regions independently
+    # expects labels_only_unique.csv files produced by feature_importance.py
     if Path("/content").exists():
         base_dir = Path("/content")
     else:
         base_dir = Path(__file__).resolve().parent.parent
 
-    data_dir = base_dir / "data"
     results_dir = base_dir / "results"
-    important_features_dir = results_dir / "important_features"
-    ar_output_dir = results_dir / "association_rules"
 
-    for d in [data_dir, results_dir, important_features_dir, ar_output_dir]:
-        d.mkdir(parents=True, exist_ok=True)
+    regions = ['northeast', 'south']
+    k_values = [1, 3, 5, 7, 9, 11, 13, 15, 17, 19]
 
-    print("\n" + "="*70)
-    print("MACROSCOPIC EXPERIMENT: ASSOCIATION RULES - FULL EXPLORATION")
-    print("="*70)
+    for region in regions:
+        important_features_dir = results_dir / region / "important_features"
+        ar_output_dir = results_dir / region / "association_rules"
+        ar_output_dir.mkdir(parents=True, exist_ok=True)
 
-    labels_csv = important_features_dir / "labels_only_unique.csv"
+        print("\n" + "="*70)
+        print(f"ASSOCIATION RULES — {region.upper()}")
+        print("="*70 + "\n")
 
-    if not labels_csv.exists():
-        print(f"  > Error: file not found at {labels_csv}")
-    else:
-        print(f"\n  > Loading transactions from {labels_csv.name}...")
-        df_encoded = extract_labels(labels_csv)
-        print(f"  > Loaded {len(df_encoded)} transactions")
+        # build k_labels_map from whatever k_* folders already exist
+        k_labels_map = {}
+        for k in k_values:
+            p = important_features_dir / f"k_{k}" / "labels_only_unique.csv"
+            if p.exists():
+                k_labels_map[k] = p
 
-        # see docs/parameter_rationale.md for why these values
-        summary = explore_association_rules(
-            df=df_encoded,
+        if not k_labels_map:
+            print(f"  > No labels files found under {important_features_dir} — run feature_importance.py first.")
+            continue
+
+        print(f"  > Found labels for k = {sorted(k_labels_map.keys())}")
+
+        # parameters updated for the larger northeast/south dataset
+        # sup_min and sup_max are auto-calibrated per k
+        # conf_min=0.50 — with ~29k transactions rules below 0.50 add noise
+        run_k_comparison(
+            k_labels_map=k_labels_map,
             output_dir=ar_output_dir,
-            # sup ceiling at 0.16: from 0.18 onward only len=1 itemsets survive
-            sup_min=0.02,  sup_max=0.16,  sup_delta=0.02,
-            # full confidence range
-            conf_min=0.10, conf_max=1.00, conf_delta=0.05,
-            # lift from 0 (true min) to 2.5 (headroom over observed max of 1.97)
-            lift_min=0.0,  lift_max=2.5,  lift_delta=0.05,
-            # drop rules with lift in [0.75, 1.25] — basically independent
+            auto_calibrate=True,
+            sup_delta=0.02,
+            conf_min=0.50, conf_max=1.00, conf_delta=0.05,
+            lift_min=0.0,  lift_delta=0.05,
             lift_neutral_half_window=0.25,
         )
 
-        print(f"\n{'='*70}")
-        print("TOP 10 COMBINATIONS BY NUMBER OF RULES AND LIFT")
-        print(f"{'='*70}\n")
-        print(summary.head(10).to_string(index=False))
-
-    print("\nDone.\n")
+    print("\n" + "="*70)
+    print("Done.")
+    print("="*70 + "\n")
