@@ -63,8 +63,7 @@ def cleanup_empty_folders(output_dir):
     return removed_conf, removed_sup
 
 
-def grid_search_fpgrowth_delta(df, 
-                               sup_min, sup_max, sup_delta,
+def grid_search_fpgrowth_delta(df, sup_min, sup_max, sup_delta,
                                conf_min, conf_max, conf_delta,
                                lift_min, lift_max, lift_delta):
     """
@@ -77,13 +76,13 @@ def grid_search_fpgrowth_delta(df,
     print(f"{'='*70}")
 
     # +half delta so the max endpoint is always included
-    support_grid = np.round(np.arange(sup_min,  sup_max  + sup_delta  / 2, sup_delta),  4)
+    support_grid    = np.round(np.arange(sup_min,  sup_max  + sup_delta  / 2, sup_delta),  4)
     confidence_grid = np.round(np.arange(conf_min, conf_max + conf_delta / 2, conf_delta), 4)
-    lift_grid = np.round(np.arange(lift_min, lift_max + lift_delta / 2, lift_delta), 4)
+    lift_grid       = np.round(np.arange(lift_min, lift_max + lift_delta / 2, lift_delta), 4)
 
-    print(f"  > support grid: {support_grid}")
+    print(f"  > support grid:    {support_grid}")
     print(f"  > confidence grid: {confidence_grid}")
-    print(f"  > lift grid: {lift_grid}")
+    print(f"  > lift grid:       {lift_grid}")
     print("-" * 50)
 
     results = []
@@ -106,11 +105,11 @@ def grid_search_fpgrowth_delta(df,
                 filtered = rules[rules['lift'] >= min_lift]
                 n = len(filtered)
                 results.append({
-                    'Support': min_sup,
-                    'Confidence': min_conf,
-                    'Lift': min_lift,
+                    'Support':         min_sup,
+                    'Confidence':      min_conf,
+                    'Lift':            min_lift,
                     'Number_of_Rules': n,
-                    'Max_Lift': round(filtered['lift'].max(), 4) if n > 0 else 0,
+                    'Max_Lift':        round(filtered['lift'].max(), 4) if n > 0 else 0,
                     'Mean_Confidence': round(filtered['confidence'].mean(), 4) if n > 0 else 0,
                 })
 
@@ -157,7 +156,7 @@ def deduplicate_symmetric_rules(rules_df):
     return pd.DataFrame(keep).reset_index(drop=True)
 
 
-def plot_heatmaps(summary_df, output_dir, lift_display_step=0.1):
+def plot_heatmaps(summary_df, output_dir, lift_display_step=0.1, lift_neutral_half_window=0.25):
     """
     3 heatmaps from the summary: support-confidence, support-lift, confidence-lift.
     Each cell = max rules over the third parameter (darker = more rules).
@@ -183,9 +182,9 @@ def plot_heatmaps(summary_df, output_dir, lift_display_step=0.1):
 
     # (x_col, y_col, file suffix, lift_on_x?)
     configs = [
-        ('Confidence', 'Support', 'support_confidence', False),
-        ('Lift_display', 'Support', 'support_lift', True),
-        ('Lift_display', 'Confidence', 'confidence_lift', True),
+        ('Confidence',   'Support',    'support_confidence', False),
+        ('Lift_display', 'Support',    'support_lift',        True),
+        ('Lift_display', 'Confidence', 'confidence_lift',     True),
     ]
 
     for x_col, y_col, suffix, x_is_lift in configs:
@@ -198,12 +197,16 @@ def plot_heatmaps(summary_df, output_dir, lift_display_step=0.1):
             .astype(int)
         )
 
-        # trim trailing zero columns on the lift axis — keep up to the last
-        # column with at least one rule so the drop-off is still visible
-        # but the empty desert after it is removed
+        # on the lift axis: remove columns inside the neutral window (they are
+        # always identical to their neighbours — the window was already filtered)
+        # then trim trailing zero columns keeping the last non-zero for drop-off
         if x_is_lift:
-            last_nonzero = int(np.where((pivot != 0).any(axis=0).values)[0].max()) if (pivot != 0).any(axis=0).any() else len(pivot.columns) - 1
-            pivot = pivot.iloc[:, :last_nonzero + 1]
+            neutral_lo = round(1.0 - lift_display_step * round(lift_neutral_half_window / lift_display_step), 4)
+            neutral_hi = round(1.0 + lift_display_step * round(lift_neutral_half_window / lift_display_step), 4)
+            pivot = pivot.loc[:, ~pivot.columns.to_series().between(neutral_lo, neutral_hi, inclusive='both')]
+            if (pivot != 0).any(axis=0).any():
+                last_nonzero = int(np.where((pivot != 0).any(axis=0).values)[0].max())
+                pivot = pivot.iloc[:, :last_nonzero + 1]
 
         n_cols = len(pivot.columns)
         n_rows = len(pivot.index)
@@ -261,25 +264,40 @@ def explore_association_rules(df, output_dir,
 
     Also saves a global summary.csv + exploration_summary.txt, cleans up
     empty folders, and generates the heatmaps.
+
+    Output layout:
+        output_dir/
+        ├── summary.csv
+        ├── exploration_summary.txt
+        ├── heatmaps/
+        ├── sup_0.02/
+        │   ├── frequent_itemsets.csv
+        │   ├── frequent_itemsets_summary.txt
+        │   ├── conf_0.10/
+        │   │   ├── rules.csv
+        │   │   ├── rules_detailed.csv
+        │   │   └── summary.txt
+        │   └── ...
+        └── ...
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # +half delta so the max endpoint is always included
-    support_grid = np.round(np.arange(sup_min,  sup_max  + sup_delta  / 2, sup_delta),  4)
+    support_grid    = np.round(np.arange(sup_min,  sup_max  + sup_delta  / 2, sup_delta),  4)
     confidence_grid = np.round(np.arange(conf_min, conf_max + conf_delta / 2, conf_delta), 4)
-    lift_grid = np.round(np.arange(lift_min, lift_max + lift_delta / 2, lift_delta), 4)
+    lift_grid       = np.round(np.arange(lift_min, lift_max + lift_delta / 2, lift_delta), 4)
 
     lift_window_lo = round(1.0 - lift_neutral_half_window, 4)
     lift_window_hi = round(1.0 + lift_neutral_half_window, 4)
-    total_combos = len(support_grid) * len(confidence_grid) * len(lift_grid)
+    total_combos   = len(support_grid) * len(confidence_grid) * len(lift_grid)
 
     print(f"\n{'='*70}")
-    print("FP-GROWTH ASSOCIATION RULES")
+    print("FULL EXPLORATION: FP-GROWTH ASSOCIATION RULES")
     print(f"{'='*70}")
-    print(f"  > support: {len(support_grid)} values [{support_grid[0]} ... {support_grid[-1]}, step={sup_delta}]")
-    print(f"  > confidence: {len(confidence_grid)} values [{confidence_grid[0]} ... {confidence_grid[-1]}, step={conf_delta}]")
-    print(f"  > lift: {len(lift_grid)} values [{lift_grid[0]} ... {lift_grid[-1]}, step={lift_delta}]")
+    print(f"  > support    : {len(support_grid)} values [{support_grid[0]} ... {support_grid[-1]}, step={sup_delta}]")
+    print(f"  > confidence : {len(confidence_grid)} values [{confidence_grid[0]} ... {confidence_grid[-1]}, step={conf_delta}]")
+    print(f"  > lift       : {len(lift_grid)} values [{lift_grid[0]} ... {lift_grid[-1]}, step={lift_delta}]")
     print(f"  > neutral window excluded: [{lift_window_lo}, {lift_window_hi}]")
     print(f"  > total combinations: {total_combos:,}")
     print("-" * 50)
@@ -302,7 +320,7 @@ def explore_association_rules(df, output_dir,
             continue
 
         fi = frequent_itemsets.copy()
-        fi['itemset_str'] = fi['itemsets'].apply(lambda x: ', '.join(sorted(x)))
+        fi['itemset_str']    = fi['itemsets'].apply(lambda x: ', '.join(sorted(x)))
         fi['itemset_length'] = fi['itemsets'].apply(len)
         fi = fi[['itemset_str', 'itemset_length', 'support']]
         fi = fi.sort_values(by=['itemset_length', 'support'], ascending=[True, False])
@@ -346,11 +364,11 @@ def explore_association_rules(df, output_dir,
             # remove symmetric duplicates — lift is symmetric so we only need
             # the direction with higher confidence
             _tmp = pd.DataFrame({
-                'antecedents_str': rules['antecedents'].apply(lambda x: ', '.join(sorted(x))),
-                'consequents_str': rules['consequents'].apply(lambda x: ', '.join(sorted(x))),
-                'confidence': rules['confidence'].values,
+                'antecedents_str':   rules['antecedents'].apply(lambda x: ', '.join(sorted(x))),
+                'consequents_str':   rules['consequents'].apply(lambda x: ', '.join(sorted(x))),
+                'confidence':        rules['confidence'].values,
                 'antecedent_length': rules['antecedents'].apply(len).values,
-                '_idx': range(len(rules)),
+                '_idx':              range(len(rules)),
             })
             _keep_idx = deduplicate_symmetric_rules(_tmp)['_idx'].tolist()
             rules = rules.iloc[_keep_idx].reset_index(drop=True)
@@ -359,24 +377,24 @@ def explore_association_rules(df, output_dir,
             fmt = pd.DataFrame()
             fmt['antecedents'] = rules['antecedents'].apply(lambda x: ', '.join(sorted(x)))
             fmt['consequents'] = rules['consequents'].apply(lambda x: ', '.join(sorted(x)))
-            fmt['support'] = rules['support'].round(4)
-            fmt['confidence'] = rules['confidence'].round(4)
-            fmt['lift'] = rules['lift'].round(4)
+            fmt['support']     = rules['support'].round(4)
+            fmt['confidence']  = rules['confidence'].round(4)
+            fmt['lift']        = rules['lift'].round(4)
 
             # detailed output with all mlxtend metrics and itemset lengths
             det = pd.DataFrame()
-            det['antecedents'] = rules['antecedents'].apply(lambda x: ', '.join(sorted(x)))
-            det['consequents'] = rules['consequents'].apply(lambda x: ', '.join(sorted(x)))
-            det['antecedent_length'] = rules['antecedents'].apply(len)
-            det['consequent_length'] = rules['consequents'].apply(len)
-            det['rule_length'] = det['antecedent_length'] + det['consequent_length']
+            det['antecedents']        = rules['antecedents'].apply(lambda x: ', '.join(sorted(x)))
+            det['consequents']        = rules['consequents'].apply(lambda x: ', '.join(sorted(x)))
+            det['antecedent_length']  = rules['antecedents'].apply(len)
+            det['consequent_length']  = rules['consequents'].apply(len)
+            det['rule_length']        = det['antecedent_length'] + det['consequent_length']
             det['antecedent support'] = rules['antecedent support'].values
             det['consequent support'] = rules['consequent support'].values
-            det['support'] = rules['support'].values
-            det['confidence'] = rules['confidence'].values
-            det['lift'] = rules['lift'].values
-            det['leverage'] = rules['leverage'].values
-            det['conviction'] = rules['conviction'].values
+            det['support']            = rules['support'].values
+            det['confidence']         = rules['confidence'].values
+            det['lift']               = rules['lift'].values
+            det['leverage']           = rules['leverage'].values
+            det['conviction']         = rules['conviction'].values
 
             conf_dir.mkdir(parents=True, exist_ok=True)
             fmt.to_csv(conf_dir / "rules.csv", index=False)
@@ -386,17 +404,17 @@ def explore_association_rules(df, output_dir,
                 f.write("Association Rules Summary\n")
                 f.write(f"{'='*60}\n\n")
                 f.write(f"Parameters:\n")
-                f.write(f"  Min Support: {min_sup}\n")
+                f.write(f"  Min Support:    {min_sup}\n")
                 f.write(f"  Min Confidence: {min_conf}\n")
                 f.write(f"  Neutral Lift Window (excluded): [{lift_window_lo}, {lift_window_hi}]\n\n")
                 f.write(f"Results:\n")
                 f.write(f"  Frequent Itemsets: {len(frequent_itemsets)}\n")
                 f.write(f"  Association Rules: {len(rules)}\n\n")
                 f.write(f"Statistics:\n")
-                f.write(f"  Avg Support: {rules['support'].mean():.4f}\n")
-                f.write(f"  Avg Confidence: {rules['confidence'].mean():.4f}\n")
-                f.write(f"  Avg Lift: {rules['lift'].mean():.4f}\n")
-                f.write(f"  Lift Range: {rules['lift'].min():.4f} - {rules['lift'].max():.4f}\n")
+                f.write(f"  Avg Support:     {rules['support'].mean():.4f}\n")
+                f.write(f"  Avg Confidence:  {rules['confidence'].mean():.4f}\n")
+                f.write(f"  Avg Lift:        {rules['lift'].mean():.4f}\n")
+                f.write(f"  Lift Range:      {rules['lift'].min():.4f} - {rules['lift'].max():.4f}\n")
                 f.write(f"  Avg Rule Length: {det['rule_length'].mean():.2f}\n\n")
                 f.write(f"Top 10 Rules (by Lift):\n{'-'*60}\n")
                 for idx, row in fmt.head(10).iterrows():
@@ -405,28 +423,31 @@ def explore_association_rules(df, output_dir,
 
             print(f"    > [conf={min_conf}] {len(rules)} rules saved to {conf_dir.relative_to(output_dir)}/")
 
-            # one summary row per lift threshold
+            # one summary row per lift threshold — skip values inside the neutral
+            # window since those rows are always identical to their neighbours
             for min_lift in lift_grid:
+                if lift_window_lo < min_lift < lift_window_hi:
+                    continue
                 filtered = rules[rules['lift'] >= min_lift]
                 n = len(filtered)
                 rl = (filtered['antecedents'].apply(len) + filtered['consequents'].apply(len)) if n > 0 else pd.Series(dtype=float)
 
                 summary_rows.append({
-                    'Support': min_sup,
-                    'Confidence': min_conf,
-                    'Lift_threshold': min_lift,
-                    'Number_of_Rules': n,
-                    'Max_Lift': round(filtered['lift'].max(), 4) if n > 0 else None,
-                    'Min_Lift': round(filtered['lift'].min(), 4) if n > 0 else None,
-                    'Avg_Lift': round(filtered['lift'].mean(), 4) if n > 0 else None,
-                    'Avg_Confidence': round(filtered['confidence'].mean(), 4) if n > 0 else None,
-                    'Avg_Support': round(filtered['support'].mean(), 4) if n > 0 else None,
-                    'Avg_Rule_Length': round(rl.mean(), 4) if n > 0 else None,
-                    'Max_Rule_Length': int(rl.max()) if n > 0 else None,
+                    'Support':               min_sup,
+                    'Confidence':            min_conf,
+                    'Lift_threshold':        min_lift,
+                    'Number_of_Rules':       n,
+                    'Max_Lift':              round(filtered['lift'].max(), 4) if n > 0 else None,
+                    'Min_Lift':              round(filtered['lift'].min(), 4) if n > 0 else None,
+                    'Avg_Lift':              round(filtered['lift'].mean(), 4) if n > 0 else None,
+                    'Avg_Confidence':        round(filtered['confidence'].mean(), 4) if n > 0 else None,
+                    'Avg_Support':           round(filtered['support'].mean(), 4) if n > 0 else None,
+                    'Avg_Rule_Length':       round(rl.mean(), 4) if n > 0 else None,
+                    'Max_Rule_Length':       int(rl.max()) if n > 0 else None,
                     'Num_Frequent_Itemsets': len(frequent_itemsets),
-                    'Num_FI_length_1': itemsets_by_len.get(1, 0),
-                    'Num_FI_length_2': itemsets_by_len.get(2, 0),
-                    'Num_FI_length_3plus': sum(v for k, v in itemsets_by_len.items() if k >= 3),
+                    'Num_FI_length_1':       itemsets_by_len.get(1, 0),
+                    'Num_FI_length_2':       itemsets_by_len.get(2, 0),
+                    'Num_FI_length_3plus':   sum(v for k, v in itemsets_by_len.items() if k >= 3),
                 })
 
     print(f"\n{'='*70}")
@@ -446,29 +467,29 @@ def explore_association_rules(df, output_dir,
         f.write(f"{'='*70}\n\n")
         f.write(f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
         f.write("Parameter Grids:\n")
-        f.write(f"  Support: {len(support_grid)} values [{support_grid[0]} ... {support_grid[-1]}, step={sup_delta}]\n")
-        f.write(f"  Confidence: {len(confidence_grid)} values [{confidence_grid[0]} ... {confidence_grid[-1]}, step={conf_delta}]\n")
-        f.write(f"  Lift: {len(lift_grid)} values [{lift_grid[0]} ... {lift_grid[-1]}, step={lift_delta}]\n")
+        f.write(f"  Support    : {len(support_grid)} values [{support_grid[0]} ... {support_grid[-1]}, step={sup_delta}]\n")
+        f.write(f"  Confidence : {len(confidence_grid)} values [{confidence_grid[0]} ... {confidence_grid[-1]}, step={conf_delta}]\n")
+        f.write(f"  Lift       : {len(lift_grid)} values [{lift_grid[0]} ... {lift_grid[-1]}, step={lift_delta}]\n")
         f.write(f"  Neutral Lift Window (excluded): [{lift_window_lo}, {lift_window_hi}]\n\n")
         f.write("Results:\n")
-        f.write(f"  Total combinations: {len(summary_df):,}\n")
-        f.write(f"  With >= 1 rule: {combos_with_rules:,}\n\n")
+        f.write(f"  Total combinations : {len(summary_df):,}\n")
+        f.write(f"  With >= 1 rule     : {combos_with_rules:,}\n\n")
         if not summary_df.empty and combos_with_rules > 0:
             best = summary_df.iloc[0]
             f.write("Best combination (most rules, then highest lift):\n")
             f.write(f"{'-'*60}\n")
-            f.write(f"  Support: {best['Support']}\n")
-            f.write(f"  Confidence: {best['Confidence']}\n")
-            f.write(f"  Lift threshold: {best['Lift_threshold']}\n")
+            f.write(f"  Support:         {best['Support']}\n")
+            f.write(f"  Confidence:      {best['Confidence']}\n")
+            f.write(f"  Lift threshold:  {best['Lift_threshold']}\n")
             f.write(f"  Number of Rules: {best['Number_of_Rules']}\n")
-            f.write(f"  Max Lift: {best['Max_Lift']}\n")
-            f.write(f"  Avg Lift: {best['Avg_Lift']}\n")
+            f.write(f"  Max Lift:        {best['Max_Lift']}\n")
+            f.write(f"  Avg Lift:        {best['Avg_Lift']}\n")
 
     print("  > Cleaning up empty folders...")
     removed_conf, removed_sup = cleanup_empty_folders(output_dir)
     print(f"  > Removed {removed_conf} conf folder(s) and {removed_sup} sup folder(s)")
 
-    plot_heatmaps(summary_df, output_dir)
+    plot_heatmaps(summary_df, output_dir, lift_neutral_half_window=lift_neutral_half_window)
 
     print(f"  > summary saved to {output_dir / 'summary.csv'}")
     print(f"  > total combinations: {len(summary_df):,}  |  with rules: {combos_with_rules:,}")
@@ -524,11 +545,11 @@ def calibrate_parameters(encoded_df, sup_delta=0.02, lift_delta=0.05):
         return None
 
     params = {
-        'sup_min': sup_min,
-        'sup_max': sup_max,
-        'sup_delta': sup_delta,
-        'lift_min': 0.0,
-        'lift_max': lift_max,
+        'sup_min':    sup_min,
+        'sup_max':    sup_max,
+        'sup_delta':  sup_delta,
+        'lift_min':   0.0,
+        'lift_max':   lift_max,
         'lift_delta': lift_delta,
     }
 
@@ -591,20 +612,20 @@ def run_k_comparison(k_labels_map, output_dir,
             if params is None:
                 print(f"  > Skipping k={k} — not enough co-occurrences to generate rules.")
                 continue
-            k_sup_min = params['sup_min']
-            k_sup_max = params['sup_max']
+            k_sup_min  = params['sup_min']
+            k_sup_max  = params['sup_max']
             k_lift_max = params['lift_max']
         else:
-            k_sup_min = sup_min
-            k_sup_max = sup_max
+            k_sup_min  = sup_min
+            k_sup_max  = sup_max
             k_lift_max = lift_max
 
         summary_df = explore_association_rules(
             df=df_encoded,
             output_dir=k_dir,
-            sup_min=k_sup_min, sup_max=k_sup_max, sup_delta=sup_delta,
-            conf_min=conf_min, conf_max=conf_max, conf_delta=conf_delta,
-            lift_min=lift_min, lift_max=k_lift_max, lift_delta=lift_delta,
+            sup_min=k_sup_min,  sup_max=k_sup_max,  sup_delta=sup_delta,
+            conf_min=conf_min,  conf_max=conf_max,   conf_delta=conf_delta,
+            lift_min=lift_min,  lift_max=k_lift_max, lift_delta=lift_delta,
             lift_neutral_half_window=lift_neutral_half_window,
         )
 
@@ -613,18 +634,18 @@ def run_k_comparison(k_labels_map, output_dir,
         has_rules_col = not summary_df.empty and 'Number_of_Rules' in summary_df.columns
         with_rules = summary_df[summary_df['Number_of_Rules'] > 0] if has_rules_col else pd.DataFrame()
         comparison_rows.append({
-            'k': k,
-            'n_transactions': len(df_encoded),
-            'n_items': df_encoded.shape[1],
+            'k':                   k,
+            'n_transactions':      len(df_encoded),
+            'n_items':             df_encoded.shape[1],
             'rarest_item_support': round(item_supports.iloc[0], 4),
-            'sup_min_used': k_sup_min,
-            'sup_max_used': k_sup_max,
-            'lift_max_used': k_lift_max,
-            'total_combos': len(summary_df),
-            'combos_with_rules': len(with_rules),
+            'sup_min_used':        k_sup_min,
+            'sup_max_used':        k_sup_max,
+            'lift_max_used':       k_lift_max,
+            'total_combos':        len(summary_df),
+            'combos_with_rules':   len(with_rules),
             'max_rules_any_combo': int(summary_df['Number_of_Rules'].max()) if has_rules_col else 0,
             'avg_lift_best_combo': round(with_rules['Avg_Lift'].max(), 4) if not with_rules.empty else None,
-            'max_lift_observed': round(summary_df['Max_Lift'].max(), 4) if has_rules_col else None,
+            'max_lift_observed':   round(summary_df['Max_Lift'].max(), 4) if has_rules_col else None,
         })
 
     print(f"\n{'='*70}")
@@ -662,8 +683,8 @@ def run_k_comparison(k_labels_map, output_dir,
         ).round(4)
 
         heatmap_configs = [
-            ('Support', 'k_support'),
-            ('Confidence', 'k_confidence'),
+            ('Support',      'k_support'),
+            ('Confidence',   'k_confidence'),
             ('Lift_display', 'k_lift'),
         ]
 
@@ -679,10 +700,15 @@ def run_k_comparison(k_labels_map, output_dir,
                 .astype(int)
             )
 
-            # same trim as plot_heatmaps — keep up to the last non-zero lift column
+            # same trim as plot_heatmaps — remove neutral window columns then
+            # trim trailing zeros keeping the last non-zero for the drop-off
             if 'lift' in suffix:
-                last_nonzero = int(np.where((pivot != 0).any(axis=0).values)[0].max()) if (pivot != 0).any(axis=0).any() else len(pivot.columns) - 1
-                pivot = pivot.iloc[:, :last_nonzero + 1]
+                neutral_lo = round(1.0 - 0.1 * round(lift_neutral_half_window / 0.1), 4)
+                neutral_hi = round(1.0 + 0.1 * round(lift_neutral_half_window / 0.1), 4)
+                pivot = pivot.loc[:, ~pivot.columns.to_series().between(neutral_lo, neutral_hi, inclusive='both')]
+                if (pivot != 0).any(axis=0).any():
+                    last_nonzero = int(np.where((pivot != 0).any(axis=0).values)[0].max())
+                    pivot = pivot.iloc[:, :last_nonzero + 1]
 
             n_cols = len(pivot.columns)
             n_rows = len(pivot.index)
