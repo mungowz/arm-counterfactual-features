@@ -1,15 +1,37 @@
-# Install CatBoost, run this cell in a Jupyter notebook or Colab environment
+# Install the CatBoost library, run this cell in a Jupyter notebook or Colab environment.
 # !pip install catboost --quiet
 
 
 import pandas as pd
 import numpy as np
 import re
+import subprocess
 from catboost import CatBoostClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import OrdinalEncoder, LabelEncoder
 from sklearn.neighbors import BallTree
 from pathlib import Path
+
+
+def _catboost_task_type():
+    """
+    Detect whether a CUDA-capable GPU is available and return the appropriate
+    CatBoost task_type string.
+
+    - Colab (NVIDIA T4/A100): nvidia-smi is present → 'GPU'
+    - Mac (Apple Silicon / Intel): no CUDA → 'CPU'
+    - Any other CPU-only environment: 'CPU'
+    """
+    try:
+        subprocess.run(
+            ['nvidia-smi'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            check=True
+        )
+        print("  > GPU detected — CatBoost will use task_type='GPU'")
+        return 'GPU'
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("  > No CUDA GPU detected — CatBoost will use task_type='CPU'")
+        return 'CPU'
 
 
 class CategoricalBoCSoR:
@@ -32,6 +54,13 @@ class CategoricalBoCSoR:
          directions isolate single-feature contributions; the swap-from-original
          direction is the natural choice when the switch point is a real data
          point rather than a synthetic interpolation.
+
+    Performance note:
+      model.predict() is called once per boundary sample on a batch containing
+      all per-feature perturbations for that sample (across all k neighbors),
+      rather than once per individual swap. This reduces the number of predict()
+      calls from O(samples × k × features) to O(boundary_samples), which is the
+      dominant speedup on both CPU and GPU.
     """
 
     def __init__(self, k_neighbors=10, perc_threshold=10):
@@ -40,7 +69,8 @@ class CategoricalBoCSoR:
         self.model          = None
         self.feature_encoder = OrdinalEncoder(dtype=int)
         self.label_encoder   = LabelEncoder()
-        self.trees = {}
+        self.trees  = {}
+        self._task_type = _catboost_task_type()
 
     def fit(self, X, y):
         """
@@ -64,7 +94,8 @@ class CategoricalBoCSoR:
 
         self.model = CatBoostClassifier(
             iterations=100, depth=6, learning_rate=0.1,
-            verbose=0, allow_writing_files=False
+            verbose=0, allow_writing_files=False,
+            task_type=self._task_type      # 'GPU' on Colab, 'CPU' on Mac
         )
         self.model.fit(
             X_tr, y_tr,
@@ -99,19 +130,19 @@ class CategoricalBoCSoR:
              For each boundary sample, query the k nearest neighbors in the
              opposite class using the pre-built BallTree.
 
-          3. Per-feature swap → predict → restore:
-             For every candidate neighbor and every feature position where
-             candidate differs from original:
-               a. swap    — set test_sample[f] = candidate[f]
-               b. predict — ask CatBoost whether the class flips
-               c. record  — if flip, save feature f as a counterfactual driver
-               d. restore — reset test_sample[f] = original[f] before next f
+          3. Batch per-feature swap → single predict → record:
+             For each boundary sample, ALL per-feature perturbations across ALL
+             k neighbors are collected into a single numpy batch. One predict()
+             call is made per boundary sample. Results are mapped back to the
+             corresponding (feature, value) pairs.
 
-             The restore step guarantees each feature is tested in complete
-             isolation: at predict time, test_sample differs from original
-             in exactly one feature position.
+             Each perturbation in the batch is a full copy of orig with exactly
+             one feature replaced by the candidate's value — so each prediction
+             tests a single-feature change in isolation, without needing an
+             explicit restore step (isolation is guaranteed structurally by the
+             independent copies).
         """
-        print("  > Extracting counterfactuals (per-feature swap)...")
+        print("  > Extracting counterfactuals (batched per-feature swap)...")
         X_enc  = self.feature_encoder.transform(X)
         y_enc  = self.label_encoder.transform(y)
 
@@ -164,26 +195,35 @@ class CategoricalBoCSoR:
                 global_ind = np.where(self.y_enc == opp_label)[0][ind[i]]
                 neighbors  = self.X_enc[global_ind]
 
+                # --- build batch of all per-feature perturbations ---
+                # each entry is orig with exactly one feature replaced by
+                # the corresponding candidate value — isolation is structural
+                # (independent copies), no restore step needed
+                batch_samples = []
+                batch_labels  = []
+
                 for cand in neighbors:
                     diff_positions = np.where(cand != orig)[0]
                     if len(diff_positions) == 0:
                         continue  # identical sample — nothing to test
 
-                    # one working copy per candidate; the restore step keeps it
-                    # identical to orig between feature iterations
-                    test_sample = orig.copy()
-
                     for f_idx in diff_positions:
-                        test_sample[f_idx] = cand[f_idx]        # a. swap
+                        perturbed         = orig.copy()
+                        perturbed[f_idx]  = cand[f_idx]       # single-feature swap
+                        batch_samples.append(perturbed)
 
-                        if self.model.predict([test_sample])[0] != orig_pred:
-                            # c. flip confirmed — record the feature
-                            val_str = self.feature_encoder.categories_[f_idx][cand[f_idx]]
-                            results[original_indices[sample_idx]].add(
-                                f"{self.feature_names[f_idx]}={val_str}"
-                            )
+                        val_str = self.feature_encoder.categories_[f_idx][cand[f_idx]]
+                        batch_labels.append(f"{self.feature_names[f_idx]}={val_str}")
 
-                        test_sample[f_idx] = orig[f_idx]        # d. restore
+                if not batch_samples:
+                    continue
+
+                # single predict() call for all perturbations of this sample
+                preds = self.model.predict(np.array(batch_samples))
+
+                for pred, label_str in zip(preds, batch_labels):
+                    if pred != orig_pred:
+                        results[original_indices[sample_idx]].add(label_str)
 
         rows = [
             {'Sample_ID': sid, 'Counterfactual_Values': list(v)}
@@ -322,7 +362,7 @@ if __name__ == "__main__":
         'south':     data_dir / "ACSIncome_south_2018_balanced.csv",
     }
 
-    k_values      = [1, 3, 5, 7, 9, 11, 13, 15, 17, 19]
+    k_values       = [1, 3, 5, 7, 9, 11, 13, 15, 17, 19]
     perc_threshold = 10  # matches original paper: explain_decision_boundary(perc_threshold=10)
 
     for region, data_path in regions.items():
