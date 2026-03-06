@@ -1,6 +1,7 @@
 # Install the CatBoost library (if needed)
 # !pip install catboost --quiet
 
+import ast
 import pandas as pd
 import numpy as np
 import re
@@ -75,12 +76,14 @@ class CategoricalBoCSoR:
     def _process_single_sample(self, sample_idx, orig_enc_sample, ind_row, opp_label):
         """
         Processes a single boundary sample in parallel across M2 cores.
-        Returns (sample_idx, set_of_counterfactual_drivers).
+        Returns (sample_idx, per_neighbor_results) where per_neighbor_results
+        is a list of (cf_global_idx, set_of_counterfactual_drivers), one entry
+        per neighbor that produced at least one driver.
 
-        sample_idx     — positional index into X_enc (used to key results dict)
+        sample_idx      — positional index into X_enc
         orig_enc_sample — encoded feature vector for this sample (copy, not a view)
-        ind_row        — 1-D array of k BallTree-local indices for this sample's neighbors
-        opp_label      — encoded label of the opposite class
+        ind_row         — 1-D array of k BallTree-local indices for this sample's neighbors
+        opp_label       — encoded label of the opposite class
         """
         orig = orig_enc_sample
         orig_pred = self.model.predict([orig])[0]
@@ -88,13 +91,15 @@ class CategoricalBoCSoR:
         global_ind = np.where(self.y_enc == opp_label)[0][ind_row]
         neighbors  = self.X_enc[global_ind]
 
-        batch_samples = []
-        batch_labels  = []
+        per_neighbor_results = []
 
-        for cand in neighbors:
+        for cf_global_idx, cand in zip(global_ind, neighbors):
             diff_positions = np.where(cand != orig)[0]
             if len(diff_positions) == 0:
                 continue
+
+            batch_samples = []
+            batch_labels  = []
 
             for f_idx in diff_positions:
                 perturbed         = orig.copy()
@@ -104,18 +109,17 @@ class CategoricalBoCSoR:
                 val_str = self.feature_encoder.categories_[f_idx][cand[f_idx]]
                 batch_labels.append(f"{self.feature_names[f_idx]}={val_str}")
 
-        # Se non ci sono differenze, ritorniamo un set vuoto
-        if not batch_samples:
-            return sample_idx, set()
+            preds = self.model.predict(np.array(batch_samples))
 
-        preds = self.model.predict(np.array(batch_samples))
-        
-        found_drivers = set()
-        for pred, label_str in zip(preds, batch_labels):
-            if pred != orig_pred:
-                found_drivers.add(label_str)
-                
-        return sample_idx, found_drivers
+            found_drivers = set()
+            for pred, label_str in zip(preds, batch_labels):
+                if pred != orig_pred:
+                    found_drivers.add(label_str)
+
+            if found_drivers:
+                per_neighbor_results.append((int(cf_global_idx), found_drivers))
+
+        return sample_idx, per_neighbor_results
     # ---------------------------------------------------
 
     def explain(self, X, y):
@@ -124,7 +128,7 @@ class CategoricalBoCSoR:
         y_enc  = self.label_encoder.transform(y)
 
         original_indices = X.index.tolist()
-        results = {original_indices[i]: set() for i in range(len(X_enc))}
+        rows = []
 
         all_classes = np.unique(y_enc)
 
@@ -162,16 +166,16 @@ class CategoricalBoCSoR:
                 for i, sample_idx in enumerate(boundary_pos_idx)
             )
 
-            # Raccogliamo i risultati generati in parallelo e li mettiamo nel dizionario
-            for sample_idx, found_drivers in parallel_results:
-                if found_drivers:
-                    results[original_indices[sample_idx]].update(found_drivers)
+            # Raccogliamo i risultati: una riga per coppia (campione, vicino CF)
+            for sample_idx, per_neighbor_results in parallel_results:
+                for cf_global_idx, found_drivers in per_neighbor_results:
+                    rows.append({
+                        'Sample_ID': original_indices[sample_idx],
+                        'CF_Neighbor_ID': cf_global_idx,
+                        'Counterfactual_Values': list(found_drivers)
+                    })
 
-        rows = [
-            {'Sample_ID': sid, 'Counterfactual_Values': list(v)}
-            for sid, v in results.items() if v
-        ]
-        print(f"    - done, {len(rows)} boundary samples have at least one "
+        print(f"    - done, {len(rows)} (sample, neighbor) pairs have at least one "
               f"counterfactual driver\n")
         return pd.DataFrame(rows)
 
@@ -200,6 +204,8 @@ def extract_labels(results_dir):
     labels_list        = []
     labels_unique_list = []
 
+    has_cf_col = 'CF_Neighbor_ID' in df.columns
+
     for _, row in df.iterrows():
         labels = re.findall(r'([A-Z]\w*)=', str(row['Counterfactual_Values']))
         labels_list.append(labels)
@@ -212,15 +218,78 @@ def extract_labels(results_dir):
                 unique.append(label)
         labels_unique_list.append(unique)
 
-    pd.DataFrame({'Sample_ID': df['Sample_ID'], 'Labels': labels_list}).to_csv(
+    base_cols = {'Sample_ID': df['Sample_ID']}
+    if has_cf_col:
+        base_cols['CF_Neighbor_ID'] = df['CF_Neighbor_ID']
+
+    pd.DataFrame({**base_cols, 'Labels': labels_list}).to_csv(
         output_file, index=False
     )
     print(f"    - labels (with duplicates) saved to {output_file.name}")
 
-    pd.DataFrame({'Sample_ID': df['Sample_ID'], 'Labels': labels_unique_list}).to_csv(
+    pd.DataFrame({**base_cols, 'Labels': labels_unique_list}).to_csv(
         output_unique, index=False
     )
     print(f"    - labels (unique) saved to {output_unique.name}")
+
+
+def aggregate_drivers_by_sample(results_dir):
+    """
+    Aggregate drivers by sample for association rule mining.
+
+    Reads labels_only_unique.csv (one row per sample-CF pair) and groups all
+    drivers by sample into a single transaction. This enables FP-Growth to
+    discover patterns like "when SCHL changes, OCCP also often changes".
+    """
+    print("  > Aggregating drivers by sample...")
+
+    labels_path = results_dir / "labels_only_unique.csv"
+    output_path = results_dir / "aggregated_drivers_by_sample.csv"
+
+    if not labels_path.exists():
+        print(f"    - WARNING: {labels_path.name} not found, skipping aggregation.")
+        return
+
+    try:
+        df = pd.read_csv(labels_path)
+    except (pd.errors.EmptyDataError, pd.errors.ParserError) as e:
+        print(f"    - WARNING: could not read labels file ({e}), skipping aggregation.")
+        return
+
+    if df.empty:
+        print("    - WARNING: labels file is empty, skipping aggregation.")
+        return
+
+    # Parse string representations of lists to actual lists
+    df['Labels'] = df['Labels'].apply(ast.literal_eval)
+
+    # Group by Sample_ID and collect all unique drivers
+    aggregated = []
+    for sample_id, group in df.groupby('Sample_ID'):
+        # Flatten all label lists and remove duplicates while preserving order
+        all_drivers = set()
+        for labels_list in group['Labels']:
+            all_drivers.update(labels_list)
+
+        aggregated.append({
+            'Sample_ID': sample_id,
+            'Drivers': sorted(list(all_drivers)),  # sorted for reproducibility
+            'Num_Drivers': len(all_drivers),
+            'Num_CF_Neighbors': len(group)
+        })
+
+    result_df = pd.DataFrame(aggregated)
+    result_df.to_csv(output_path, index=False)
+
+    print(f"    - Aggregated {len(df)} (sample, neighbor) pairs into {len(result_df)} unique samples")
+
+    # Statistics
+    dist = result_df['Num_Drivers'].value_counts().sort_index().to_dict()
+    for n_drivers, count in sorted(dist.items()):
+        pct = count / len(result_df) * 100
+        print(f"      {n_drivers} driver(s): {count} samples ({pct:.1f}%)")
+
+    print(f"    - aggregated CSV saved to {output_path.name}")
 
 
 def run_for_k_values(k_values, data_path, output_base_dir, perc_threshold=10):
@@ -266,6 +335,7 @@ def run_for_k_values(k_values, data_path, output_base_dir, perc_threshold=10):
             print(f"    > {len(transactions)} transactions saved to "
                   f"{transactions_path.name}")
             extract_labels(k_dir)
+            aggregate_drivers_by_sample(k_dir)
         else:
             print(f"    > 0 transactions — skipping CSV write and label extraction.")
 

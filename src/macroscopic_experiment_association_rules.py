@@ -22,11 +22,22 @@ _CPU_CORES = os.cpu_count() or 1
 def extract_labels(labels_only_path):
     """
     Read the labels CSV and one-hot encode each transaction for FP-Growth.
-    The Labels column contains lists stored as strings, so we eval them first.
+    Supports both formats:
+    - Original (one row per sample-CF pair): 'Labels' column with lists as strings
+    - Aggregated (one row per sample): 'Drivers' column with lists as strings
     """
     print("  > Loading and encoding labels...")
     df = pd.read_csv(labels_only_path)
-    itemsets = df['Labels'].apply(ast.literal_eval)
+
+    # Auto-detect which column to use
+    if 'Drivers' in df.columns:
+        print("    (using aggregated format: Drivers column)")
+        itemsets = df['Drivers'].apply(ast.literal_eval)
+    elif 'Labels' in df.columns:
+        print("    (using original format: Labels column)")
+        itemsets = df['Labels'].apply(ast.literal_eval)
+    else:
+        raise ValueError(f"CSV must have 'Labels' or 'Drivers' column. Found: {df.columns.tolist()}")
 
     te = TransactionEncoder()
     te_ary = te.fit(itemsets).transform(itemsets)
@@ -579,7 +590,7 @@ def explore_association_rules(df, output_dir,
     return summary_df
 
 
-def calibrate_parameters(encoded_df, sup_delta=0.02, lift_delta=0.05, conf_delta=0.05):
+def calibrate_parameters(encoded_df, sup_delta=0.02, lift_delta=0.05, conf_delta=0.05, conf_min_floor=0.05):
     """
     Auto-calibrate sup_min, sup_max and lift_max from the actual item frequencies.
     Call this before explore_association_rules() when k changes so the grid always
@@ -589,8 +600,8 @@ def calibrate_parameters(encoded_df, sup_delta=0.02, lift_delta=0.05, conf_delta
                rounded down to the nearest sup_delta step
     sup_max  = last threshold where FP-Growth still finds at least one 2-itemset
     lift_max = 1 / support(rarest item), rounded up to nearest 0.5, capped at 10
-    conf_min = floor of the minimum confidence observed at sup_min, clamped to
-               [0.50, 0.50] — fixed at 0.50 to enforce strong rule threshold
+    conf_min = floor of the max confidence observed at sup_min, rounded down to
+               the nearest conf_delta step, with conf_min_floor as absolute minimum
     """
     print("  > Calibrating parameters from item frequencies...")
 
@@ -603,58 +614,76 @@ def calibrate_parameters(encoded_df, sup_delta=0.02, lift_delta=0.05, conf_delta
         print("  > Warning: fewer than 2 items — cannot form pairwise rules.")
         return None
 
-    rarest = item_supports.iloc[0]
-    second = item_supports.iloc[1]
+    rarest  = item_supports.iloc[0]   # least frequent item
+    second  = item_supports.iloc[1]   # second least frequent
+    freq_2  = item_supports.iloc[-2]  # second most frequent — upper bound for scan
 
     # pairwise floor under independence, rounded down to sup_delta
     raw_sup_min = rarest * second
     sup_min = max(round(np.floor(raw_sup_min / sup_delta) * sup_delta, 4), sup_delta)
 
-    # scan upward until 2-itemsets disappear; cache the first FP-Growth result
-    # at sup_min so it can be reused for conf_min calibration without a second call
-    scan_grid = np.round(np.arange(sup_min, rarest * 1.05 + sup_delta, sup_delta), 4)
+    # BUG FIX: the scan ceiling was `rarest * 1.05` (≈ 0.018 for these data),
+    # which is BELOW sup_min = 0.02, producing a trivially single-value grid
+    # [0.02] with no real grid search. The correct ceiling is the support of
+    # the second most frequent item — that is the theoretical maximum support
+    # any 2-itemset can achieve (bounded by min(sup_A, sup_B) for the most
+    # frequent pair). This ensures the full relevant range is scanned.
+    scan_grid = np.round(np.arange(sup_min, freq_2 + sup_delta / 2, sup_delta), 4)
     sup_max = sup_min
     prev_had_2itemsets = False
-    fi_at_sup_min = None                # FIX: cache — avoids a redundant FP-Growth call
+    # Cache the FP-Growth result at the FIRST t where 2-itemsets appear — not
+    # necessarily at sup_min. If sup_min has only 1-itemsets and 2-itemsets
+    # appear later, using fi_at_sup_min for conf calibration would silently
+    # fall back to conf_min_floor because association_rules() needs >= 2-itemsets.
+    fi_first_with_2itemsets = None
 
     for t in scan_grid:
         fi = fpgrowth(encoded_df, min_support=t, use_colnames=True)
         if fi.empty:
             break
-        if fi_at_sup_min is None:
-            fi_at_sup_min = fi          # FIX: cache the first result (t == sup_min)
-        has_2itemsets = fi['itemsets'].apply(len).max() >= 2
+        has_2itemsets = (fi['itemsets'].apply(len).max() >= 2) if not fi.empty else False
         if has_2itemsets:
+            if fi_first_with_2itemsets is None:
+                fi_first_with_2itemsets = fi  # cache at first t with 2-itemsets
             sup_max = t
             prev_had_2itemsets = True
         elif prev_had_2itemsets:
-            # once 2-itemsets disappear they never come back (FP-Growth is monotonic)
+            # FP-Growth is monotonic: once 2-itemsets disappear they never return
             break
 
-    # theoretical lift ceiling, round up to nearest 0.5
+    # theoretical lift ceiling: 1 / support(rarest item), capped at 10
     raw_lift_max = 1.0 / rarest
     lift_max = min(round(np.ceil(raw_lift_max * 2) / 2, 1), 10.0)
 
-    # FIX: correct sparse-transaction check — the original condition
-    # `sup_max == sup_min` is a false negative when 2-itemsets exist only at
-    # exactly sup_min (valid case). The correct check is whether the scan ever
-    # found any 2-itemset at all.
     if not prev_had_2itemsets:
         print(f"  > Warning: no 2-itemsets found at any support threshold for this k.")
         print(f"    Transactions are too sparse to generate association rules.")
         print("-" * 50)
         return None
 
-    # FIX: conf_min fixed at 0.50 to enforce the strong-rule requirement.
-    # The previous version allowed it to drop to 0.30 for sparse k values,
-    # which contradicts the goal of finding only high-confidence associations.
-    # Use the cached FP-Growth result at sup_min instead of re-running it.
-    conf_min = 0.50
+    # BUG FIX: conf_min was hardcoded to 0.50 regardless of the data.
+    # With BoCSoR transactions (1–3 items per row), the max observable
+    # confidence is support(2-itemset) / support(antecedent) ≈ 0.02/0.30 ≈ 7%
+    # — hardcoding 0.50 silently produces zero rules every time.
+    # Fix: observe the actual maximum confidence at sup_min and use
+    # conf_min_floor as the lower bound (default 0.10, passed from caller).
+    conf_min = conf_min_floor  # start from the configured floor
     try:
-        if fi_at_sup_min is not None and not fi_at_sup_min.empty:
-            rules_probe = association_rules(fi_at_sup_min, metric="confidence", min_threshold=0.01)
-            if rules_probe.empty:
-                print(f"  > Note: no rules found at conf=0.01 with sup_min={sup_min} — conf_min stays at 0.50")
+        if fi_first_with_2itemsets is not None and not fi_first_with_2itemsets.empty:
+            rules_probe = association_rules(
+                fi_first_with_2itemsets, metric="confidence", min_threshold=0.01
+            )
+            if not rules_probe.empty:
+                # step down from max observed confidence to the nearest
+                # conf_delta step, but never below conf_min_floor
+                max_conf = rules_probe['confidence'].max()
+                calibrated = round(np.floor(max_conf / conf_delta) * conf_delta, 4)
+                conf_min = max(calibrated, conf_min_floor)
+                print(f"  > conf_min calibrated to {conf_min} "
+                      f"(max observed confidence={max_conf:.4f}, floor={conf_min_floor})")
+            else:
+                print(f"  > Note: no rules at conf=0.01 for sup_min={sup_min} "
+                      f"— conf_min stays at floor={conf_min_floor}")
     except Exception:
         pass
 
@@ -669,7 +698,7 @@ def calibrate_parameters(encoded_df, sup_delta=0.02, lift_delta=0.05, conf_delta
     }
 
     print(f"  > calibrated: sup_min={sup_min} (raw={raw_sup_min:.4f}), "
-          f"sup_max={sup_max}, conf_min={conf_min} (fixed — strong rules), "
+          f"sup_max={sup_max}, conf_min={conf_min} (calibrated from data), "
           f"lift_max={lift_max} (raw ceiling={raw_lift_max:.2f})")
     print("-" * 50)
 
@@ -679,7 +708,7 @@ def calibrate_parameters(encoded_df, sup_delta=0.02, lift_delta=0.05, conf_delta
 def run_k_comparison(k_labels_map, output_dir,
                      auto_calibrate=True,
                      sup_min=0.02,  sup_max=0.16,  sup_delta=0.02,
-                     conf_min=0.50, conf_max=1.00,  conf_delta=0.05,
+                     conf_min=0.05, conf_max=1.00,  conf_delta=0.05,
                      lift_min=0.0,  lift_max=2.5,   lift_delta=0.05,
                      lift_neutral_half_window=0.25):
     """
@@ -725,7 +754,8 @@ def run_k_comparison(k_labels_map, output_dir,
 
         if auto_calibrate:
             params = calibrate_parameters(encoded_df=df_encoded, sup_delta=sup_delta,
-                                          lift_delta=lift_delta, conf_delta=conf_delta)
+                                          lift_delta=lift_delta, conf_delta=conf_delta,
+                                          conf_min_floor=conf_min)
             if params is None:
                 print(f"  > Skipping k={k} — not enough co-occurrences to generate rules.")
                 continue
@@ -798,6 +828,14 @@ def run_k_comparison(k_labels_map, output_dir,
 
     if all_summaries:
         combined = pd.concat(all_summaries, ignore_index=True)
+
+        # guard: if every k produced an empty summary (no rules at any threshold)
+        # combined has no columns — skip heatmaps rather than crashing on KeyError
+        if combined.empty or 'Lift_threshold' not in combined.columns:
+            print('  > No rules found in any k — skipping cross-k heatmaps.')
+            print(f'  > Cross-k comparison saved to {comp_dir}/')
+            return k_summaries
+
         combined['Lift_display'] = (
             (combined['Lift_threshold'] / lift_delta).round() * lift_delta
         ).round(4)
@@ -928,12 +966,21 @@ if __name__ == "__main__":
     # Each unique combination is saved in its own labelled subfolder so   #
     # results are never overwritten.                                       #
     # ------------------------------------------------------------------ #
-    AUTO_CALIBRATE          = False
-    SUP_MIN, SUP_MAX        = 0.50, 1.00
-    SUP_DELTA               = 0.05
-    CONF_MIN, CONF_MAX      = 0.70, 1.00
+    # auto_calibrate=True: sup_min/sup_max/lift_max are derived from
+    # actual item frequencies per k. With counterfactual transactions
+    # each row has only 1-3 active features, so support is inherently
+    # sparse and manual thresholds like 0.50 produce zero rules.
+    # CONF_MIN acts as conf_min_floor for calibration: the calibrator observes
+    # the max confidence at sup_min and floors it to the nearest conf_delta step,
+    # but never below this value. With BoCSoR transactions (max conf ≈ 0.07),
+    # 0.05 is the minimum meaningful floor to avoid zero rules.
+    # sup_delta/lift_delta/conf_delta are shared across k values.
+    AUTO_CALIBRATE          = True
+    SUP_MIN, SUP_MAX        = 0.02, 0.50  # fallback if auto_calibrate=False
+    SUP_DELTA               = 0.02
+    CONF_MIN, CONF_MAX      = 0.05, 1.00
     CONF_DELTA              = 0.05
-    LIFT_MIN, LIFT_MAX      = 0.0,  3.0
+    LIFT_MIN, LIFT_MAX      = 0.0,  5.0   # fallback if auto_calibrate=False
     LIFT_DELTA              = 0.05
     LIFT_NEUTRAL_HALF_WIN   = 0.25
     # ------------------------------------------------------------------ #
@@ -958,11 +1005,18 @@ if __name__ == "__main__":
         print("="*70 + "\n")
 
         # build k_labels_map from whatever k_* folders already exist
+        # Use aggregated_drivers_by_sample.csv (grouped per sample) for better association patterns
         k_labels_map = {}
         for k in k_values:
-            p = important_features_dir / f"k_{k}" / "labels_only_unique.csv"
-            if p.exists():
-                k_labels_map[k] = p
+            # Try aggregated version first (one transaction per sample with all drivers)
+            p_agg = important_features_dir / f"k_{k}" / "aggregated_drivers_by_sample.csv"
+            # Fall back to original if aggregated doesn't exist yet
+            p_orig = important_features_dir / f"k_{k}" / "labels_only_unique.csv"
+
+            if p_agg.exists():
+                k_labels_map[k] = p_agg
+            elif p_orig.exists():
+                k_labels_map[k] = p_orig
 
         if not k_labels_map:
             print(f"  > No labels files found under {important_features_dir} — run feature_importance.py first.")

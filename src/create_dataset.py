@@ -221,11 +221,15 @@ def balance_datasets(df1, df2, random_state=42):
         # FIX #4: use n=round(...) per group instead of frac= to guarantee the
         # total sample count equals target_n exactly, avoiding float-rounding
         # discrepancies that could leave the result 1–2 rows off.
-        return (
-            df.groupby('target', group_keys=False)
-            .apply(lambda g: g.sample(n=round(n * len(g) / len(df)), random_state=seed))
-            .reset_index(drop=True)
-        )
+        # Explicit per-group sampling via concat avoids the pandas FutureWarning
+        # about groupby.apply operating on the grouping column.
+        group_sizes = df.groupby('target').size()
+        return pd.concat([
+            df[df['target'] == label].sample(
+                n=round(n * size / len(df)), random_state=seed
+            )
+            for label, size in group_sizes.items()
+        ]).reset_index(drop=True)
 
     if n1 > n2:
         df1 = stratified_sample(df1, target_n, random_state)
