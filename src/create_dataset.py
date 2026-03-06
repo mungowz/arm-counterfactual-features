@@ -1,6 +1,12 @@
+
+# Install the folktables library, run this cell in a Jupyter notebook or Colab environment.
+# !pip install folktables --quiet
+
+
 import pandas as pd
 from pathlib import Path
 from folktables import ACSDataSource, ACSIncome
+
 
 # ACS PUMS code mappings — taken manually from the 2018 data dictionary
 # hardcoding these because the folktables API doesn't expose them directly
@@ -16,12 +22,14 @@ OCCP_MAP = {
     '0': 'N/A-Unemployed'
 }
 
+
 POBP_MAP = {
     '36': 'New-York', '34': 'New-Jersey', '42': 'Pennsylvania', '9': 'Connecticut',
     '25': 'Massachusetts', '12': 'Florida', '6': 'California', '48': 'Texas',
     '13': 'Georgia', '37': 'North-Carolina', '45': 'South-Carolina',
     '72': 'PlaceCode_72', '313': 'PlaceCode_313', '303': 'PlaceCode_303', '1': 'PlaceCode_1'
 }
+
 
 # FIX #3 — mappings for the integer-coded columns that were previously left as raw
 # numbers. Without these, FP-Growth items would be uninterpretable (e.g. SEX=1).

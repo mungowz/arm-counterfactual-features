@@ -1,3 +1,7 @@
+# Install CatBoost, run this cell in a Jupyter notebook or Colab environment
+# !pip install catboost --quiet
+
+
 import pandas as pd
 import numpy as np
 import re
