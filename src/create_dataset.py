@@ -1,5 +1,4 @@
 import pandas as pd
-import numpy as np
 from pathlib import Path
 from folktables import ACSDataSource, ACSIncome
 
@@ -75,6 +74,8 @@ def categorize_dataset(input_path, output_path):
             return 'Bachelor-Degree'
         if x >= 22:
             return 'Advanced-Degree'
+        # codes 18 (some college < 1yr), 19 (some college >= 1yr),
+        # 20 (Associate's degree) all map here — intentional grouping
         return 'Some-College-Vocational'
 
     df['SCHL'] = df['SCHL'].apply(map_schl)
@@ -123,10 +124,11 @@ def balance_datasets(df1, df2, random_state=42):
         df1 = stratified_sample(df1, target_n, random_state)
     elif n2 > n1:
         df2 = stratified_sample(df2, target_n, random_state)
+    # if n1 == n2 both are returned unchanged — no sampling needed
 
-    print(f"    - northeast: {len(df1):,} samples  "
+    print(f"    - df1: {len(df1):,} samples  "
           f"(>50k: {(df1['target'] == '>50k').mean():.1%})")
-    print(f"    - south:     {len(df2):,} samples  "
+    print(f"    - df2: {len(df2):,} samples  "
           f"(>50k: {(df2['target'] == '>50k').mean():.1%})")
 
     return df1, df2
