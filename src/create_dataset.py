@@ -1,4 +1,3 @@
-
 # Install the folktables library, run this cell in a Jupyter notebook or Colab environment.
 # !pip install folktables --quiet
 

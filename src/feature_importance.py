@@ -1,6 +1,5 @@
-# Install the CatBoost library, run this cell in a Jupyter notebook or Colab environment.
+# Install the CatBoost library (if needed)
 # !pip install catboost --quiet
-
 
 import pandas as pd
 import numpy as np
@@ -12,15 +11,13 @@ from sklearn.preprocessing import OrdinalEncoder, LabelEncoder
 from sklearn.neighbors import BallTree
 from pathlib import Path
 
+# NUOVA IMPORTAZIONE PER IL MULTIPROCESSING
+from joblib import Parallel, delayed
 
 def _catboost_task_type():
     """
     Detect whether a CUDA-capable GPU is available and return the appropriate
     CatBoost task_type string.
-
-    - Colab (NVIDIA T4/A100): nvidia-smi is present → 'GPU'
-    - Mac (Apple Silicon / Intel): no CUDA → 'CPU'
-    - Any other CPU-only environment: 'CPU'
     """
     try:
         subprocess.run(
@@ -30,39 +27,12 @@ def _catboost_task_type():
         print("  > GPU detected — CatBoost will use task_type='GPU'")
         return 'GPU'
     except (subprocess.CalledProcessError, FileNotFoundError):
+        # Sul tuo Mac M2 stamperà questo e userà la CPU (molto più adatta per questo task)
         print("  > No CUDA GPU detected — CatBoost will use task_type='CPU'")
         return 'CPU'
 
 
 class CategoricalBoCSoR:
-    """
-    BoCSoR adapted for fully categorical datasets.
-    Hamming distance + BallTree for nearest neighbor search in discrete space.
-
-    Faithfully follows the CounterfactualExplainerByProximity approach from the
-    original paper, with three adaptations for the discrete/categorical setting:
-
-      1. Hamming distance replaces Euclidean — the only meaningful metric when
-         all features are nominal categories.
-      2. No synthetic interpolation — np.linspace cannot be applied to discrete
-         values, so each k neighbor is used directly as a candidate switch point.
-         All k neighbors are tested (rather than just the closest one) to maximise
-         coverage for global feature importance extraction via FP-Growth.
-      3. Swap direction — the original code starts from the switch point and
-         restores features to the original one at a time. Here we start from the
-         original and swap features to the candidate's value one at a time. Both
-         directions isolate single-feature contributions; the swap-from-original
-         direction is the natural choice when the switch point is a real data
-         point rather than a synthetic interpolation.
-
-    Performance note:
-      model.predict() is called once per boundary sample on a batch containing
-      all per-feature perturbations for that sample (across all k neighbors),
-      rather than once per individual swap. This reduces the number of predict()
-      calls from O(samples × k × features) to O(boundary_samples), which is the
-      dominant speedup on both CPU and GPU.
-    """
-
     def __init__(self, k_neighbors=10, perc_threshold=10):
         self.k_neighbors    = k_neighbors
         self.perc_threshold = perc_threshold
@@ -73,21 +43,12 @@ class CategoricalBoCSoR:
         self._task_type = _catboost_task_type()
 
     def fit(self, X, y):
-        """
-        Train CatBoost and build one BallTree per class for counterfactual search.
-
-        The internal 80/20 split is used exclusively for CatBoost's eval_set.
-        BallTrees are built on the FULL encoded set passed to fit() — matching
-        the original authors' approach where find_counterfactuals() queries
-        self.x (the complete training set), not a sub-split of it.
-        """
         print("  > Training CatBoost and building BallTrees...")
         self.feature_names = X.columns.tolist()
 
         y_enc = self.label_encoder.fit_transform(y)
         X_enc = self.feature_encoder.fit_transform(X)
 
-        # internal split only for CatBoost's eval_set — not used for BallTrees
         X_tr, X_val, y_tr, y_val = train_test_split(
             X_enc, y_enc, test_size=0.2, random_state=42, stratify=y_enc
         )
@@ -95,7 +56,7 @@ class CategoricalBoCSoR:
         self.model = CatBoostClassifier(
             iterations=100, depth=6, learning_rate=0.1,
             verbose=0, allow_writing_files=False,
-            task_type=self._task_type      # 'GPU' on Colab, 'CPU' on Mac
+            task_type=self._task_type      
         )
         self.model.fit(
             X_tr, y_tr,
@@ -103,9 +64,6 @@ class CategoricalBoCSoR:
             eval_set=(X_val, y_val)
         )
 
-        # BallTrees built on the FULL encoded set, not just X_tr.
-        # Storing self.X_enc / self.y_enc lets explain() map BallTree-local
-        # indices back to global rows and apply the perc_threshold filter.
         for label in np.unique(y_enc):
             idx = np.where(y_enc == label)[0]
             self.trees[label] = BallTree(X_enc[idx], metric='hamming')
@@ -113,48 +71,61 @@ class CategoricalBoCSoR:
         self.X_enc = X_enc
         self.y_enc = y_enc
 
+    # --- NUOVO METODO HELPER PER IL MULTIPROCESSING ---
+    def _process_single_sample(self, sample_idx, orig_enc_sample, ind_row, opp_label):
+        """
+        Processes a single boundary sample in parallel across M2 cores.
+        Returns (sample_idx, set_of_counterfactual_drivers).
+
+        sample_idx     — positional index into X_enc (used to key results dict)
+        orig_enc_sample — encoded feature vector for this sample (copy, not a view)
+        ind_row        — 1-D array of k BallTree-local indices for this sample's neighbors
+        opp_label      — encoded label of the opposite class
+        """
+        orig = orig_enc_sample
+        orig_pred = self.model.predict([orig])[0]
+
+        global_ind = np.where(self.y_enc == opp_label)[0][ind_row]
+        neighbors  = self.X_enc[global_ind]
+
+        batch_samples = []
+        batch_labels  = []
+
+        for cand in neighbors:
+            diff_positions = np.where(cand != orig)[0]
+            if len(diff_positions) == 0:
+                continue
+
+            for f_idx in diff_positions:
+                perturbed         = orig.copy()
+                perturbed[f_idx]  = cand[f_idx]
+                batch_samples.append(perturbed)
+
+                val_str = self.feature_encoder.categories_[f_idx][cand[f_idx]]
+                batch_labels.append(f"{self.feature_names[f_idx]}={val_str}")
+
+        # Se non ci sono differenze, ritorniamo un set vuoto
+        if not batch_samples:
+            return sample_idx, set()
+
+        preds = self.model.predict(np.array(batch_samples))
+        
+        found_drivers = set()
+        for pred, label_str in zip(preds, batch_labels):
+            if pred != orig_pred:
+                found_drivers.add(label_str)
+                
+        return sample_idx, found_drivers
+    # ---------------------------------------------------
+
     def explain(self, X, y):
-        """
-        Extract per-feature counterfactual drivers for all boundary samples.
-
-        Pipeline (mirrors explain_decision_boundary + explain_sample):
-
-          1. Boundary filter (perc_threshold):
-             For each class, compute the minimum Hamming distance from every
-             sample to the nearest neighbor in the opposite class. Keep only
-             samples within the perc_threshold-th percentile of that distance
-             distribution — these are the samples closest to the decision
-             boundary and most informative for global feature importance.
-
-          2. Neighbor search:
-             For each boundary sample, query the k nearest neighbors in the
-             opposite class using the pre-built BallTree.
-
-          3. Batch per-feature swap → single predict → record:
-             For each boundary sample, ALL per-feature perturbations across ALL
-             k neighbors are collected into a single numpy batch. One predict()
-             call is made per boundary sample. Results are mapped back to the
-             corresponding (feature, value) pairs.
-
-             Each perturbation in the batch is a full copy of orig with exactly
-             one feature replaced by the candidate's value — so each prediction
-             tests a single-feature change in isolation, without needing an
-             explicit restore step (isolation is guaranteed structurally by the
-             independent copies).
-        """
-        print("  > Extracting counterfactuals (batched per-feature swap)...")
+        print("  > Extracting counterfactuals (PARALLEL batched per-feature swap)...")
         X_enc  = self.feature_encoder.transform(X)
         y_enc  = self.label_encoder.transform(y)
 
-        # key by the original DataFrame index so Sample_ID is traceable
-        # back to the balanced CSV row, not just a positional offset in X_enc
         original_indices = X.index.tolist()
         results = {original_indices[i]: set() for i in range(len(X_enc))}
 
-        # derive the opposite class without assuming labels are {0, 1}:
-        # all_classes is a sorted 1-D array from np.unique, so
-        # all_classes[all_classes != label] gives the complement safely
-        # for any binary encoding
         all_classes = np.unique(y_enc)
 
         for label in all_classes:
@@ -167,11 +138,6 @@ class CategoricalBoCSoR:
             if tree is None:
                 continue
 
-            # --- boundary filter (perc_threshold) ---
-            # query each sample's distance to its single nearest neighbor in
-            # the opposite class, then keep only those within the percentile
-            # threshold — equivalent to explain_decision_boundary()'s cdist
-            # + np.percentile filter, adapted for Hamming via BallTree
             min_dist_to_opp, _ = tree.query(X_enc[pos_idx], k=1)
             min_dist_to_opp    = min_dist_to_opp.ravel()
             dist_threshold     = np.percentile(min_dist_to_opp, self.perc_threshold)
@@ -184,46 +150,22 @@ class CategoricalBoCSoR:
             print(f"    - class {label}: {len(boundary_pos_idx)}/{len(pos_idx)} "
                   f"boundary samples (perc_threshold={self.perc_threshold})")
 
-            # query k neighbors for boundary samples only
             _, ind = tree.query(X_enc[boundary_pos_idx], k=self.k_neighbors)
 
-            for i, sample_idx in enumerate(boundary_pos_idx):
-                orig      = X_enc[sample_idx]
-                orig_pred = self.model.predict([orig])[0]  # cached once per sample
+            # --- MAGIA DEL MULTIPROCESSING SUL MAC M2 ---
+            # n_jobs=-1 dice a joblib di usare TUTTI i core fisici e logici disponibili.
+            # backend="threading" evita il pickle di self.model (CatBoost rilascia il GIL)
+            parallel_results = Parallel(n_jobs=-1, backend="threading")(
+                delayed(self._process_single_sample)(
+                    sample_idx, X_enc[sample_idx], ind[i], opp_label
+                )
+                for i, sample_idx in enumerate(boundary_pos_idx)
+            )
 
-                # map BallTree-local indices back to self.X_enc global indices
-                global_ind = np.where(self.y_enc == opp_label)[0][ind[i]]
-                neighbors  = self.X_enc[global_ind]
-
-                # --- build batch of all per-feature perturbations ---
-                # each entry is orig with exactly one feature replaced by
-                # the corresponding candidate value — isolation is structural
-                # (independent copies), no restore step needed
-                batch_samples = []
-                batch_labels  = []
-
-                for cand in neighbors:
-                    diff_positions = np.where(cand != orig)[0]
-                    if len(diff_positions) == 0:
-                        continue  # identical sample — nothing to test
-
-                    for f_idx in diff_positions:
-                        perturbed         = orig.copy()
-                        perturbed[f_idx]  = cand[f_idx]       # single-feature swap
-                        batch_samples.append(perturbed)
-
-                        val_str = self.feature_encoder.categories_[f_idx][cand[f_idx]]
-                        batch_labels.append(f"{self.feature_names[f_idx]}={val_str}")
-
-                if not batch_samples:
-                    continue
-
-                # single predict() call for all perturbations of this sample
-                preds = self.model.predict(np.array(batch_samples))
-
-                for pred, label_str in zip(preds, batch_labels):
-                    if pred != orig_pred:
-                        results[original_indices[sample_idx]].add(label_str)
+            # Raccogliamo i risultati generati in parallelo e li mettiamo nel dizionario
+            for sample_idx, found_drivers in parallel_results:
+                if found_drivers:
+                    results[original_indices[sample_idx]].update(found_drivers)
 
         rows = [
             {'Sample_ID': sid, 'Counterfactual_Values': list(v)}
@@ -235,18 +177,25 @@ class CategoricalBoCSoR:
 
 
 def extract_labels(results_dir):
-    """
-    Pull just the feature names out of the counterfactual values and save them
-    as transaction lists for FP-Growth. Saves two versions: one with duplicates
-    (labels_only.csv) and one without (labels_only_unique.csv).
-    """
     print("  > Extracting labels from counterfactual values...")
-
     input_file    = results_dir / "transactions_values.csv"
     output_file   = results_dir / "labels_only.csv"
     output_unique = results_dir / "labels_only_unique.csv"
 
-    df = pd.read_csv(input_file)
+    # Guard robusto: cattura sia file mancante che CSV vuoto/solo-header
+    if not input_file.exists():
+        print("    - WARNING: transactions file not found, skipping.")
+        return
+
+    try:
+        df = pd.read_csv(input_file)
+    except (pd.errors.EmptyDataError, pd.errors.ParserError) as e:
+        print(f"    - WARNING: could not read transactions file ({e}), skipping.")
+        return
+
+    if df.empty:
+        print("    - WARNING: no transactions found, skipping label extraction.")
+        return
 
     labels_list        = []
     labels_unique_list = []
@@ -255,7 +204,6 @@ def extract_labels(results_dir):
         labels = re.findall(r'([A-Z]\w*)=', str(row['Counterfactual_Values']))
         labels_list.append(labels)
 
-        # deduplicate while keeping the original order
         seen   = set()
         unique = []
         for label in labels:
@@ -276,21 +224,6 @@ def extract_labels(results_dir):
 
 
 def run_for_k_values(k_values, data_path, output_base_dir, perc_threshold=10):
-    """
-    Run the full pipeline (fit + explain + extract_labels) for each k in k_values.
-
-    The train/test split and model fit are performed once before the loop so that:
-      - all k values see identical train/test partitions (fair comparison);
-      - CatBoost is not redundantly re-trained for each k, since the model
-        depends only on the data and random_state, not on k_neighbors.
-
-    explain() is called on X_tr (the training set), matching the original
-    authors' approach where CounterfactualExplainerByProximity is initialised
-    with X_train and the boundary analysis is run on training samples.
-
-    Returns a dict {k: path_to_labels_only_unique.csv} that can be passed
-    directly to run_k_comparison() in association_rules.py.
-    """
     output_base_dir = Path(output_base_dir)
     output_base_dir.mkdir(parents=True, exist_ok=True)
 
@@ -301,7 +234,6 @@ def run_for_k_values(k_values, data_path, output_base_dir, perc_threshold=10):
     print(f"  > perc_threshold: {perc_threshold}")
     print("-" * 50)
 
-    # split once, reuse for all k — otherwise the comparison isn't fair
     print("  > Loading dataset and splitting...")
     df   = pd.read_csv(data_path)
     X, y = df.drop(columns=["target"]), df["target"]
@@ -310,8 +242,6 @@ def run_for_k_values(k_values, data_path, output_base_dir, perc_threshold=10):
     )
     print(f"    - train: {len(X_tr)} samples, test: {len(X_te)} samples")
 
-    # fit CatBoost and build BallTrees once — k_neighbors only affects how many
-    # neighbors are queried in explain(), not the model or the trees themselves
     print(f"\n  > Fitting model (shared across all k values)...")
     explainer = CategoricalBoCSoR(k_neighbors=k_values[0], perc_threshold=perc_threshold)
     explainer.fit(X_tr, y_tr)
@@ -324,20 +254,26 @@ def run_for_k_values(k_values, data_path, output_base_dir, perc_threshold=10):
 
         print(f"\n  [{i+1}/{len(k_values)}] k = {k}")
 
-        # update k_neighbors in place — no re-fit needed
         explainer.k_neighbors = k
 
-        # explain() is called on the TRAINING set, matching the original paper's
-        # approach of running the boundary analysis on training samples
         transactions = explainer.explain(X_tr, y_tr)
 
         transactions_path = k_dir / "transactions_values.csv"
-        transactions.to_csv(transactions_path, index=False)
-        print(f"    > {len(transactions)} transactions saved to "
-              f"{transactions_path.name}")
 
-        extract_labels(k_dir)
-        k_labels_map[k] = k_dir / "labels_only_unique.csv"
+        # Scriviamo il CSV SOLO se ci sono transazioni effettive
+        if not transactions.empty:
+            transactions.to_csv(transactions_path, index=False)
+            print(f"    > {len(transactions)} transactions saved to "
+                  f"{transactions_path.name}")
+            extract_labels(k_dir)
+        else:
+            print(f"    > 0 transactions — skipping CSV write and label extraction.")
+
+        labels_path = k_dir / "labels_only_unique.csv"
+        if labels_path.exists() and labels_path.stat().st_size > 0:
+            k_labels_map[k] = labels_path
+        else:
+            print(f"    - WARNING: no labels for k={k}, skipping.")
 
     print(f"\n{'='*70}")
     print("  > All k values done.")
@@ -347,8 +283,6 @@ def run_for_k_values(k_values, data_path, output_base_dir, perc_threshold=10):
 
 
 if __name__ == "__main__":
-    # when run standalone, processes both regions independently
-    # expects the balanced CSVs produced by create_dataset.py to already exist
     if Path("/content").exists():
         base_dir = Path("/content")
     else:
@@ -362,8 +296,8 @@ if __name__ == "__main__":
         'south':     data_dir / "ACSIncome_south_2018_balanced.csv",
     }
 
-    k_values       = [1, 3, 5, 7, 9, 11, 13, 15, 17, 19]
-    perc_threshold = 10  # matches original paper: explain_decision_boundary(perc_threshold=10)
+    k_values       = [1, 3, 5, 7]
+    perc_threshold = 10  
 
     for region, data_path in regions.items():
         important_features_dir = results_dir / region / "important_features"
