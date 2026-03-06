@@ -23,6 +23,73 @@ POBP_MAP = {
     '72': 'PlaceCode_72', '313': 'PlaceCode_313', '303': 'PlaceCode_303', '1': 'PlaceCode_1'
 }
 
+# FIX #3 — mappings for the integer-coded columns that were previously left as raw
+# numbers. Without these, FP-Growth items would be uninterpretable (e.g. SEX=1).
+# All codes taken from the ACS 2018 PUMS data dictionary.
+
+# COW: class of worker (codes 1–9)
+COW_MAP = {
+    '1': 'Private-For-Profit',
+    '2': 'Private-Non-Profit',
+    '3': 'Local-Government',
+    '4': 'State-Government',
+    '5': 'Federal-Government',
+    '6': 'Self-Employed-Unincorporated',
+    '7': 'Self-Employed-Incorporated',
+    '8': 'Family-Business-Unpaid',
+    '9': 'Long-Term-Unemployed-Or-Never-Worked',
+}
+
+# MAR: marital status (codes 1–5)
+MAR_MAP = {
+    '1': 'Married',
+    '2': 'Widowed',
+    '3': 'Divorced',
+    '4': 'Separated',
+    '5': 'Never-Married',
+}
+
+# RELP: relationship to reference person (codes 0–17)
+RELP_MAP = {
+    '0':  'Reference-Person',
+    '1':  'Spouse',
+    '2':  'Biological-Child',
+    '3':  'Adopted-Child',
+    '4':  'Stepchild',
+    '5':  'Sibling',
+    '6':  'Parent',
+    '7':  'Grandchild',
+    '8':  'In-Law',
+    '9':  'Other-Relative',
+    '10': 'Roommate',
+    '11': 'Foster-Child',
+    '12': 'Other-Nonrelative',
+    '13': 'Institutionalized-GQ',
+    '14': 'Noninstitutionalized-GQ',
+    '15': 'GQ-Other-1',
+    '16': 'GQ-Other-2',
+    '17': 'GQ-Other-3',
+}
+
+# SEX (codes 1–2)
+SEX_MAP = {
+    '1': 'Male',
+    '2': 'Female',
+}
+
+# RAC1P: race (codes 1–9)
+RAC1P_MAP = {
+    '1': 'White',
+    '2': 'Black-AfricanAmerican',
+    '3': 'AmericanIndian',
+    '4': 'AlaskaNative',
+    '5': 'AmericanIndian-AlaskaNative-Mixed',
+    '6': 'Asian',
+    '7': 'NativeHawaiian-PacificIslander',
+    '8': 'Other-Race',
+    '9': 'Two-Or-More-Races',
+}
+
 # the two regions we compare — chosen to maximize socioeconomic contrast
 REGIONS = {
     'northeast': ['NY', 'NJ', 'CT', 'MA', 'PA'],
@@ -52,20 +119,45 @@ def create_region_dataset(states, year="2018"):
     return combined
 
 
+def _int_str(series):
+    """
+    Safe integer-string conversion for ACS code columns.
+
+    pd.read_csv() loads numeric columns as float64, so a naive .astype(str)
+    produces '10.0' instead of '10', silently breaking every dict lookup.
+    Casting float → int → str restores the bare integer string that matches
+    the dictionary keys. NaNs are preserved so fillna() can handle them later.
+
+    FIX #1 — applied to OCCP, POBP, COW, MAR, RELP, SEX, RAC1P.
+    """
+    return series.where(series.isna(), series.astype(float).astype('Int64').astype(str))
+
+
 def categorize_dataset(input_path, output_path):
     """
-    Convert continuous/coded columns into readable categorical bins.
+    Convert continuous/coded columns into readable categorical strings.
     Needed because FP-Growth works on discrete items, not raw numbers.
     """
     print(f"  > Categorizing {Path(input_path).name}...")
     df = pd.read_csv(input_path)
 
-    # map occupation and place-of-birth codes to readable strings
-    df['OCCP'] = df['OCCP'].astype(str).map(OCCP_MAP).fillna('Other-Occupation')
-    df['POBP'] = df['POBP'].astype(str).map(POBP_MAP).fillna('Other-Place')
+    # --- integer-coded columns: safe int→str conversion before dict lookup ---
+    # FIX #1: use _int_str() to avoid the '10.0' ≠ '10' mismatch
+    df['OCCP']  = _int_str(df['OCCP']).map(OCCP_MAP).fillna('Other-Occupation')
+    df['POBP']  = _int_str(df['POBP']).map(POBP_MAP).fillna('Other-Place')
 
-    # SCHL: education level codes from the ACS codebook
+    # FIX #3: map the remaining integer-coded columns that were left as raw ints
+    df['COW']   = _int_str(df['COW']).map(COW_MAP).fillna('Other-COW')
+    df['MAR']   = _int_str(df['MAR']).map(MAR_MAP).fillna('Other-MAR')
+    df['RELP']  = _int_str(df['RELP']).map(RELP_MAP).fillna('Other-RELP')
+    df['SEX']   = _int_str(df['SEX']).map(SEX_MAP).fillna('Other-SEX')
+    df['RAC1P'] = _int_str(df['RAC1P']).map(RAC1P_MAP).fillna('Other-Race')
+
+    # --- SCHL: education level codes from the ACS codebook ---
     def map_schl(x):
+        # FIX #2: guard against NaN before numeric comparisons to avoid TypeError
+        if pd.isna(x):
+            return 'Unknown-Education'
         if x <= 15:
             return 'No-HS-Diploma'
         if x in [16, 17]:
@@ -80,6 +172,8 @@ def categorize_dataset(input_path, output_path):
 
     df['SCHL'] = df['SCHL'].apply(map_schl)
 
+    # --- continuous columns: bin into readable labels ---
+
     # AGEP: ACSIncome filters to 16+ so the lower bound starts at 15
     df['AGEP'] = pd.cut(df['AGEP'], bins=[15, 29, 44, 59, 150],
                         labels=['Young-Adults', 'Adults', 'Middle-Aged', 'Seniors'])
@@ -93,7 +187,11 @@ def categorize_dataset(input_path, output_path):
     for col in ['group', 'state']:
         if col in df.columns:
             df.drop(columns=[col], inplace=True)
-    df['target'] = df['target'].map({False: '<=50k', True: '>50k'})
+
+    # astype(str) first makes the mapping robust regardless of whether pd.read_csv
+    # parsed 'True'/'False' back as booleans or left them as strings — both cases
+    # produce the string keys 'True'/'False' that the dict below expects.
+    df['target'] = df['target'].astype(str).map({'True': '>50k', 'False': '<=50k'})
 
     df.to_csv(output_path, index=False)
     print(f"    - saved to {Path(output_path).name}")
@@ -113,10 +211,12 @@ def balance_datasets(df1, df2, random_state=42):
     print(f"  > Balancing datasets: {n1:,} vs {n2:,} → target {target_n:,} each")
 
     def stratified_sample(df, n, seed):
-        # sample proportionally within each target class
+        # FIX #4: use n=round(...) per group instead of frac= to guarantee the
+        # total sample count equals target_n exactly, avoiding float-rounding
+        # discrepancies that could leave the result 1–2 rows off.
         return (
             df.groupby('target', group_keys=False)
-            .apply(lambda g: g.sample(frac=n / len(df), random_state=seed))
+            .apply(lambda g: g.sample(n=round(n * len(g) / len(df)), random_state=seed))
             .reset_index(drop=True)
         )
 
