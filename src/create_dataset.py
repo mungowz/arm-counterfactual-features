@@ -49,7 +49,7 @@ _INCOME_FEATURES = [
     'MAR',    # marital status
     'OCCP',   # occupation
     'POBP',   # place of birth
-    'RELP',   # relationship to reference person
+    'RELSHIPP',  # relationship to reference person (replaces RELP from 2019 onward)
     'WKHP',   # usual hours worked per week
     'SEX',    # sex
     'RAC1P',  # race
@@ -75,7 +75,7 @@ ACSIncomeSouth = folktables.BasicProblem(
 
 
 # --- categorical mappings --------------------------------------------------------
-# Source: 2023 ACS PUMS Data Dictionary (census.gov)
+# Source: 2024 ACS PUMS Data Dictionary (census.gov, October 16, 2025)
 # Codes arrive from folktables as float64; the lookup layer converts them to
 # integers before indexing, so keys here are plain int-strings without leading zeros.
 
@@ -126,27 +126,28 @@ MAR_MAP = {
     '5': 'Never-Married-Or-Under-15',
 }
 
-# Note: codes 8-17 differ from many third-party references; these are verbatim
-# from the 2023 ACS PUMS Data Dictionary.
-RELP_MAP = {
-    '0':  'Reference-Person',
-    '1':  'Husband-Wife',
-    '2':  'Biological-Son-Or-Daughter',
-    '3':  'Adopted-Son-Or-Daughter',
-    '4':  'Stepson-Or-Stepdaughter',
-    '5':  'Brother-Or-Sister',
-    '6':  'Father-Or-Mother',
-    '7':  'Grandchild',
-    '8':  'Parent-In-Law',
-    '9':  'Son-In-Law-Or-Daughter-In-Law',
-    '10': 'Other-Relative',
-    '11': 'Roomer-Or-Boarder',
-    '12': 'Housemate-Or-Roommate',
-    '13': 'Unmarried-Partner',
-    '14': 'Foster-Child',
-    '15': 'Other-Nonrelative',
-    '16': 'Institutionalized-Group-Quarters',
-    '17': 'Noninstitutionalized-Group-Quarters',
+# RELSHIPP replaced RELP starting with 2019 ACS PUMS; codes are 20-38 (two digits).
+# The new scheme adds separate codes for same-sex vs opposite-sex couples.
+RELSHIPP_MAP = {
+    '20': 'Reference-Person',
+    '21': 'Opposite-Sex-Husband-Wife-Spouse',
+    '22': 'Opposite-Sex-Unmarried-Partner',
+    '23': 'Same-Sex-Husband-Wife-Spouse',
+    '24': 'Same-Sex-Unmarried-Partner',
+    '25': 'Biological-Son-Or-Daughter',
+    '26': 'Adopted-Son-Or-Daughter',
+    '27': 'Stepson-Or-Stepdaughter',
+    '28': 'Brother-Or-Sister',
+    '29': 'Father-Or-Mother',
+    '30': 'Grandchild',
+    '31': 'Parent-In-Law',
+    '32': 'Son-In-Law-Or-Daughter-In-Law',
+    '33': 'Other-Relative',
+    '34': 'Roommate-Or-Housemate',
+    '35': 'Foster-Child',
+    '36': 'Other-Nonrelative',
+    '37': 'Institutionalized-Group-Quarters',
+    '38': 'Noninstitutionalized-Group-Quarters',
 }
 
 SEX_MAP = {
@@ -321,7 +322,7 @@ COLUMN_MAPS = {
     'COW':   COW_MAP,
     'SCHL':  SCHL_MAP,
     'MAR':   MAR_MAP,
-    'RELP':  RELP_MAP,
+    'RELSHIPP': RELSHIPP_MAP,
     'SEX':   SEX_MAP,
     'RAC1P': RAC1P_MAP,
     'POBP':  POBP_MAP,
