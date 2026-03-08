@@ -1,299 +1,470 @@
-# Install the folktables library, run this cell in a Jupyter notebook or Colab environment.
-# !pip install folktables --quiet
+"""
+build_acs_datasets.py
 
+Downloads ACS Income PUMS data for two US regions and saves them as
+classification-ready CSVs with human-readable categorical labels.
 
+    Northeast states — income threshold $110,000
+    South states     — income threshold $90,000
+
+Survey year: 2024 | Horizon: 1-Year | Survey: person (PUMS)
+
+Usage:
+    pip install folktables pandas numpy
+    python build_acs_datasets.py
+"""
+
+import os
+import time
+import numpy as np
 import pandas as pd
-from pathlib import Path
-from folktables import ACSDataSource, ACSIncome
+import folktables
+from folktables import ACSDataSource
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
-# ACS PUMS code mappings — taken manually from the 2018 data dictionary
-# hardcoding these because the folktables API doesn't expose them directly
-OCCP_MAP = {
-    '10': 'Chief-Executives', '20': 'General-Operations-Managers', '120': 'Financial-Managers',
-    '440': 'Other-Operations-Managers', '800': 'Accountants', '710': 'Management-Analysts',
-    '1021': 'Software-Developers', '1010': 'Computer-Systems-Analysts', '2100': 'Lawyers',
-    '2310': 'Elementary-Teachers', '3255': 'Registered-Nurses', '1020': 'Software-Apps-Developers',
-    '4110': 'Waiters-Waitresses', '4720': 'Cashiers', '4760': 'Retail-Salespersons',
-    '5110': 'Receptionists', '5700': 'Secretaries-Admin', '4220': 'Janitors',
-    '2320': 'Secondary-Teachers', '2545': 'Teaching-Assistants', '2723': 'Designers-Artists',
-    '4622': 'Hotel-Clerks', '5120': 'Reservation-Agents', '9620': 'Laborers',
-    '0': 'N/A-Unemployed'
-}
+# --- parallelism -----------------------------------------------------------------
+
+_CORES           = os.cpu_count() or 4
+DOWNLOAD_WORKERS = min(_CORES * 2, 16)   # capped to avoid Census server rate-limits
+REGION_WORKERS   = 2
 
 
-POBP_MAP = {
-    '36': 'New-York', '34': 'New-Jersey', '42': 'Pennsylvania', '9': 'Connecticut',
-    '25': 'Massachusetts', '12': 'Florida', '6': 'California', '48': 'Texas',
-    '13': 'Georgia', '37': 'North-Carolina', '45': 'South-Carolina',
-    '72': 'PlaceCode_72', '313': 'PlaceCode_313', '303': 'PlaceCode_303', '1': 'PlaceCode_1'
-}
+# --- state groups ----------------------------------------------------------------
+
+NORTHEAST_STATES = ['CT', 'ME', 'MA', 'NH', 'RI', 'VT', 'NJ', 'NY', 'PA']
+SOUTH_STATES     = ['DE', 'FL', 'GA', 'MD', 'NC', 'SC', 'VA', 'DC', 'WV',
+                    'AL', 'KY', 'MS', 'TN', 'AR', 'LA', 'OK', 'TX']
+
+SURVEY_YEAR = '2024'
+HORIZON     = '1-Year'
 
 
-# FIX #3 — mappings for the integer-coded columns that were previously left as raw
-# numbers. Without these, FP-Growth items would be uninterpretable (e.g. SEX=1).
-# All codes taken from the ACS 2018 PUMS data dictionary.
+# --- prediction tasks ------------------------------------------------------------
 
-# COW: class of worker (codes 1–9)
+_INCOME_FEATURES = [
+    'AGEP',   # age
+    'COW',    # class of worker
+    'SCHL',   # educational attainment
+    'MAR',    # marital status
+    'OCCP',   # occupation
+    'POBP',   # place of birth
+    'RELP',   # relationship to reference person
+    'WKHP',   # usual hours worked per week
+    'SEX',    # sex
+    'RAC1P',  # race
+]
+
+ACSIncomeNortheast = folktables.BasicProblem(
+    features=_INCOME_FEATURES,
+    target='PINCP',
+    target_transform=lambda x: x > 110_000,
+    group='RAC1P',
+    preprocess=folktables.adult_filter,
+    postprocess=lambda x: np.nan_to_num(x, nan=-1),
+)
+
+ACSIncomeSouth = folktables.BasicProblem(
+    features=_INCOME_FEATURES,
+    target='PINCP',
+    target_transform=lambda x: x > 90_000,
+    group='RAC1P',
+    preprocess=folktables.adult_filter,
+    postprocess=lambda x: np.nan_to_num(x, nan=-1),
+)
+
+
+# --- categorical mappings --------------------------------------------------------
+# Source: 2023 ACS PUMS Data Dictionary (census.gov)
+# Codes arrive from folktables as float64; the lookup layer converts them to
+# integers before indexing, so keys here are plain int-strings without leading zeros.
+
 COW_MAP = {
-    '1': 'Private-For-Profit',
-    '2': 'Private-Non-Profit',
-    '3': 'Local-Government',
-    '4': 'State-Government',
-    '5': 'Federal-Government',
-    '6': 'Self-Employed-Unincorporated',
+    '1': 'Employee-Private-For-Profit',
+    '2': 'Employee-Private-Non-Profit',
+    '3': 'Local-Government-Employee',
+    '4': 'State-Government-Employee',
+    '5': 'Federal-Government-Employee',
+    '6': 'Self-Employed-Not-Incorporated',
     '7': 'Self-Employed-Incorporated',
-    '8': 'Family-Business-Unpaid',
-    '9': 'Long-Term-Unemployed-Or-Never-Worked',
+    '8': 'Unpaid-Family-Worker',
+    '9': 'Unemployed-5plus-Years-Or-Never-Worked',
 }
 
-# MAR: marital status (codes 1–5)
+SCHL_MAP = {
+    '1':  'No-Schooling-Completed',
+    '2':  'Nursery-School-Preschool',
+    '3':  'Kindergarten',
+    '4':  'Grade-1',
+    '5':  'Grade-2',
+    '6':  'Grade-3',
+    '7':  'Grade-4',
+    '8':  'Grade-5',
+    '9':  'Grade-6',
+    '10': 'Grade-7',
+    '11': 'Grade-8',
+    '12': 'Grade-9',
+    '13': 'Grade-10',
+    '14': 'Grade-11',
+    '15': 'Grade-12-No-Diploma',
+    '16': 'Regular-HS-Diploma',
+    '17': 'GED-Or-Alt-Credential',
+    '18': 'Some-College-Less-Than-1yr',
+    '19': 'Some-College-1yr-Or-More-No-Degree',
+    '20': 'Associates-Degree',
+    '21': 'Bachelors-Degree',
+    '22': 'Masters-Degree',
+    '23': 'Professional-Degree-Beyond-Bachelors',
+    '24': 'Doctorate-Degree',
+}
+
 MAR_MAP = {
     '1': 'Married',
     '2': 'Widowed',
     '3': 'Divorced',
     '4': 'Separated',
-    '5': 'Never-Married',
+    '5': 'Never-Married-Or-Under-15',
 }
 
-# RELP: relationship to reference person (codes 0–17)
+# Note: codes 8-17 differ from many third-party references; these are verbatim
+# from the 2023 ACS PUMS Data Dictionary.
 RELP_MAP = {
     '0':  'Reference-Person',
-    '1':  'Spouse',
-    '2':  'Biological-Child',
-    '3':  'Adopted-Child',
-    '4':  'Stepchild',
-    '5':  'Sibling',
-    '6':  'Parent',
+    '1':  'Husband-Wife',
+    '2':  'Biological-Son-Or-Daughter',
+    '3':  'Adopted-Son-Or-Daughter',
+    '4':  'Stepson-Or-Stepdaughter',
+    '5':  'Brother-Or-Sister',
+    '6':  'Father-Or-Mother',
     '7':  'Grandchild',
-    '8':  'In-Law',
-    '9':  'Other-Relative',
-    '10': 'Roommate',
-    '11': 'Foster-Child',
-    '12': 'Other-Nonrelative',
-    '13': 'Institutionalized-GQ',
-    '14': 'Noninstitutionalized-GQ',
-    '15': 'GQ-Other-1',
-    '16': 'GQ-Other-2',
-    '17': 'GQ-Other-3',
+    '8':  'Parent-In-Law',
+    '9':  'Son-In-Law-Or-Daughter-In-Law',
+    '10': 'Other-Relative',
+    '11': 'Roomer-Or-Boarder',
+    '12': 'Housemate-Or-Roommate',
+    '13': 'Unmarried-Partner',
+    '14': 'Foster-Child',
+    '15': 'Other-Nonrelative',
+    '16': 'Institutionalized-Group-Quarters',
+    '17': 'Noninstitutionalized-Group-Quarters',
 }
 
-# SEX (codes 1–2)
 SEX_MAP = {
     '1': 'Male',
     '2': 'Female',
 }
 
-# RAC1P: race (codes 1–9)
 RAC1P_MAP = {
-    '1': 'White',
-    '2': 'Black-AfricanAmerican',
-    '3': 'AmericanIndian',
-    '4': 'AlaskaNative',
-    '5': 'AmericanIndian-AlaskaNative-Mixed',
-    '6': 'Asian',
-    '7': 'NativeHawaiian-PacificIslander',
-    '8': 'Other-Race',
+    '1': 'White-Alone',
+    '2': 'Black-Or-African-American-Alone',
+    '3': 'American-Indian-Alone',
+    '4': 'Alaska-Native-Alone',
+    '5': 'American-Indian-And-Alaska-Native-Tribes',
+    '6': 'Asian-Alone',
+    '7': 'Native-Hawaiian-And-Other-Pacific-Islander-Alone',
+    '8': 'Some-Other-Race-Alone',
     '9': 'Two-Or-More-Races',
 }
 
-# the two regions we compare — chosen to maximize socioeconomic contrast
-REGIONS = {
-    'northeast': ['NY', 'NJ', 'CT', 'MA', 'PA'],
-    'south':     ['TX', 'FL', 'GA', 'NC', 'SC'],
+POBP_MAP = {
+    # US states and DC — FIPS numeric codes
+    '1':  'Alabama',        '2':  'Alaska',         '4':  'Arizona',
+    '5':  'Arkansas',       '6':  'California',     '8':  'Colorado',
+    '9':  'Connecticut',    '10': 'Delaware',        '11': 'DC',
+    '12': 'Florida',        '13': 'Georgia',         '15': 'Hawaii',
+    '16': 'Idaho',          '17': 'Illinois',        '18': 'Indiana',
+    '19': 'Iowa',           '20': 'Kansas',          '21': 'Kentucky',
+    '22': 'Louisiana',      '23': 'Maine',           '24': 'Maryland',
+    '25': 'Massachusetts',  '26': 'Michigan',        '27': 'Minnesota',
+    '28': 'Mississippi',    '29': 'Missouri',        '30': 'Montana',
+    '31': 'Nebraska',       '32': 'Nevada',          '33': 'New-Hampshire',
+    '34': 'New-Jersey',     '35': 'New-Mexico',      '36': 'New-York',
+    '37': 'North-Carolina', '38': 'North-Dakota',    '39': 'Ohio',
+    '40': 'Oklahoma',       '41': 'Oregon',          '42': 'Pennsylvania',
+    '44': 'Rhode-Island',   '45': 'South-Carolina',  '46': 'South-Dakota',
+    '47': 'Tennessee',      '48': 'Texas',           '49': 'Utah',
+    '50': 'Vermont',        '51': 'Virginia',        '53': 'Washington',
+    '54': 'West-Virginia',  '55': 'Wisconsin',       '56': 'Wyoming',
+    '72': 'Puerto-Rico',
+    # Foreign born
+    '100': 'Born-Abroad-US-Parents',
+    '301': 'Cuba',            '302': 'Jamaica',           '303': 'Dominican-Republic',
+    '308': 'Haiti',           '313': 'Other-Caribbean',
+    '400': 'Mexico',          '414': 'Guatemala',         '416': 'Honduras',
+    '417': 'El-Salvador',     '422': 'Nicaragua',         '423': 'Panama',
+    '424': 'Other-Central-America',
+    '501': 'Colombia',        '507': 'Peru',              '508': 'Brazil',
+    '516': 'Venezuela',       '523': 'Other-South-America',
+    '600': 'Armenia',         '601': 'China',             '603': 'India',
+    '607': 'Japan',           '613': 'Philippines',       '615': 'South-Korea',
+    '618': 'Vietnam',         '619': 'Other-Southeast-Asia', '620': 'Other-Asia',
+    '700': 'United-Kingdom',  '703': 'Germany',           '706': 'Greece',
+    '708': 'Ireland',         '710': 'Italy',             '714': 'Poland',
+    '716': 'Portugal',        '720': 'Russia',            '724': 'Ukraine',
+    '730': 'Other-Europe',
+    '800': 'Nigeria',         '803': 'Ethiopia',          '804': 'Egypt',
+    '820': 'Other-Africa',
+    '900': 'Canada',          '999': 'Other-NEC',
+}
+
+# Only the most frequent SOC codes are named; the rest fall back to 'Other-Occupation'
+OCCP_MAP = {
+    '0':    'Not-In-Labor-Force-Or-Under-16',
+    '10':   'Chief-Executives',
+    '20':   'General-Operations-Managers',
+    '120':  'Financial-Managers',
+    '136':  'HR-Managers',
+    '220':  'Advertising-And-Marketing-Managers',
+    '300':  'Purchasing-Managers',
+    '310':  'Transportation-Managers',
+    '330':  'Food-Service-Managers',
+    '410':  'Medical-And-Health-Services-Managers',
+    '430':  'Construction-Managers',
+    '440':  'Other-Managers',
+    '500':  'Agents-Of-Performing-Arts',
+    '510':  'Compliance-Officers',
+    '520':  'Cost-Estimators',
+    '530':  'Human-Resources-Workers',
+    '710':  'Management-Analysts',
+    '720':  'Meeting-And-Event-Planners',
+    '800':  'Accountants-And-Auditors',
+    '840':  'Financial-Analysts',
+    '850':  'Personal-Financial-Advisors',
+    '900':  'Financial-Examiners',
+    '950':  'Other-Financial-Specialists',
+    '1010': 'Computer-Systems-Analysts',
+    '1020': 'Software-Developers',
+    '1021': 'Software-Quality-Assurance',
+    '1022': 'Web-Developers',
+    '1032': 'Software-Dev-And-Programmers-NEC',
+    '1050': 'Computer-Support-Specialists',
+    '1060': 'Database-Administrators',
+    '1100': 'Network-Architects',
+    '1110': 'Network-And-Systems-Administrators',
+    '1200': 'Actuaries',
+    '1220': 'Operations-Research-Analysts',
+    '1230': 'Statisticians',
+    '1240': 'Data-Scientists',
+    '2100': 'Lawyers',
+    '2105': 'Judicial-Law-Clerks',
+    '2110': 'Judges-And-Magistrates',
+    '2310': 'Elementary-School-Teachers',
+    '2320': 'Middle-School-Teachers',
+    '2330': 'Secondary-School-Teachers',
+    '2540': 'Special-Education-Teachers',
+    '2550': 'Other-Teachers',
+    '2560': 'Tutors-And-Instructors',
+    '2630': 'Postsecondary-Teachers',
+    '2640': 'Preschool-And-Kindergarten-Teachers',
+    '2720': 'Art-Directors',
+    '2740': 'Graphic-Designers',
+    '2750': 'Interior-Designers',
+    '3010': 'Chiropractors',
+    '3050': 'Dietitians-And-Nutritionists',
+    '3090': 'Emergency-Medical-Technicians',
+    '3100': 'Exercise-Physiologists',
+    '3130': 'Pharmacists',
+    '3160': 'Physical-Therapists',
+    '3230': 'Physicians-And-Surgeons',
+    '3250': 'Registered-Nurses',
+    '3255': 'Nurse-Practitioners',
+    '3260': 'Occupational-Therapists',
+    '3300': 'Dentists',
+    '3420': 'Dental-Assistants',
+    '3500': 'Licensed-Practical-Nurses',
+    '3600': 'Medical-Assistants',
+    '4000': 'Cooks-Restaurant',
+    '4020': 'Food-Preparation-Workers',
+    '4040': 'Bartenders',
+    '4055': 'Fast-Food-Workers',
+    '4110': 'Waiters-And-Waitresses',
+    '4120': 'Dining-Room-Attendants',
+    '4140': 'Dishwashers',
+    '4220': 'Janitors-And-Cleaners',
+    '4230': 'Maids-And-Housekeeping',
+    '4700': 'First-Line-Retail-Supervisors',
+    '4720': 'Cashiers',
+    '4740': 'Counter-And-Rental-Clerks',
+    '4760': 'Retail-Salespersons',
+    '4800': 'Insurance-Sales-Agents',
+    '4810': 'Securities-And-Financial-Sales',
+    '4820': 'Real-Estate-Brokers-And-Agents',
+    '4840': 'Telemarketers',
+    '4850': 'Sales-Representatives',
+    '5000': 'First-Line-Office-Supervisors',
+    '5110': 'Receptionists',
+    '5120': 'Information-Clerks',
+    '5160': 'Customer-Service-Representatives',
+    '5230': 'Payroll-And-Timekeeping-Clerks',
+    '5240': 'Human-Resources-Assistants',
+    '5260': 'Eligibility-Interviewers',
+    '5420': 'Postal-Service-Workers',
+    '5600': 'Production-Planning-Clerks',
+    '5700': 'Secretaries-And-Admin-Assistants',
+    '5820': 'Data-Entry-Keyers',
+    '9600': 'Cleaners-Of-Vehicles-And-Equipment',
+    '9620': 'Laborers-And-Material-Movers',
+    '9800': 'Military-Officer-Special-Operations',
+    '9810': 'Military-First-Line-Supervisors',
+    '9820': 'Military-Enlisted-Tactical-Operations',
+    '9830': 'Military-Rank-Not-Specified',
+}
+
+# Codes not found in the maps above get this label, so each column stays
+# semantically uniform (no raw integer strings mixed with text labels).
+COLUMN_FALLBACKS = {
+    'OCCP': 'Other-Occupation',
+    'POBP': 'Other-NEC',
+}
+
+COLUMN_MAPS = {
+    'COW':   COW_MAP,
+    'SCHL':  SCHL_MAP,
+    'MAR':   MAR_MAP,
+    'RELP':  RELP_MAP,
+    'SEX':   SEX_MAP,
+    'RAC1P': RAC1P_MAP,
+    'POBP':  POBP_MAP,
+    'OCCP':  OCCP_MAP,
 }
 
 
-def create_region_dataset(states, year="2018"):
-    """
-    Download ACS data for a list of states and concatenate them into one DataFrame.
-    Each row gets a 'state' column so we can trace where it came from if needed.
-    """
-    dfs = []
-    data_source = ACSDataSource(survey_year=year, horizon='1-Year', survey='person')
+# --- lookup arrays ---------------------------------------------------------------
+# Each mapping is compiled into a numpy object array indexed by integer code.
+# Index = code + 1, so the NaN sentinel (-1) maps to index 0 and gets the
+# fallback label.  This avoids per-row dict lookups and string conversions.
 
-    for state in states:
-        print(f"    - downloading {state} {year}...")
-        acs_data = data_source.get_data(states=[state], download=True)
-        features, labels, _ = ACSIncome.df_to_pandas(acs_data)
-        df = features.copy()
-        df['target'] = labels
-        df['state'] = state
-        dfs.append(df)
-
-    combined = pd.concat(dfs, ignore_index=True)
-    print(f"    - combined: {len(combined):,} samples from {states}")
-    return combined
+def _build_lookup(mapping: dict, fallback: str) -> np.ndarray:
+    max_code = max(int(k) for k in mapping) if mapping else 0
+    arr = np.full(max_code + 2, fill_value=fallback, dtype=object)
+    for code_str, label in mapping.items():
+        arr[int(code_str) + 1] = label
+    return arr
 
 
-def _int_str(series):
-    """
-    Safe integer-string conversion for ACS code columns.
-
-    pd.read_csv() loads numeric columns as float64, so a naive .astype(str)
-    produces '10.0' instead of '10', silently breaking every dict lookup.
-    Casting float → int → str restores the bare integer string that matches
-    the dictionary keys. NaNs are preserved so fillna() can handle them later.
-
-    FIX #1 — applied to OCCP, POBP, COW, MAR, RELP, SEX, RAC1P.
-    """
-    return series.where(series.isna(), series.astype(float).astype('Int64').astype(str))
+_LOOKUPS: dict[str, np.ndarray] = {
+    col: _build_lookup(mapping, COLUMN_FALLBACKS.get(col, 'Unknown'))
+    for col, mapping in COLUMN_MAPS.items()
+}
 
 
-def categorize_dataset(input_path, output_path):
-    """
-    Convert continuous/coded columns into readable categorical strings.
-    Needed because FP-Growth works on discrete items, not raw numbers.
-    """
-    print(f"  > Categorizing {Path(input_path).name}...")
-    df = pd.read_csv(input_path)
+# --- helpers ---------------------------------------------------------------------
 
-    # --- integer-coded columns: safe int→str conversion before dict lookup ---
-    # FIX #1: use _int_str() to avoid the '10.0' ≠ '10' mismatch
-    df['OCCP']  = _int_str(df['OCCP']).map(OCCP_MAP).fillna('Other-Occupation')
-    df['POBP']  = _int_str(df['POBP']).map(POBP_MAP).fillna('Other-Place')
-
-    # FIX #3: map the remaining integer-coded columns that were left as raw ints
-    df['COW']   = _int_str(df['COW']).map(COW_MAP).fillna('Other-COW')
-    df['MAR']   = _int_str(df['MAR']).map(MAR_MAP).fillna('Other-MAR')
-    df['RELP']  = _int_str(df['RELP']).map(RELP_MAP).fillna('Other-RELP')
-    df['SEX']   = _int_str(df['SEX']).map(SEX_MAP).fillna('Other-SEX')
-    df['RAC1P'] = _int_str(df['RAC1P']).map(RAC1P_MAP).fillna('Other-Race')
-
-    # --- SCHL: education level codes from the ACS codebook ---
-    def map_schl(x):
-        # FIX #2: guard against NaN before numeric comparisons to avoid TypeError
-        if pd.isna(x):
-            return 'Unknown-Education'
-        if x <= 15:
-            return 'No-HS-Diploma'
-        if x in [16, 17]:
-            return 'HS-Diploma-GED'
-        if x == 21:
-            return 'Bachelor-Degree'
-        if x >= 22:
-            return 'Advanced-Degree'
-        # codes 18 (some college < 1yr), 19 (some college >= 1yr),
-        # 20 (Associate's degree) all map here — intentional grouping
-        return 'Some-College-Vocational'
-
-    df['SCHL'] = df['SCHL'].apply(map_schl)
-
-    # --- continuous columns: bin into readable labels ---
-
-    # AGEP: ACSIncome filters to 16+ so the lower bound starts at 15
-    df['AGEP'] = pd.cut(df['AGEP'], bins=[15, 29, 44, 59, 150],
-                        labels=['Young-Adults', 'Adults', 'Middle-Aged', 'Seniors'])
-
-    # WKHP: BLS defines part-time as <35h, FLSA standard full-time is 40h/week
-    df['WKHP'] = pd.cut(df['WKHP'], bins=[-1, 34, 40, 49, 150],
-                        labels=['Part-Time', 'Full-Time', 'Overtime', 'Intensive'])
-
-    # drop the group column folktables sometimes adds, and the state column
-    # added by create_region_dataset (not a feature, just a provenance tag)
-    for col in ['group', 'state']:
-        if col in df.columns:
-            df.drop(columns=[col], inplace=True)
-
-    # astype(str) first makes the mapping robust regardless of whether pd.read_csv
-    # parsed 'True'/'False' back as booleans or left them as strings — both cases
-    # produce the string keys 'True'/'False' that the dict below expects.
-    df['target'] = df['target'].astype(str).map({'True': '>50k', 'False': '<=50k'})
-
-    df.to_csv(output_path, index=False)
-    print(f"    - saved to {Path(output_path).name}")
+def _decode_column(series: pd.Series, lookup: np.ndarray) -> np.ndarray:
+    """Map a float64 code series to string labels via integer array indexing."""
+    codes = pd.to_numeric(series, errors='coerce').fillna(-1).to_numpy(dtype=np.int32)
+    idx   = np.clip(codes + 1, 0, len(lookup) - 1)
+    return lookup[idx]
 
 
-def balance_datasets(df1, df2, random_state=42):
-    """
-    Stratified downsample the larger dataset to match the size of the smaller one.
-    Stratification is on 'target' so the class ratio is preserved after sampling.
+def apply_categorical_mappings(df: pd.DataFrame) -> None:
+    """Decode all categorical columns in-place using the pre-built lookup arrays."""
+    for col, lookup in _LOOKUPS.items():
+        if col not in df.columns:
+            continue
+        df[col] = pd.Categorical(_decode_column(df[col], lookup))
 
-    Returns (df1_balanced, df2_balanced) — one of them is unchanged, the other
-    is the downsampled version.
-    """
-    n1, n2 = len(df1), len(df2)
-    target_n = min(n1, n2)
 
-    print(f"  > Balancing datasets: {n1:,} vs {n2:,} → target {target_n:,} each")
+def _download_state(data_source: ACSDataSource, state: str) -> pd.DataFrame:
+    return data_source.get_data(states=[state], download=True)
 
-    def stratified_sample(df, n, seed):
-        # FIX #4: use n=round(...) per group instead of frac= to guarantee the
-        # total sample count equals target_n exactly, avoiding float-rounding
-        # discrepancies that could leave the result 1–2 rows off.
-        # Explicit per-group sampling via concat avoids the pandas FutureWarning
-        # about groupby.apply operating on the grouping column.
-        group_sizes = df.groupby('target').size()
-        return pd.concat([
-            df[df['target'] == label].sample(
-                n=round(n * size / len(df)), random_state=seed
+
+def parallel_get_data(
+    data_source: ACSDataSource,
+    states: list[str],
+    label: str,
+) -> pd.DataFrame:
+    """Download one region's states concurrently and concatenate the results."""
+    n_workers = min(len(states), DOWNLOAD_WORKERS)
+    print(f"  [{label}] fetching {len(states)} states ({n_workers} workers)")
+
+    results: dict[str, pd.DataFrame] = {}
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        futures = {pool.submit(_download_state, data_source, s): s for s in states}
+        for fut in as_completed(futures):
+            state = futures[fut]
+            try:
+                results[state] = fut.result()
+                print(f"    {state} done")
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Download failed for {state}: {exc}\n"
+                    f"If {SURVEY_YEAR} data is not yet available, "
+                    f"try setting SURVEY_YEAR = '{int(SURVEY_YEAR) - 1}'."
+                ) from exc
+
+    # maintain original state order
+    return pd.concat([results[s] for s in states], ignore_index=True)
+
+
+def build_dataset(
+    task: folktables.BasicProblem,
+    states: list[str],
+    data_source: ACSDataSource,
+    label: str,
+) -> pd.DataFrame:
+    t0 = time.perf_counter()
+    print(f"\n{label}")
+    print("-" * len(label))
+
+    raw = parallel_get_data(data_source, states, label)
+    print(f"  raw rows: {len(raw):,}  ({time.perf_counter() - t0:.1f}s)")
+
+    features_df, labels, _ = task.df_to_pandas(raw)
+    features_df['INCOME_ABOVE_THRESHOLD'] = labels.to_numpy(dtype=np.int8)
+
+    apply_categorical_mappings(features_df)
+
+    for col in ('AGEP', 'WKHP'):
+        if col in features_df.columns:
+            features_df[col] = (
+                pd.to_numeric(features_df[col], errors='coerce')
+                .fillna(-1)
+                .astype(np.int32)
             )
-            for label, size in group_sizes.items()
-        ]).reset_index(drop=True)
 
-    if n1 > n2:
-        df1 = stratified_sample(df1, target_n, random_state)
-    elif n2 > n1:
-        df2 = stratified_sample(df2, target_n, random_state)
-    # if n1 == n2 both are returned unchanged — no sampling needed
+    pos = features_df['INCOME_ABOVE_THRESHOLD'].mean() * 100
+    print(f"  kept rows: {len(features_df):,}  |  positive class: {pos:.1f}%"
+          f"  ({time.perf_counter() - t0:.1f}s total)")
 
-    print(f"    - df1: {len(df1):,} samples  "
-          f"(>50k: {(df1['target'] == '>50k').mean():.1%})")
-    print(f"    - df2: {len(df2):,} samples  "
-          f"(>50k: {(df2['target'] == '>50k').mean():.1%})")
-
-    return df1, df2
+    return features_df
 
 
-if __name__ == "__main__":
-    if Path("/content").exists():
-        data_dir = Path("/content/data")
-    else:
-        base_dir = Path(__file__).resolve().parent.parent
-        data_dir = base_dir / "data"
+# --- main ------------------------------------------------------------------------
 
-    data_dir.mkdir(parents=True, exist_ok=True)
+def main() -> None:
+    t0 = time.perf_counter()
 
-    print("\n" + "="*70)
-    print("DATA PREPARATION — NORTHEAST vs SOUTH 2018")
-    print("="*70 + "\n")
+    data_source = ACSDataSource(survey_year=SURVEY_YEAR, horizon=HORIZON, survey='person')
 
-    for region, states in REGIONS.items():
-        raw_csv = data_dir / f"ACSIncome_{region}_2018_clean.csv"
-        cat_csv = data_dir / f"ACSIncome_{region}_2018_categorized.csv"
+    out_ne = f'acs_income_northeast_{SURVEY_YEAR}.csv'
+    out_s  = f'acs_income_south_{SURVEY_YEAR}.csv'
 
-        print(f"  > Region: {region.upper()} {states}")
+    print(f"ACS Income {SURVEY_YEAR} — building datasets\n")
 
-        if not raw_csv.exists():
-            df_raw = create_region_dataset(states)
-            df_raw.to_csv(raw_csv, index=False)
-            print(f"    - raw saved to {raw_csv.name}\n")
-        else:
-            print(f"    - raw already exists ({raw_csv.name}), skipping.\n")
+    with ThreadPoolExecutor(max_workers=REGION_WORKERS) as pool:
+        fut_ne = pool.submit(
+            build_dataset, ACSIncomeNortheast, NORTHEAST_STATES,
+            data_source, 'Northeast ($110,000 threshold)'
+        )
+        fut_s = pool.submit(
+            build_dataset, ACSIncomeSouth, SOUTH_STATES,
+            data_source, 'South ($90,000 threshold)'
+        )
+        df_ne = fut_ne.result()
+        df_s  = fut_s.result()
 
-        if not cat_csv.exists():
-            categorize_dataset(raw_csv, cat_csv)
-            print()
-        else:
-            print(f"    - categorized already exists ({cat_csv.name}), skipping.\n")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        w1 = pool.submit(df_ne.to_csv, out_ne, index=False)
+        w2 = pool.submit(df_s.to_csv,  out_s,  index=False)
+        w1.result()
+        w2.result()
 
-    # balance the two categorized datasets
-    ne_csv = data_dir / "ACSIncome_northeast_2018_categorized.csv"
-    so_csv = data_dir / "ACSIncome_south_2018_categorized.csv"
-    ne_bal = data_dir / "ACSIncome_northeast_2018_balanced.csv"
-    so_bal = data_dir / "ACSIncome_south_2018_balanced.csv"
+    print(f"\ndone in {time.perf_counter() - t0:.1f}s")
+    print(f"  {out_ne}  ({len(df_ne):,} rows)")
+    print(f"  {out_s}  ({len(df_s):,} rows)")
+    print(f"\ndtypes:\n{df_ne.dtypes.to_string()}")
 
-    if not ne_bal.exists() or not so_bal.exists():
-        print("  > Balancing datasets...")
-        df_ne = pd.read_csv(ne_csv)
-        df_so = pd.read_csv(so_csv)
-        df_ne, df_so = balance_datasets(df_ne, df_so)
-        df_ne.to_csv(ne_bal, index=False)
-        df_so.to_csv(so_bal, index=False)
-        print(f"    - balanced datasets saved.\n")
-    else:
-        print(f"  > Balanced datasets already exist, skipping.\n")
 
-    print("="*70)
-    print("Done.")
-    print("="*70 + "\n")
+if __name__ == '__main__':
+    main()
