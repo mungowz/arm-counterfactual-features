@@ -33,8 +33,9 @@ REGION_WORKERS   = 2
 # --- state groups ----------------------------------------------------------------
 
 NORTHEAST_STATES = ['CT', 'ME', 'MA', 'NH', 'RI', 'VT', 'NJ', 'NY', 'PA']
-SOUTH_STATES     = ['DE', 'FL', 'GA', 'MD', 'NC', 'SC', 'VA', 'DC', 'WV',
+SOUTH_STATES     = ['DE', 'FL', 'GA', 'MD', 'NC', 'SC', 'VA', 'WV',
                     'AL', 'KY', 'MS', 'TN', 'AR', 'LA', 'OK', 'TX']
+# Note: DC excluded — not present in folktables' state_list
 
 SURVEY_YEAR = '2024'
 HORIZON     = '1-Year'
