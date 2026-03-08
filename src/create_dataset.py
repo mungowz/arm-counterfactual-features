@@ -1,13 +1,12 @@
 """
 build_acs_datasets.py
 
-Downloads ACS Income PUMS data for two US regions and saves them as
-classification-ready CSVs with human-readable categorical labels.
+Downloads 2024 ACS 1-Year PUMS person records for two US regions and
+produces classification-ready CSVs with human-readable categorical labels.
+The South dataset is undersampled to match the Northeast size.
 
-    Northeast states — income threshold $110,000
-    South states     — income threshold $90,000
-
-Survey year: 2024 | Horizon: 1-Year | Survey: person (PUMS)
+    Northeast (9 states)  — income threshold $110,000
+    South     (16 states) — income threshold $90,000
 
 Usage:
     pip install folktables pandas numpy
@@ -23,37 +22,35 @@ from folktables import ACSDataSource
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
-# --- parallelism -----------------------------------------------------------------
-
 _CORES           = os.cpu_count() or 4
-DOWNLOAD_WORKERS = min(_CORES * 2, 16)   # capped to avoid Census server rate-limits
+DOWNLOAD_WORKERS = min(_CORES * 2, 16)
 REGION_WORKERS   = 2
 
-
-# --- state groups ----------------------------------------------------------------
-
 NORTHEAST_STATES = ['CT', 'ME', 'MA', 'NH', 'RI', 'VT', 'NJ', 'NY', 'PA']
-SOUTH_STATES     = ['DE', 'FL', 'GA', 'MD', 'NC', 'SC', 'VA', 'WV',
-                    'AL', 'KY', 'MS', 'TN', 'AR', 'LA', 'OK', 'TX']
-# Note: DC excluded — not present in folktables' state_list
+SOUTH_STATES     = ['DE', 'FL', 'GA', 'MD', 'NC', 'SC', 'VA', 'WV', 'AL', 'KY', 'MS', 'TN', 'AR', 'LA', 'OK', 'TX']
+# DC is not in folktables' state list
 
 SURVEY_YEAR = '2024'
-HORIZON     = '1-Year'
+HORIZON = '1-Year'
+RANDOM_SEED = 42
+OUTPUT_DIR = 'data'
 
 
-# --- prediction tasks ------------------------------------------------------------
+# --------------------------------------------------------------------------- #
+# prediction tasks
+# --------------------------------------------------------------------------- #
 
 _INCOME_FEATURES = [
-    'AGEP',   # age
-    'COW',    # class of worker
-    'SCHL',   # educational attainment
-    'MAR',    # marital status
-    'OCCP',   # occupation
-    'POBP',   # place of birth
-    'RELSHIPP',  # relationship to reference person (replaces RELP from 2019 onward)
-    'WKHP',   # usual hours worked per week
-    'SEX',    # sex
-    'RAC1P',  # race
+    'AGEP', # age
+    'COW', # class of worker
+    'SCHL', # educational attainment
+    'MAR', # marital status
+    'OCCP', # occupation
+    'POBP', # place of birth
+    'RELSHIPP', # relationship to reference person
+    'WKHP', # usual hours worked per week
+    'SEX', # sex
+    'RAC1P', # race
 ]
 
 ACSIncomeNortheast = folktables.BasicProblem(
@@ -75,10 +72,11 @@ ACSIncomeSouth = folktables.BasicProblem(
 )
 
 
-# --- categorical mappings --------------------------------------------------------
-# Source: 2024 ACS PUMS Data Dictionary (census.gov, October 16, 2025)
-# Codes arrive from folktables as float64; the lookup layer converts them to
-# integers before indexing, so keys here are plain int-strings without leading zeros.
+# --------------------------------------------------------------------------- #
+# categorical mappings — source: 2024 ACS PUMS Data Dictionary (census.gov)
+# codes come from folktables as float64 and are cast to int before lookup,
+# so keys are plain int-strings with no leading zeros
+# --------------------------------------------------------------------------- #
 
 COW_MAP = {
     '1': 'Employee-Private-For-Profit',
@@ -93,15 +91,15 @@ COW_MAP = {
 }
 
 SCHL_MAP = {
-    '1':  'No-Schooling-Completed',
-    '2':  'Nursery-School-Preschool',
-    '3':  'Kindergarten',
-    '4':  'Grade-1',
-    '5':  'Grade-2',
-    '6':  'Grade-3',
-    '7':  'Grade-4',
-    '8':  'Grade-5',
-    '9':  'Grade-6',
+    '1': 'No-Schooling-Completed',
+    '2': 'Nursery-School-Preschool',
+    '3': 'Kindergarten',
+    '4': 'Grade-1',
+    '5': 'Grade-2',
+    '6': 'Grade-3',
+    '7': 'Grade-4',
+    '8': 'Grade-5',
+    '9': 'Grade-6',
     '10': 'Grade-7',
     '11': 'Grade-8',
     '12': 'Grade-9',
@@ -127,8 +125,7 @@ MAR_MAP = {
     '5': 'Never-Married-Or-Under-15',
 }
 
-# RELSHIPP replaced RELP starting with 2019 ACS PUMS; codes are 20-38 (two digits).
-# The new scheme adds separate codes for same-sex vs opposite-sex couples.
+# two-digit codes (20-38) introduced in 2019; distinguishes same-sex couples
 RELSHIPP_MAP = {
     '20': 'Reference-Person',
     '21': 'Opposite-Sex-Husband-Wife-Spouse',
@@ -170,12 +167,23 @@ RAC1P_MAP = {
 
 POBP_MAP = {
     # US states and DC — FIPS numeric codes
-    '1':  'Alabama',        '2':  'Alaska',         '4':  'Arizona',
-    '5':  'Arkansas',       '6':  'California',     '8':  'Colorado',
-    '9':  'Connecticut',    '10': 'Delaware',        '11': 'DC',
-    '12': 'Florida',        '13': 'Georgia',         '15': 'Hawaii',
-    '16': 'Idaho',          '17': 'Illinois',        '18': 'Indiana',
-    '19': 'Iowa',           '20': 'Kansas',          '21': 'Kentucky',
+    '1': 'Alabama',
+    '2': 'Alaska',
+    '4': 'Arizona',
+    '5': 'Arkansas',
+    '6': 'California',
+    '8': 'Colorado',
+    '9': 'Connecticut',
+    '10': 'Delaware',
+    '11': 'DC',
+    '12': 'Florida',
+    '13': 'Georgia',
+    '15': 'Hawaii',
+    '16': 'Idaho',
+    '17': 'Illinois',
+    '18': 'Indiana',
+    '19': 'Iowa',
+    '20': 'Kansas',          '21': 'Kentucky',
     '22': 'Louisiana',      '23': 'Maine',           '24': 'Maryland',
     '25': 'Massachusetts',  '26': 'Michigan',        '27': 'Minnesota',
     '28': 'Mississippi',    '29': 'Missouri',        '30': 'Montana',
@@ -190,26 +198,43 @@ POBP_MAP = {
     '72': 'Puerto-Rico',
     # Foreign born
     '100': 'Born-Abroad-US-Parents',
-    '301': 'Cuba',            '302': 'Jamaica',           '303': 'Dominican-Republic',
-    '308': 'Haiti',           '313': 'Other-Caribbean',
-    '400': 'Mexico',          '414': 'Guatemala',         '416': 'Honduras',
-    '417': 'El-Salvador',     '422': 'Nicaragua',         '423': 'Panama',
+    '301': 'Cuba',
+    '302': 'Jamaica',
+    '303': 'Dominican-Republic',
+    '308': 'Haiti',
+    '313': 'Other-Caribbean',
+    '400': 'Mexico',
+    '414': 'Guatemala',
+    '416': 'Honduras',
+    '417': 'El-Salvador',
+    '422': 'Nicaragua',
+    '423': 'Panama',
     '424': 'Other-Central-America',
-    '501': 'Colombia',        '507': 'Peru',              '508': 'Brazil',
-    '516': 'Venezuela',       '523': 'Other-South-America',
-    '600': 'Armenia',         '601': 'China',             '603': 'India',
-    '607': 'Japan',           '613': 'Philippines',       '615': 'South-Korea',
-    '618': 'Vietnam',         '619': 'Other-Southeast-Asia', '620': 'Other-Asia',
-    '700': 'United-Kingdom',  '703': 'Germany',           '706': 'Greece',
+    '501': 'Colombia',
+    '507': 'Peru',
+    '508': 'Brazil',
+    '516': 'Venezuela',
+    '523': 'Other-South-America',
+    '600': 'Armenia',
+    '601': 'China',
+    '603': 'India',
+    '607': 'Japan',
+    '613': 'Philippines',
+    '615': 'South-Korea',
+    '618': 'Vietnam',
+    '619': 'Other-Southeast-Asia',
+    '620': 'Other-Asia',
+    '700': 'United-Kingdom',
+    '703': 'Germany',           '706': 'Greece',
     '708': 'Ireland',         '710': 'Italy',             '714': 'Poland',
     '716': 'Portugal',        '720': 'Russia',            '724': 'Ukraine',
     '730': 'Other-Europe',
-    '800': 'Nigeria',         '803': 'Ethiopia',          '804': 'Egypt',
+    '800': 'Nigeria', '803': 'Ethiopia',          '804': 'Egypt',
     '820': 'Other-Africa',
-    '900': 'Canada',          '999': 'Other-NEC',
+    '900': 'Canada', '999': 'Other-NEC',
 }
 
-# Only the most frequent SOC codes are named; the rest fall back to 'Other-Occupation'
+# most frequent SOC codes only; anything else maps to 'Other-Occupation'
 OCCP_MAP = {
     '0':    'Not-In-Labor-Force-Or-Under-16',
     '10':   'Chief-Executives',
@@ -227,22 +252,28 @@ OCCP_MAP = {
     '510':  'Compliance-Officers',
     '520':  'Cost-Estimators',
     '530':  'Human-Resources-Workers',
-    '710':  'Management-Analysts',
-    '720':  'Meeting-And-Event-Planners',
-    '800':  'Accountants-And-Auditors',
-    '840':  'Financial-Analysts',
-    '850':  'Personal-Financial-Advisors',
-    '900':  'Financial-Examiners',
-    '950':  'Other-Financial-Specialists',
-    '1010': 'Computer-Systems-Analysts',
-    '1020': 'Software-Developers',
-    '1021': 'Software-Quality-Assurance',
-    '1022': 'Web-Developers',
-    '1032': 'Software-Dev-And-Programmers-NEC',
-    '1050': 'Computer-Support-Specialists',
-    '1060': 'Database-Administrators',
-    '1100': 'Network-Architects',
-    '1110': 'Network-And-Systems-Administrators',
+    '540':  'Training-And-Development-Specialists',
+    '565':  'Logisticians',
+    '600':  'Accountants-And-Auditors',
+    '630':  'Budget-Analysts',
+    '640':  'Credit-Analysts',
+    '650':  'Financial-Analysts',
+    '700':  'Management-Analysts',
+    '726':  'Market-Research-Analysts',
+    '740':  'Business-Operations-Specialists',
+    '800':  'Buyers-And-Purchasing-Agents',
+    '840':  'Claims-Adjusters',
+    '1005': 'Computer-And-Info-Research-Scientists',
+    '1006': 'Computer-Systems-Analysts',
+    '1007': 'Information-Security-Analysts',
+    '1010': 'Computer-Programmers',
+    '1021': 'Software-Developers',
+    '1022': 'Software-Quality-Assurance',
+    '1031': 'Web-Developers',
+    '1032': 'Web-And-Digital-Interface-Designers',
+    '1050': 'Database-Administrators',
+    '1065': 'Network-And-Computer-Systems-Admins',
+    '1100': 'Computer-Support-Specialists',
     '1200': 'Actuaries',
     '1220': 'Operations-Research-Analysts',
     '1230': 'Statisticians',
@@ -312,55 +343,53 @@ OCCP_MAP = {
     '9830': 'Military-Rank-Not-Specified',
 }
 
-# Codes not found in the maps above get this label, so each column stays
-# semantically uniform (no raw integer strings mixed with text labels).
 COLUMN_FALLBACKS = {
     'OCCP': 'Other-Occupation',
     'POBP': 'Other-NEC',
 }
 
 COLUMN_MAPS = {
-    'COW':   COW_MAP,
-    'SCHL':  SCHL_MAP,
-    'MAR':   MAR_MAP,
+    'COW': COW_MAP,
+    'SCHL': SCHL_MAP,
+    'MAR': MAR_MAP,
     'RELSHIPP': RELSHIPP_MAP,
-    'SEX':   SEX_MAP,
+    'SEX': SEX_MAP,
     'RAC1P': RAC1P_MAP,
-    'POBP':  POBP_MAP,
-    'OCCP':  OCCP_MAP,
+    'POBP': POBP_MAP,
+    'OCCP': OCCP_MAP,
 }
 
 
-# --- lookup arrays ---------------------------------------------------------------
-# Each mapping is compiled into a numpy object array indexed by integer code.
-# Index = code + 1, so the NaN sentinel (-1) maps to index 0 and gets the
-# fallback label.  This avoids per-row dict lookups and string conversions.
+# --------------------------------------------------------------------------- #
+# lookup arrays
+# --------------------------------------------------------------------------- #
 
 def _build_lookup(mapping: dict, fallback: str) -> np.ndarray:
     max_code = max(int(k) for k in mapping) if mapping else 0
     arr = np.full(max_code + 2, fill_value=fallback, dtype=object)
-    for code_str, label in mapping.items():
-        arr[int(code_str) + 1] = label
+    for k, label in mapping.items():
+        arr[int(k) + 1] = label
     return arr
 
 
+# pre-built at import time; index = code + 1 so that NaN sentinel (-1) → index 0
 _LOOKUPS: dict[str, np.ndarray] = {
-    col: _build_lookup(mapping, COLUMN_FALLBACKS.get(col, 'Unknown'))
-    for col, mapping in COLUMN_MAPS.items()
+    col: _build_lookup(m, COLUMN_FALLBACKS.get(col, 'Unknown'))
+    for col, m in COLUMN_MAPS.items()
 }
 
 
-# --- helpers ---------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
+# helpers
+# --------------------------------------------------------------------------- #
 
 def _decode_column(series: pd.Series, lookup: np.ndarray) -> np.ndarray:
-    """Map a float64 code series to string labels via integer array indexing."""
     codes = pd.to_numeric(series, errors='coerce').fillna(-1).to_numpy(dtype=np.int32)
-    idx   = np.clip(codes + 1, 0, len(lookup) - 1)
+    idx = np.clip(codes + 1, 0, len(lookup) - 1)
     return lookup[idx]
 
 
 def apply_categorical_mappings(df: pd.DataFrame) -> None:
-    """Decode all categorical columns in-place using the pre-built lookup arrays."""
     for col, lookup in _LOOKUPS.items():
         if col not in df.columns:
             continue
@@ -376,9 +405,8 @@ def parallel_get_data(
     states: list[str],
     label: str,
 ) -> pd.DataFrame:
-    """Download one region's states concurrently and concatenate the results."""
     n_workers = min(len(states), DOWNLOAD_WORKERS)
-    print(f"  [{label}] fetching {len(states)} states ({n_workers} workers)")
+    print(f"  [{label}] {len(states)} states — {n_workers} workers")
 
     results: dict[str, pd.DataFrame] = {}
     with ThreadPoolExecutor(max_workers=n_workers) as pool:
@@ -395,7 +423,6 @@ def parallel_get_data(
                     f"try setting SURVEY_YEAR = '{int(SURVEY_YEAR) - 1}'."
                 ) from exc
 
-    # maintain original state order
     return pd.concat([results[s] for s in states], ignore_index=True)
 
 
@@ -410,7 +437,7 @@ def build_dataset(
     print("-" * len(label))
 
     raw = parallel_get_data(data_source, states, label)
-    print(f"  raw rows: {len(raw):,}  ({time.perf_counter() - t0:.1f}s)")
+    print(f"  raw: {len(raw):,} rows ({time.perf_counter() - t0:.1f}s)")
 
     features_df, labels, _ = task.df_to_pandas(raw)
     features_df['INCOME_ABOVE_THRESHOLD'] = labels.to_numpy(dtype=np.int8)
@@ -426,23 +453,50 @@ def build_dataset(
             )
 
     pos = features_df['INCOME_ABOVE_THRESHOLD'].mean() * 100
-    print(f"  kept rows: {len(features_df):,}  |  positive class: {pos:.1f}%"
-          f"  ({time.perf_counter() - t0:.1f}s total)")
+    print(f"  filter: {len(features_df):,} rows  |  pos {pos:.1f}%"
+          f"  ({time.perf_counter() - t0:.1f}s)")
 
     return features_df
 
 
-# --- main ------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
+# sampling
+# --------------------------------------------------------------------------- #
+
+def undersample_to(df: pd.DataFrame, n: int, seed: int) -> pd.DataFrame:
+    """Stratified random undersample to n rows, preserving the class ratio."""
+    if len(df) <= n:
+        return df
+
+    target_col = 'INCOME_ABOVE_THRESHOLD'
+    groups = [g for _, g in df.groupby(target_col, observed=False)]
+    per_class = [max(1, round(len(g) / len(df) * n)) for g in groups]
+
+    # absorb rounding error into the majority class
+    per_class[0] += n - sum(per_class)
+
+    sampled = pd.concat(
+        [g.sample(k, random_state=seed) for g, k in zip(groups, per_class)],
+        ignore_index=True,
+    )
+    return sampled.sample(frac=1, random_state=seed).reset_index(drop=True)
+
+
+# --------------------------------------------------------------------------- #
+# main
+# --------------------------------------------------------------------------- #
 
 def main() -> None:
     t0 = time.perf_counter()
 
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
     data_source = ACSDataSource(survey_year=SURVEY_YEAR, horizon=HORIZON, survey='person')
 
-    out_ne = f'acs_income_northeast_{SURVEY_YEAR}.csv'
-    out_s  = f'acs_income_south_{SURVEY_YEAR}.csv'
+    out_ne = os.path.join(OUTPUT_DIR, f'acs_income_northeast_{SURVEY_YEAR}.csv')
+    out_s = os.path.join(OUTPUT_DIR, f'acs_income_south_{SURVEY_YEAR}.csv')
 
-    print(f"ACS Income {SURVEY_YEAR} — building datasets\n")
+    print(f"ACS Income {SURVEY_YEAR}\n")
 
     with ThreadPoolExecutor(max_workers=REGION_WORKERS) as pool:
         fut_ne = pool.submit(
@@ -454,17 +508,24 @@ def main() -> None:
             data_source, 'South ($90,000 threshold)'
         )
         df_ne = fut_ne.result()
-        df_s  = fut_s.result()
+        df_s = fut_s.result()
+
+    df_s = undersample_to(df_s, len(df_ne), seed=RANDOM_SEED)
+
+    pos_ne = df_ne['INCOME_ABOVE_THRESHOLD'].mean() * 100
+    pos_s  = df_s['INCOME_ABOVE_THRESHOLD'].mean()  * 100
+    print(f"\n  Northeast: {len(df_ne):>7,} rows  |  pos {pos_ne:.1f}%")
+    print(f"  South: {len(df_s):>7,} rows  |  pos {pos_s:.1f}%")
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         w1 = pool.submit(df_ne.to_csv, out_ne, index=False)
-        w2 = pool.submit(df_s.to_csv,  out_s,  index=False)
+        w2 = pool.submit(df_s.to_csv, out_s, index=False)
         w1.result()
         w2.result()
 
     print(f"\ndone in {time.perf_counter() - t0:.1f}s")
-    print(f"  {out_ne}  ({len(df_ne):,} rows)")
-    print(f"  {out_s}  ({len(df_s):,} rows)")
+    print(f"  {out_ne}")
+    print(f"  {out_s}")
     print(f"\ndtypes:\n{df_ne.dtypes.to_string()}")
 
 
