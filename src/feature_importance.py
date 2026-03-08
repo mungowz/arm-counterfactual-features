@@ -302,20 +302,6 @@ class CategoricalBoCSoR:
             dist_threshold     = np.percentile(min_dist_to_opp,
                                                self.perc_threshold)
 
-            # DIAGNOSTICS — print dist_threshold for each class so the user
-            # can identify the minimum perc_threshold at which dist_threshold
-            # exceeds 2/n_features (i.e. at least 2 features differ between
-            # original and CF). Once the optimal percentile is found, this
-            # block can be removed.
-            n_features = X_enc.shape[1]
-            print(f"      [DIAG] class {label}: "
-                  f"dist_threshold={dist_threshold:.4f} "
-                  f"(perc={self.perc_threshold}) | "
-                  f"min={min_dist_to_opp.min():.4f} "
-                  f"max={min_dist_to_opp.max():.4f} | "
-                  f"2-feat Hamming threshold={2/n_features:.4f} | "
-                  f"dist >= 2-feat: {dist_threshold >= 2/n_features}")
-
             boundary_mask      = min_dist_to_opp <= dist_threshold
             boundary_pos_idx   = pos_idx[boundary_mask]
 
