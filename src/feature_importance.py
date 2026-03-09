@@ -1,32 +1,56 @@
+"""
+feature_importance.py
+=====================
+Identifies boundary-crossing feature drivers via a categorical adaptation of
+BoCSoR (Boundary Crossing Solo Ratio) built on top of CatBoost and BallTree
+nearest-neighbour search.
+
+The algorithm trains a CatBoost classifier, identifies instances near the
+decision boundary (Hamming-distance percentile filter), queries k opposite-
+class neighbours for each boundary instance, and records which feature values
+cause the model prediction to flip — producing a transaction table suitable
+for FP-Growth association-rule mining.
+
+Public API
+----------
+run_for_k_values(k_values, data_path, output_base_dir,
+                 target_col, perc_threshold)
+    Train once, run counterfactual extraction for each k, and save results.
+
+CategoricalBoCSoR
+    Class implementing fit() and explain().
+"""
+
 import ast
-import sys
 import io
-import pandas as pd
-import numpy as np
+import sys
 import subprocess
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
 from catboost import CatBoostClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import OrdinalEncoder, LabelEncoder
 from sklearn.neighbors import BallTree
-from pathlib import Path
 from joblib import Parallel, delayed
 
 
 # ---------------------------------------------------------------------------
-# Utility: detect GPU availability for CatBoost
+# GPU detection
 # ---------------------------------------------------------------------------
 
-def _catboost_task_type():
+def _catboost_task_type() -> str:
     """
-    Detect whether a CUDA-capable GPU is available and return the appropriate
-    CatBoost task_type string ('GPU' or 'CPU').
+    Detect CUDA-capable GPU availability and return the appropriate CatBoost
+    task_type string ('GPU' or 'CPU').
     """
     try:
         subprocess.run(
             ['nvidia-smi'],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            check=True
+            check=True,
         )
         print("  > GPU detected — CatBoost will use task_type='GPU'")
         return 'GPU'
@@ -36,87 +60,84 @@ def _catboost_task_type():
 
 
 # ---------------------------------------------------------------------------
-# Core class: CategoricalBoCSoR
+# CategoricalBoCSoR
 # ---------------------------------------------------------------------------
 
 class CategoricalBoCSoR:
     """
     Categorical adaptation of BoCSoR (Boundary Crossing Solo Ratio).
 
-    Differences from the original paper and code (all deliberate):
+    Differences from the original paper (all deliberate):
 
-    1. Hamming distance instead of Euclidean — appropriate for categorical
-       features where no ordinal relationship between values exists.
+    1. Hamming distance instead of Euclidean
+       Appropriate for categorical features where no ordinal relationship
+       between values exists.
 
-    2. No midpoint interpolation — midpoints between two categorical instances
-       are not meaningful. Following the authors' suggestion, only real
-       instances from the opposite class are used as counterfactuals. To
-       preserve the guarantee that the selected CF is predicted as the CF
-       class by the model, every candidate CF is verified against the model
-       before being used (see _process_single_sample).
+    2. No midpoint interpolation
+       Midpoints between two categorical instances are not meaningful.
+       Following the authors' suggestion, only real instances from the
+       opposite class are used as counterfactuals.  Every candidate CF is
+       verified against the model before use (see _process_single_sample).
 
-    3. Inverted swap direction — instead of injecting the original feature
-       value into the CF (as in the paper), we inject the CF feature value
-       into the original instance. The check is symmetric: if injecting the
-       CF value into the original causes the prediction to switch to the CF
-       class, that feature (with that specific CF value) is a driver. This
-       direction is more informative for association-rule mining because the
-       stored itemset contains the actual CF values that trigger the switch,
-       not just the feature names.
+    3. Inverted swap direction
+       Instead of injecting the original feature value into the CF, the CF
+       feature value is injected into the original instance.  If this causes
+       the prediction to switch to the CF class, the feature with that CF
+       value is recorded as a driver.  This direction is more informative
+       for association-rule mining because the stored itemset contains the
+       actual CF values that trigger the switch, not just the feature names.
 
-    4. All k neighbours considered — instead of selecting only the single
-       closest counterfactual, all k neighbours are retained. Each produces
+    4. All k neighbours considered
+       All k nearest opposite-class neighbours are retained.  Each produces
        a separate transaction row, enabling FP-Growth to detect patterns
        across different CF contexts for the same boundary instance.
 
-    Performance optimisations (M2-oriented):
+    Performance design
+    ------------------
     - model.predict calls reduced from O(1 + 2k) to O(3) per boundary sample:
         * 1 call for the original instance
-        * 1 batched call for all k CF verifications at once
-        * 1 batched call for ALL perturbations across ALL valid CFs at once
-    - Perturbation matrix built via NumPy broadcasting (no Python loops),
-      exploiting the M2's NEON SIMD units for the array operations
-    - class_global_indices pre-cached in fit() so workers never recompute
-      np.where(y_enc == label) on every call
-    - X_enc stored as C-contiguous int32 array for optimal cache behaviour
-    - joblib backend set to 'loky' (true multiprocessing) to bypass the GIL
-      and spread load across all M2 performance + efficiency cores
+        * 1 batched call for all k CF verifications
+        * 1 batched call for all perturbations across all valid CFs
+    - Perturbation matrix built via NumPy broadcasting (no Python inner loops).
+    - Per-class global indices pre-cached in fit() so workers never recompute
+      np.where(y_enc == label) on every parallel call.
+    - X_enc stored as C-contiguous int32 for optimal cache behaviour.
+    - joblib 'loky' backend provides true multiprocessing, bypassing the GIL.
     """
 
-    def __init__(self, k_neighbors=10, perc_threshold=10):
+    def __init__(self, k_neighbors: int = 10, perc_threshold: int = 10) -> None:
         self.k_neighbors     = k_neighbors
         self.perc_threshold  = perc_threshold
         self.model           = None
         self.feature_encoder = OrdinalEncoder(dtype=int)
         self.label_encoder   = LabelEncoder()
-        self.trees           = {}   # one BallTree (Hamming) per class
+        self.trees: dict     = {}   # one BallTree (Hamming metric) per class
         self._task_type      = _catboost_task_type()
 
     # ------------------------------------------------------------------
     # fit
     # ------------------------------------------------------------------
 
-    def fit(self, X, y):
+    def fit(self, X: pd.DataFrame, y: pd.Series) -> None:
         """
         Train CatBoost on (X, y) and build one BallTree per class.
 
         Parameters
         ----------
-        X : pd.DataFrame  — feature matrix (categorical and/or integer columns)
-        y : pd.Series     — binary target (0/1)
+        X : feature matrix (categorical and/or integer columns)
+        y : binary target (0/1)
         """
-        print("  > Training CatBoost and building BallTrees...")
+        print('  > Training CatBoost and building BallTrees...')
         self.feature_names = X.columns.tolist()
 
         y_enc = self.label_encoder.fit_transform(y)
 
-        # Store as C-contiguous int32: faster numpy slicing and better cache
-        # locality on M2 when building perturbation matrices in workers
+        # C-contiguous int32: faster NumPy slicing and better cache locality
+        # when building perturbation matrices in worker processes.
         X_enc = np.ascontiguousarray(
             self.feature_encoder.fit_transform(X), dtype=np.int32
         )
 
-        # Internal train/validation split for CatBoost early-stopping
         X_tr, X_val, y_tr, y_val = train_test_split(
             X_enc, y_enc, test_size=0.2, random_state=42, stratify=y_enc
         )
@@ -124,16 +145,16 @@ class CategoricalBoCSoR:
         self.model = CatBoostClassifier(
             iterations=100, depth=6, learning_rate=0.1,
             verbose=0, allow_writing_files=False,
-            task_type=self._task_type
+            task_type=self._task_type,
         )
         self.model.fit(
             X_tr, y_tr,
             cat_features=list(range(X_enc.shape[1])),
-            eval_set=(X_val, y_val)
+            eval_set=(X_val, y_val),
         )
 
-        # BallTrees built on ALL encoded training data so the boundary-
-        # filtering percentile reflects the full training distribution.
+        # BallTrees built on the full encoded training set so the boundary
+        # percentile reflects the complete training distribution.
         for label in np.unique(y_enc):
             idx = np.where(y_enc == label)[0]
             self.trees[label] = BallTree(X_enc[idx], metric='hamming')
@@ -141,7 +162,7 @@ class CategoricalBoCSoR:
         self.X_enc = X_enc
         self.y_enc = y_enc
 
-        # OPTIMISATION: pre-cache per-class global indices so workers never
+        # Pre-cache per-class global indices so worker processes never
         # recompute np.where(y_enc == label) on every parallel call.
         self.class_indices = {
             int(label): np.where(y_enc == label)[0]
@@ -149,90 +170,82 @@ class CategoricalBoCSoR:
         }
 
     # ------------------------------------------------------------------
-    # _process_single_sample  (worker called by joblib)
+    # _process_single_sample  (worker dispatched by joblib)
     # ------------------------------------------------------------------
 
-    def _process_single_sample(self, sample_idx, orig_enc_sample, ind_row,
-                                opp_label):
+    def _process_single_sample(
+        self,
+        sample_idx: int,
+        orig_enc_sample: np.ndarray,
+        ind_row: np.ndarray,
+        opp_label: int,
+    ):
         """
         Process one boundary instance against its k CF neighbours.
 
-        Performance profile (per call):
-            model.predict calls : 3  (was 1 + 2k in the naive version)
-            numpy ops           : fully vectorised, no Python inner loops
+        Performance profile per call:
+            model.predict calls : 3  (vs. 1 + 2k in the naive version)
+            NumPy ops           : fully vectorised, no Python inner loops
 
         Steps
         -----
-        1. Predict orig_pred with a single call.
-        2. Retrieve all k CF candidates; verify all of them in ONE batched
-           predict call; discard those not predicted as opp_label.
-        3. Build the full perturbation matrix in one NumPy operation:
-              shape = (total_diff_positions_across_valid_CFs, n_features)
-           using np.tile + advanced indexing — no Python loop over features.
-        4. Predict all perturbations in ONE batched call.
-        5. Group drivers by CF neighbour.
+        1.  Predict orig_pred with a single call.
+        2.  Retrieve all k CF candidates; verify all of them in one batched
+            predict call; discard those not predicted as opp_label.
+        3.  Build the full perturbation matrix in one NumPy operation:
+                shape = (total_diff_positions_across_valid_CFs, n_features)
+            using np.tile + advanced indexing.
+        4.  Predict all perturbations in one batched call.
+        5.  Group driver strings by CF neighbour.
 
         Returns
         -------
-        sample_idx : int
+        sample_idx           : int
         per_neighbor_results : list of (cf_global_idx, sorted_driver_list)
         """
-        orig      = orig_enc_sample          # C-contiguous int32, already copied
+        orig      = orig_enc_sample
         orig_pred = self.model.predict([orig])[0]
 
-        # Map BallTree-local indices to global row indices (pre-cached)
+        # Map BallTree-local indices to global row indices (pre-cached).
         global_ind = self.class_indices[int(opp_label)][ind_row]
-        neighbors  = self.X_enc[global_ind]  # shape (k, n_features)
+        neighbors  = self.X_enc[global_ind]       # shape: (k, n_features)
 
-        # ------------------------------------------------------------------
-        # OPTIMISATION 1 — batch verify all k CF candidates in one call
-        # ------------------------------------------------------------------
-        cf_preds    = self.model.predict(neighbors).ravel()
-        valid_mask  = (cf_preds == opp_label)
+        # Batch-verify all k CF candidates in one predict call.
+        cf_preds     = self.model.predict(neighbors).ravel()
+        valid_mask   = cf_preds == opp_label
         valid_global = global_ind[valid_mask]
-        valid_neigh  = neighbors[valid_mask]   # shape (n_valid, n_features)
+        valid_neigh  = neighbors[valid_mask]       # shape: (n_valid, n_features)
 
         if len(valid_neigh) == 0:
             return sample_idx, []
 
-        # ------------------------------------------------------------------
-        # OPTIMISATION 2 — vectorised perturbation matrix construction
-        #
+        # Build perturbation matrix via NumPy broadcasting.
         # diff_matrix[i, j] is True where valid CF i differs from orig at j.
-        # np.where returns two aligned arrays:
-        #   cf_row[p]  = which valid CF the p-th perturbation belongs to
-        #   feat_col[p] = which feature is swapped in the p-th perturbation
-        # ------------------------------------------------------------------
-        diff_matrix            = valid_neigh != orig          # (n_valid, n_feat)
-        cf_row, feat_col       = np.where(diff_matrix)        # both shape (P,)
-        n_perturbations        = len(cf_row)
+        # np.where returns aligned (cf_row, feat_col) index arrays.
+        diff_matrix      = valid_neigh != orig          # (n_valid, n_feat)
+        cf_row, feat_col = np.where(diff_matrix)        # both: shape (P,)
+        n_perturbations  = len(cf_row)
 
         if n_perturbations == 0:
             return sample_idx, []
 
         # Build (P, n_features) matrix: start from P copies of orig, then
         # inject each CF value at the corresponding feature position.
-        # np.tile + advanced indexing: no Python loop, pure NumPy.
         perturb_matrix = np.tile(orig, (n_perturbations, 1))
         perturb_matrix[np.arange(n_perturbations), feat_col] = \
             valid_neigh[cf_row, feat_col]
 
-        # ------------------------------------------------------------------
-        # OPTIMISATION 3 — one single predict call for ALL perturbations
-        # ------------------------------------------------------------------
+        # Predict all perturbations in one batched call.
         all_preds = self.model.predict(perturb_matrix).ravel()
 
-        # ------------------------------------------------------------------
-        # Group drivers by CF neighbour
-        # ------------------------------------------------------------------
-        # Build driver strings for all perturbations (vectorised decode)
+        # Build driver strings for all perturbations (vectorised decode).
         driver_strings = [
-            f"{self.feature_names[feat_col[p]]}"
-            f"={self.feature_encoder.categories_[feat_col[p]][valid_neigh[cf_row[p], feat_col[p]]]}"
+            f'{self.feature_names[feat_col[p]]}'
+            f'={self.feature_encoder.categories_[feat_col[p]][valid_neigh[cf_row[p], feat_col[p]]]}'
             for p in range(n_perturbations)
         ]
 
-        # Collect drivers per (valid) CF neighbour
+        # Collect drivers per valid CF neighbour.
         cf_drivers: dict[int, list] = {}
         for p, (pred, driver_str) in enumerate(zip(all_preds, driver_strings)):
             if pred != orig_pred:
@@ -250,31 +263,28 @@ class CategoricalBoCSoR:
     # explain
     # ------------------------------------------------------------------
 
-    def explain(self, X, y):
+    def explain(self, X: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
         """
-        Run the boundary-crossing analysis on (X, y) — training data only.
+        Run boundary-crossing analysis on (X, y).
 
         For each class label:
-          1. Compute Hamming distance from each instance to its nearest
-             opposite-class neighbour.
-          2. Keep only instances whose distance is <= the perc_threshold-th
+          1. Compute Hamming distance to the nearest opposite-class instance.
+          2. Keep only instances whose distance ≤ the perc_threshold-th
              percentile (boundary filter).
-          3. Keep only boundary instances the model predicts correctly
-             (paper consistency: mirrors the original explain_decision_boundary
-             check before calling explain_sample).
+          3. Keep only boundary instances the model predicts correctly,
+             mirroring the consistency check in the original paper.
           4. For each surviving boundary instance, query k nearest CF
-             neighbours and run the vectorised per-feature swap in parallel
-             across all M2 cores (loky backend = true multiprocessing).
+             neighbours and run the vectorised per-feature swap in parallel.
 
         Returns
         -------
         pd.DataFrame with columns:
             Sample_ID             — original DataFrame index
             CF_Neighbor_ID        — positional index in self.X_enc
-            Counterfactual_Values — sorted list of "FEATURE=cf_value" strings
+            Counterfactual_Values — sorted list of 'FEATURE=cf_value' strings
         """
-        print("  > Extracting counterfactuals "
-              "(parallel + vectorised per-feature swap)...")
+        print('  > Extracting counterfactuals '
+              '(parallel, vectorised per-feature swap)...')
 
         X_enc = np.ascontiguousarray(
             self.feature_encoder.transform(X), dtype=np.int32
@@ -296,59 +306,47 @@ class CategoricalBoCSoR:
             if tree is None:
                 continue
 
-            # --------------------------------------------------------------
-            # Step 1 — Boundary filter (Hamming percentile)
-            # --------------------------------------------------------------
-            min_dist_to_opp, _ = tree.query(X_enc[pos_idx], k=1)
-            min_dist_to_opp    = min_dist_to_opp.ravel()
-            dist_threshold     = np.percentile(min_dist_to_opp,
-                                               self.perc_threshold)
+            # Boundary filter: keep instances within the perc_threshold-th
+            # percentile of Hamming distance to the opposite class.
+            min_dist, _ = tree.query(X_enc[pos_idx], k=1)
+            min_dist    = min_dist.ravel()
+            threshold   = np.percentile(min_dist, self.perc_threshold)
 
-            boundary_mask      = min_dist_to_opp <= dist_threshold
-            boundary_pos_idx   = pos_idx[boundary_mask]
-
-            if len(boundary_pos_idx) == 0:
+            boundary_idx = pos_idx[min_dist <= threshold]
+            if len(boundary_idx) == 0:
                 continue
 
-            # --------------------------------------------------------------
-            # Step 2 — Model-prediction filter
-            # Keep only boundary instances the model predicts as `label`.
-            # Mirrors the original authors' check in explain_decision_boundary:
-            #   if self.model.predict(sample.values) == self.original_class
-            # --------------------------------------------------------------
-            model_preds      = self.model.predict(
-                X_enc[boundary_pos_idx]
-            ).ravel()
-            correct_mask     = (model_preds == label)
-            boundary_pos_idx = boundary_pos_idx[correct_mask]
+            # Model-prediction filter: retain only instances predicted as
+            # their true label (mirrors the original paper's consistency check).
+            model_preds  = self.model.predict(X_enc[boundary_idx]).ravel()
+            correct_mask = model_preds == label
+            boundary_idx = boundary_idx[correct_mask]
 
-            if len(boundary_pos_idx) == 0:
-                print(f"    - class {label}: 0 boundary samples pass the "
-                      f"model-prediction filter — skipping.")
+            if len(boundary_idx) == 0:
+                print(
+                    f'    - class {label}: 0 boundary samples pass the '
+                    f'model-prediction filter — skipping.'
+                )
                 continue
 
-            print(f"    - class {label}: {len(boundary_pos_idx)}"
-                  f"/{len(pos_idx)} boundary samples pass model-prediction "
-                  f"filter (perc_threshold={self.perc_threshold})")
+            print(
+                f'    - class {label}: {len(boundary_idx)}/{len(pos_idx)} '
+                f'boundary samples pass model-prediction filter '
+                f'(perc_threshold={self.perc_threshold})'
+            )
 
-            # --------------------------------------------------------------
-            # Step 3 — k nearest CF neighbours for each boundary instance
-            # --------------------------------------------------------------
-            _, ind = tree.query(X_enc[boundary_pos_idx], k=self.k_neighbors)
+            # Query k nearest CF neighbours for each boundary instance.
+            _, ind = tree.query(X_enc[boundary_idx], k=self.k_neighbors)
 
-            # --------------------------------------------------------------
-            # Step 4 — Parallel dispatch across all M2 cores
-            # 'loky' spawns real processes → true parallelism, no GIL.
-            # CatBoost supports pickle so workers can deserialise the model.
-            # --------------------------------------------------------------
-            parallel_results = Parallel(n_jobs=-1, backend="loky")(
+            # Dispatch in parallel; 'loky' spawns real processes (no GIL).
+            parallel_results = Parallel(n_jobs=-1, backend='loky')(
                 delayed(self._process_single_sample)(
                     sample_idx,
-                    X_enc[sample_idx].copy(),   # copy → worker-safe
+                    X_enc[sample_idx].copy(),   # copy: worker-safe
                     ind[i],
-                    opp_label
+                    opp_label,
                 )
-                for i, sample_idx in enumerate(boundary_pos_idx)
+                for i, sample_idx in enumerate(boundary_idx)
             )
 
             for sample_idx, per_neighbor_results in parallel_results:
@@ -356,11 +354,11 @@ class CategoricalBoCSoR:
                     rows.append({
                         'Sample_ID':             original_indices[sample_idx],
                         'CF_Neighbor_ID':        cf_global_idx,
-                        'Counterfactual_Values': found_drivers
+                        'Counterfactual_Values': found_drivers,
                     })
 
-        print(f"    - done: {len(rows)} (sample, CF-neighbour) pairs "
-              f"with at least one driver\n")
+        print(f'    - done: {len(rows)} (sample, CF-neighbour) pairs '
+              f'with at least one driver\n')
         return pd.DataFrame(rows)
 
 
@@ -368,37 +366,36 @@ class CategoricalBoCSoR:
 # Post-processing helpers
 # ---------------------------------------------------------------------------
 
-def extract_labels_and_values(results_dir):
+def extract_labels_and_values(results_dir: Path) -> None:
     """
-    Parse transactions_values.csv and produce four additional CSVs:
+    Parse transactions_values.csv and write four derived CSV files:
 
-        labels_only.csv          — per (sample, CF): all driver feature names
-        labels_only_unique.csv   — per (sample, CF): unique driver feature names
-        values_only.csv          — per (sample, CF): all CF category values
-        values_only_unique.csv   — per (sample, CF): unique CF category values
+        labels_only.csv          per (sample, CF): all driver feature names
+        labels_only_unique.csv   per (sample, CF): unique driver feature names
+        values_only.csv          per (sample, CF): all CF category values
+        values_only_unique.csv   per (sample, CF): unique CF category values
 
     Deduplication is performed on (label, value) pairs jointly so that
     labels_only_unique and values_only_unique remain positionally aligned.
     """
-    print("  > Extracting labels and values from counterfactual drivers...")
-    input_file = results_dir / "transactions_values.csv"
+    print('  > Extracting labels and values from counterfactual drivers...')
+    input_file = results_dir / 'transactions_values.csv'
 
     if not input_file.exists():
-        print("    - WARNING: transactions file not found, skipping.")
+        print('    - WARNING: transactions file not found, skipping.')
         return
     try:
         df = pd.read_csv(input_file)
-    except (pd.errors.EmptyDataError, pd.errors.ParserError) as e:
-        print(f"    - WARNING: could not read transactions file ({e}), "
-              f"skipping.")
+    except (pd.errors.EmptyDataError, pd.errors.ParserError) as exc:
+        print(f'    - WARNING: could not read transactions file ({exc}), skipping.')
         return
     if df.empty:
-        print("    - WARNING: no transactions found, skipping.")
+        print('    - WARNING: no transactions found, skipping.')
         return
 
-    base_col_names = ['Sample_ID']
+    base_cols = ['Sample_ID']
     if 'CF_Neighbor_ID' in df.columns:
-        base_col_names.append('CF_Neighbor_ID')
+        base_cols.append('CF_Neighbor_ID')
 
     labels_list        = []
     labels_unique_list = []
@@ -419,8 +416,8 @@ def extract_labels_and_values(results_dir):
                 labels.append(lbl.strip())
                 values.append(val.strip())
 
-        # Deduplicate on (label, value) pairs jointly — keeps the two lists
-        # positionally aligned (labels_only_unique[i] ↔ values_only_unique[i])
+        # Deduplicate on (label, value) pairs jointly to keep the two lists
+        # positionally aligned after deduplication.
         seen_pairs  = set()
         uniq_labels = []
         uniq_values = []
@@ -436,61 +433,57 @@ def extract_labels_and_values(results_dir):
         values_list.append(values)
         values_unique_list.append(uniq_values)
 
-    base_data = {col: df[col] for col in base_col_names}
+    base_data = {col: df[col] for col in base_cols}
 
-    outputs = [
-        ("labels_only.csv",        "Labels", labels_list),
-        ("labels_only_unique.csv", "Labels", labels_unique_list),
-        ("values_only.csv",        "Values", values_list),
-        ("values_only_unique.csv", "Values", values_unique_list),
-    ]
-    for filename, col_name, data in outputs:
-        path = results_dir / filename
-        pd.DataFrame({**base_data, col_name: data}).to_csv(path, index=False)
-        print(f"    - saved {filename}")
+    for filename, col_name, data in [
+        ('labels_only.csv',        'Labels', labels_list),
+        ('labels_only_unique.csv', 'Labels', labels_unique_list),
+        ('values_only.csv',        'Values', values_list),
+        ('values_only_unique.csv', 'Values', values_unique_list),
+    ]:
+        pd.DataFrame({**base_data, col_name: data}).to_csv(
+            results_dir / filename, index=False
+        )
+        print(f'    - saved {filename}')
 
 
-def aggregate_drivers_by_sample(results_dir):
+def aggregate_drivers_by_sample(results_dir: Path) -> None:
     """
     Collapse all (sample, CF-neighbour) rows into one transaction per sample,
-    producing two aggregated CSV files for ARM on feature labels:
+    writing two aggregated CSV files for ARM on feature labels.
 
     aggregated_labels_by_sample.csv
-        One row per sample. 'Labels' contains the UNION of all unique driver
-        feature names across every CF neighbour of that sample — duplicates
-        removed. This is the recommended input for FP-Growth: each row is one
-        transaction (itemset) of feature names.
+        One row per sample.  'Labels' contains the union of all unique driver
+        feature names across every CF neighbour — duplicates removed.
+        Recommended input for FP-Growth.
 
     aggregated_labels_duplicates_by_sample.csv
-        One row per sample. 'Labels' contains ALL driver feature names
-        including duplicates (i.e. if a feature appears as a driver for
-        multiple CF neighbours of the same sample, it is listed multiple
-        times). Useful for weighted ARM or frequency analysis.
+        One row per sample.  'Labels' contains all driver feature names
+        including duplicates (a feature appearing as a driver for multiple CFs
+        of the same sample is listed multiple times).
 
-    Both files share the same columns:
+    Both files share columns:
         Sample_ID        — original row index in the dataset
-        Labels           — list of feature name drivers (see above)
+        Labels           — list of feature-name drivers (see above)
         Num_Labels       — cardinality of the label list
         Num_CF_Neighbors — number of CF neighbours that contributed drivers
     """
-    print("  > Aggregating labels by sample...")
+    print('  > Aggregating labels by sample...')
 
-    # Read from labels_only.csv (with duplicates across CF neighbours) so we
-    # can build both the unique and duplicate aggregations from a single source
-    labels_path = results_dir / "labels_only.csv"
-    out_unique   = results_dir / "aggregated_labels_by_sample.csv"
-    out_dupl     = results_dir / "aggregated_labels_duplicates_by_sample.csv"
+    labels_path = results_dir / 'labels_only.csv'
+    out_unique  = results_dir / 'aggregated_labels_by_sample.csv'
+    out_dupl    = results_dir / 'aggregated_labels_duplicates_by_sample.csv'
 
     if not labels_path.exists():
-        print(f"    - WARNING: {labels_path.name} not found, skipping.")
+        print(f'    - WARNING: {labels_path.name} not found, skipping.')
         return
     try:
         df = pd.read_csv(labels_path)
-    except (pd.errors.EmptyDataError, pd.errors.ParserError) as e:
-        print(f"    - WARNING: could not read labels file ({e}), skipping.")
+    except (pd.errors.EmptyDataError, pd.errors.ParserError) as exc:
+        print(f'    - WARNING: could not read labels file ({exc}), skipping.')
         return
     if df.empty:
-        print("    - WARNING: labels file is empty, skipping.")
+        print('    - WARNING: labels file is empty, skipping.')
         return
 
     df['Labels'] = df['Labels'].apply(ast.literal_eval)
@@ -499,97 +492,93 @@ def aggregate_drivers_by_sample(results_dir):
     aggregated_dupl   = []
 
     for sample_id, group in df.groupby('Sample_ID'):
-        n_cf_neighbors = len(group)
+        n_cf = len(group)
 
-        # --- Unique: union of all driver labels, duplicates removed ----------
+        # Union of all driver labels across CFs — duplicates removed.
         all_labels_set = set()
         for labels_list in group['Labels']:
             all_labels_set.update(labels_list)
         unique_labels = sorted(all_labels_set)
 
-        # --- With duplicates: concatenate all label lists across CF neighbours
-        # preserving multiplicity (a feature that drives the switch for 3 CFs
-        # of the same sample appears 3 times)
-        all_labels_list = []
-        for labels_list in group['Labels']:
-            all_labels_list.extend(labels_list)
-        # Sort for reproducibility while keeping duplicates
-        all_labels_list_sorted = sorted(all_labels_list)
+        # All driver labels concatenated across CFs — duplicates kept.
+        all_labels_list = sorted(
+            lbl for labels_list in group['Labels'] for lbl in labels_list
+        )
 
         aggregated_unique.append({
             'Sample_ID':        sample_id,
             'Labels':           unique_labels,
             'Num_Labels':       len(unique_labels),
-            'Num_CF_Neighbors': n_cf_neighbors
+            'Num_CF_Neighbors': n_cf,
         })
         aggregated_dupl.append({
             'Sample_ID':        sample_id,
-            'Labels':           all_labels_list_sorted,
-            'Num_Labels':       len(all_labels_list_sorted),
-            'Num_CF_Neighbors': n_cf_neighbors
+            'Labels':           all_labels_list,
+            'Num_Labels':       len(all_labels_list),
+            'Num_CF_Neighbors': n_cf,
         })
 
     unique_df = pd.DataFrame(aggregated_unique)
     dupl_df   = pd.DataFrame(aggregated_dupl)
 
     unique_df.to_csv(out_unique, index=False)
-    dupl_df.to_csv(out_dupl,   index=False)
+    dupl_df.to_csv(out_dupl,    index=False)
 
     n_samples = len(unique_df)
-    print(f"    - {len(df)} (sample, CF) pairs collapsed into "
-          f"{n_samples} unique samples")
+    print(f'    - {len(df)} (sample, CF) pairs collapsed into '
+          f'{n_samples} unique samples')
 
-    print(f"    [unique labels per sample]")
-    for n_labels, count in (unique_df['Num_Labels']
-                             .value_counts().sort_index().items()):
-        pct = count / n_samples * 100
-        print(f"      {n_labels} label(s): {count} samples ({pct:.1f}%)")
-    print(f"    - saved to {out_unique.name}")
+    for tag, frame in [('unique labels', unique_df), ('labels with duplicates', dupl_df)]:
+        print(f'    [{tag} per sample]')
+        for n_labels, count in frame['Num_Labels'].value_counts().sort_index().items():
+            pct = count / n_samples * 100
+            print(f'      {n_labels} label(s): {count} samples ({pct:.1f}%)')
 
-    print(f"    [labels with duplicates per sample]")
-    for n_labels, count in (dupl_df['Num_Labels']
-                             .value_counts().sort_index().items()):
-        pct = count / n_samples * 100
-        print(f"      {n_labels} label(s): {count} samples ({pct:.1f}%)")
-    print(f"    - saved to {out_dupl.name}")
+    print(f'    - saved {out_unique.name}')
+    print(f'    - saved {out_dupl.name}')
 
 
 # ---------------------------------------------------------------------------
 # Experiment runner
 # ---------------------------------------------------------------------------
 
-def run_for_k_values(k_values, data_path, output_base_dir,
-                     target_col='INCOME_ABOVE_THRESHOLD', perc_threshold=10):
+def run_for_k_values(
+    k_values: list[int],
+    data_path: Path,
+    output_base_dir: Path,
+    target_col: str  = 'INCOME_ABOVE_THRESHOLD',
+    perc_threshold: int = 10,
+) -> dict[int, Path]:
     """
-    Run CategoricalBoCSoR for each value of k in k_values.
+    Train CategoricalBoCSoR once and run counterfactual extraction for each k.
 
-    The model and BallTrees are trained once on the training split and reused
-    across all k values; only the neighbourhood query size changes per run.
+    The model and BallTrees are fitted on the training split and shared across
+    all k values; only the neighbourhood query size changes per iteration.
 
     Parameters
     ----------
-    k_values        : list[int] — neighbourhood sizes to test
-    data_path       : Path      — path to the input CSV file
-    output_base_dir : Path      — root directory for result sub-folders
-    target_col      : str       — name of the target column in the CSV
-    perc_threshold  : int       — percentile threshold for boundary filtering
+    k_values        : neighbourhood sizes to evaluate
+    data_path       : path to the input CSV
+    output_base_dir : root directory for per-k result sub-folders
+    target_col      : name of the target column in the CSV
+    perc_threshold  : boundary filter percentile
 
     Returns
     -------
-    dict mapping k -> Path of the corresponding labels_only_unique.csv
+    dict mapping k → Path of labels_only_unique.csv for that k
     """
     output_base_dir = Path(output_base_dir)
     output_base_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n{'='*70}")
-    print(f"K-VARIATION EXPERIMENT — {len(k_values)} values of k")
-    print(f"{'='*70}")
-    print(f"  > k values       : {k_values}")
-    print(f"  > perc_threshold : {perc_threshold}")
-    print(f"  > target column  : {target_col}")
-    print("-" * 50)
+    print(f'\n{"=" * 70}')
+    print(f'K-VARIATION EXPERIMENT — {len(k_values)} k values')
+    print(f'{"=" * 70}')
+    print(f'  > k values        : {k_values}')
+    print(f'  > perc_threshold  : {perc_threshold}')
+    print(f'  > target column   : {target_col}')
+    print('-' * 50)
 
-    print("  > Loading dataset and splitting...")
+    print('  > Loading dataset and splitting...')
     df = pd.read_csv(data_path)
 
     if target_col != 'target':
@@ -599,74 +588,73 @@ def run_for_k_values(k_values, data_path, output_base_dir,
     X_tr, X_te, y_tr, y_te = train_test_split(
         X, y, test_size=0.2, random_state=42, stratify=y
     )
-    print(f"    - train: {len(X_tr)} samples  |  test: {len(X_te)} samples")
+    print(f'    - train: {len(X_tr):,} samples  |  test: {len(X_te):,} samples')
 
-    # Fit once — model and BallTrees shared across all k iterations
-    print(f"\n  > Fitting model (shared across all k values)...")
+    # Fit once — model and BallTrees are shared across all k iterations.
+    print('\n  > Fitting model (shared across all k values)...')
     explainer = CategoricalBoCSoR(
         k_neighbors=k_values[0], perc_threshold=perc_threshold
     )
     explainer.fit(X_tr, y_tr)
 
-    k_labels_map = {}
+    k_labels_map: dict[int, Path] = {}
 
     for i, k in enumerate(k_values):
-        k_dir = output_base_dir / f"k_{k}"
+        k_dir = output_base_dir / f'k_{k}'
         k_dir.mkdir(parents=True, exist_ok=True)
 
-        print(f"\n  [{i+1}/{len(k_values)}] k = {k}")
+        print(f'\n  [{i + 1}/{len(k_values)}] k = {k}')
         explainer.k_neighbors = k
 
-        # explain() is called on training data only — we explain the
-        # classifier's logic, not its generalisation on unseen instances
+        # explain() runs on the training set: we explain the classifier's
+        # decision logic, not its generalisation to unseen instances.
         transactions = explainer.explain(X_tr, y_tr)
 
         if transactions.empty:
-            print("    > 0 transactions — skipping CSV write and downstream "
-                  "steps.")
+            print('    > 0 transactions — skipping downstream steps.')
             continue
 
-        transactions_path = k_dir / "transactions_values.csv"
+        transactions_path = k_dir / 'transactions_values.csv'
         transactions.to_csv(transactions_path, index=False)
-        print(f"    > {len(transactions)} transactions saved to "
-              f"{transactions_path.name}")
+        print(f'    > {len(transactions)} transactions saved to '
+              f'{transactions_path.name}')
 
         extract_labels_and_values(k_dir)
         aggregate_drivers_by_sample(k_dir)
 
-        labels_path = k_dir / "labels_only_unique.csv"
+        labels_path = k_dir / 'labels_only_unique.csv'
         if labels_path.exists() and labels_path.stat().st_size > 0:
             k_labels_map[k] = labels_path
         else:
-            print(f"    - WARNING: labels_only_unique.csv empty for k={k}, "
-                  f"skipping.")
+            print(f'    - WARNING: labels_only_unique.csv is empty for k={k}, '
+                  f'skipping.')
 
-    print(f"\n{'='*70}")
-    print("  > All k values done.")
-    print(f"{'='*70}\n")
+    print(f'\n{"=" * 70}')
+    print('  > All k values completed.')
+    print(f'{"=" * 70}\n')
 
     return k_labels_map
 
 
 # ---------------------------------------------------------------------------
-# Tee writer: duplicates stdout to both the terminal and a buffer
+# Log capturing utility
 # ---------------------------------------------------------------------------
 
 class _TeeWriter:
-    """Write to the original stdout AND capture everything in a StringIO."""
+    """Write to the original stdout and simultaneously capture in a StringIO buffer."""
 
     def __init__(self, original_stdout):
         self._orig = original_stdout
         self._buf  = io.StringIO()
 
-    def write(self, text):
+    def write(self, text: str) -> None:
         self._orig.write(text)
         self._buf.write(text)
 
-    def flush(self):
+    def flush(self) -> None:
         self._orig.flush()
 
-    def getvalue(self):
+    def getvalue(self) -> str:
         return self._buf.getvalue()
 
 
@@ -674,80 +662,112 @@ class _TeeWriter:
 # Entry point
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
-    if Path("/content").exists():
-        base_dir = Path("/content")       # Google Colab
-    else:
-        base_dir = Path(__file__).resolve().parent.parent   # local
+def main(
+    survey_year: str       = '2024',
+    regions: dict          = None,
+    k_values: list[int]    = None,
+    perc_threshold: int    = 10,
+    target_col: str        = 'INCOME_ABOVE_THRESHOLD',
+    base_dir: Path         = None,
+) -> None:
+    """
+    Run counterfactual extraction for all specified regions and k values.
 
-    data_dir    = base_dir / "data"
-    results_dir = base_dir / "results"
+    Parameters
+    ----------
+    survey_year     : ACS survey year, used to locate input CSV files.
+    regions         : mapping of region name → CSV path.  If None, defaults
+                      to Northeast and South under base_dir/data/.
+    k_values        : neighbourhood sizes for BoCSoR.
+    perc_threshold  : boundary filter percentile.
+    target_col      : name of the binary target column in the CSV.
+    base_dir        : project root directory.  Defaults to two levels above
+                      this file when run standalone.
+    """
+    if base_dir is None:
+        base_dir = (
+            Path('/content')
+            if Path('/content').exists()
+            else Path(__file__).resolve().parent.parent
+        )
+    base_dir = Path(base_dir)
 
-    regions = {
-        'northeast': data_dir / "acs_income_northeast_2024.csv",
-        'south':     data_dir / "acs_income_south_2024.csv",
-    }
+    if k_values is None:
+        k_values = [1, 3, 5, 7]
 
-    k_values       = [1, 3, 5, 7]
-    perc_threshold = 10
-    target_col     = 'INCOME_ABOVE_THRESHOLD'
+    if regions is None:
+        data_dir = base_dir / 'data'
+        regions  = {
+            'northeast': data_dir / f'acs_income_northeast_{survey_year}.csv',
+            'south':     data_dir / f'acs_income_south_{survey_year}.csv',
+        }
 
-    # Redirect stdout through a tee so every print goes to both
-    # the terminal AND a StringIO buffer we can dump to files later.
+    results_dir = base_dir / 'results'
+
     tee = _TeeWriter(sys.stdout)
     sys.stdout = tee
 
     try:
         for region, data_path in regions.items():
-            output_dir = results_dir / region / "important_features"
+            output_dir = results_dir / region / 'important_features'
             output_dir.mkdir(parents=True, exist_ok=True)
 
-            print("\n" + "=" * 70)
-            print(f"COUNTERFACTUAL EXTRACTION — {region.upper()}")
-            print("=" * 70 + "\n")
+            print('\n' + '=' * 70)
+            print(f'COUNTERFACTUAL EXTRACTION — {region.upper()}')
+            print('=' * 70 + '\n')
 
-            if not data_path.exists():
-                print(f"  > Error: {data_path.name} not found — "
-                      f"run create_dataset.py first.")
+            if not Path(data_path).exists():
+                print(f'  > Error: {data_path} not found — '
+                      f'run create_dataset.py first.')
                 continue
 
             k_labels_map = run_for_k_values(
-                k_values, data_path, output_dir,
-                target_col=target_col,
-                perc_threshold=perc_threshold
+                k_values       = k_values,
+                data_path      = data_path,
+                output_base_dir= output_dir,
+                target_col     = target_col,
+                perc_threshold = perc_threshold,
             )
 
-            print("  > k_labels_map ready:")
+            print('  > k_labels_map ready:')
             for k, path in k_labels_map.items():
-                print(f"    k={k:>2} -> {path}")
+                print(f'    k={k:>2} -> {path}')
 
-        print("\n" + "=" * 70)
-        print("Done.")
-        print("=" * 70 + "\n")
+        print('\n' + '=' * 70)
+        print('Done.')
+        print('=' * 70 + '\n')
 
     finally:
         sys.stdout = tee._orig
 
-    # Save the full log to a global file and per-region files
+    # Save full execution log and per-region excerpts.
     full_log = tee.getvalue()
-
     results_dir.mkdir(parents=True, exist_ok=True)
-    global_log_path = results_dir / "feature_importance_log.txt"
-    global_log_path.write_text(full_log, encoding="utf-8")
-    print(f"  > Full log saved to {global_log_path}")
+
+    global_log = results_dir / 'feature_importance_log.txt'
+    global_log.write_text(full_log, encoding='utf-8')
+    print(f'  > Full log saved to {global_log}')
 
     for region in regions:
-        region_dir = results_dir / region / "important_features"
+        region_dir = results_dir / region / 'important_features'
         if region_dir.exists():
-            region_log_path = region_dir / "feature_importance_log.txt"
-            # Extract the region-specific section from the full log
-            marker = f"COUNTERFACTUAL EXTRACTION — {region.upper()}"
-            start = full_log.find(marker)
+            marker = f'COUNTERFACTUAL EXTRACTION — {region.upper()}'
+            start  = full_log.find(marker)
             if start != -1:
-                # Find the next region marker or end of log
-                next_start = full_log.find("COUNTERFACTUAL EXTRACTION",
-                                           start + len(marker))
-                region_log = full_log[start:next_start] if next_start != -1 \
+                next_start = full_log.find(
+                    'COUNTERFACTUAL EXTRACTION', start + len(marker)
+                )
+                snippet = (
+                    full_log[start:next_start]
+                    if next_start != -1
                     else full_log[start:]
-                region_log_path.write_text(region_log, encoding="utf-8")
-                print(f"  > Region log saved to {region_log_path}")
+                )
+                (region_dir / 'feature_importance_log.txt').write_text(
+                    snippet, encoding='utf-8'
+                )
+                print(f'  > Region log saved to '
+                      f'{region_dir / "feature_importance_log.txt"}')
+
+
+if __name__ == '__main__':
+    main()
