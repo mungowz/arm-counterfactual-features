@@ -1329,11 +1329,12 @@ def main(
     )
 
     if base_dir is None:
-        base_dir = (
-            Path('/content')
-            if Path('/content').exists()
-            else Path(__file__).resolve().parent.parent
-        )
+        if Path('/kaggle/working').exists():
+            base_dir = Path('/kaggle/working')
+        elif Path('/content').exists():
+            base_dir = Path('/content')
+        else:
+            base_dir = Path(__file__).resolve().parent.parent
     base_dir = Path(base_dir)
 
     if regions is None:

@@ -143,14 +143,15 @@ class CategoricalBoCSoR:
         )
 
         self.model = CatBoostClassifier(
-            iterations=100, depth=6, learning_rate=0.1,
-            verbose=0, allow_writing_files=False,
+            iterations=500, depth=8, learning_rate=0.05,
+            verbose=50, allow_writing_files=False,
             task_type=self._task_type,
         )
         self.model.fit(
             X_tr, y_tr,
             cat_features=list(range(X_enc.shape[1])),
             eval_set=(X_val, y_val),
+            early_stopping_rounds=50,
         )
 
         # BallTrees built on the full encoded training set so the boundary
@@ -338,24 +339,82 @@ class CategoricalBoCSoR:
             # Query k nearest CF neighbours for each boundary instance.
             _, ind = tree.query(X_enc[boundary_idx], k=self.k_neighbors)
 
-            # Dispatch in parallel; 'loky' spawns real processes (no GIL).
-            parallel_results = Parallel(n_jobs=-1, backend='loky')(
-                delayed(self._process_single_sample)(
-                    sample_idx,
-                    X_enc[sample_idx].copy(),   # copy: worker-safe
-                    ind[i],
-                    opp_label,
-                )
-                for i, sample_idx in enumerate(boundary_idx)
-            )
+            # -------------------------------------------------------
+            # Mega-batch approach: 2 model.predict() calls per class
+            # instead of 3 × len(boundary_idx) individual calls.
+            # Eliminates joblib serialisation overhead entirely.
+            # -------------------------------------------------------
+            B = len(boundary_idx)
+            boundary_X = X_enc[boundary_idx]                    # (B, F)
 
-            for sample_idx, per_neighbor_results in parallel_results:
-                for cf_global_idx, found_drivers in per_neighbor_results:
-                    rows.append({
-                        'Sample_ID':             original_indices[sample_idx],
-                        'CF_Neighbor_ID':        cf_global_idx,
-                        'Counterfactual_Values': found_drivers,
-                    })
+            # (a) Batch-verify all B×k CF candidates in one predict.
+            cf_global_all = self.class_indices[opp_label][ind]  # (B, k)
+            cf_X_all      = self.X_enc[cf_global_all.ravel()]   # (B*k, F)
+            cf_preds      = (self.model.predict(cf_X_all)
+                             .ravel().reshape(B, -1))           # (B, k)
+            valid_mask    = cf_preds == opp_label               # (B, k)
+
+            n_valid = int(valid_mask.sum())
+            if n_valid == 0:
+                print(f'    - class {label}: 0 valid CF neighbours — skipping.')
+                continue
+
+            # (b) Vectorised perturbation matrix construction.
+            valid_b, valid_cf_pos = np.where(valid_mask)
+            cf_gidx_valid = cf_global_all[valid_b, valid_cf_pos]
+            orig_valid    = boundary_X[valid_b]
+            cf_valid      = self.X_enc[cf_gidx_valid]
+
+            diff_matrix        = cf_valid != orig_valid
+            pair_idx, feat_idx = np.where(diff_matrix)
+            P = len(pair_idx)
+
+            if P == 0:
+                continue
+
+            perturb_matrix = orig_valid[pair_idx].copy()
+            perturb_matrix[np.arange(P), feat_idx] = \
+                cf_valid[pair_idx, feat_idx]
+
+            print(f'    - class {label}: {n_valid:,} valid CFs, '
+                  f'{P:,} perturbations — predicting...')
+
+            # (c) Mega-batch predict all perturbations.
+            all_preds = self.model.predict(perturb_matrix).ravel()
+
+            # (d) Identify drivers (prediction flipped from `label`).
+            is_driver      = all_preds != label
+            driver_indices = np.where(is_driver)[0]
+
+            if len(driver_indices) == 0:
+                continue
+
+            driver_b       = valid_b[pair_idx[driver_indices]]
+            driver_cf_gidx = cf_gidx_valid[pair_idx[driver_indices]]
+            driver_feat    = feat_idx[driver_indices]
+            driver_cf_val  = cf_valid[
+                pair_idx[driver_indices], feat_idx[driver_indices]
+            ].astype(int)
+
+            driver_strs = [
+                f'{self.feature_names[f]}'
+                f'={self.feature_encoder.categories_[f][v]}'
+                for f, v in zip(driver_feat, driver_cf_val)
+            ]
+
+            # Group drivers by (boundary sample, CF neighbour).
+            groups: dict[tuple, list] = {}
+            for d, ds in enumerate(driver_strs):
+                key = (int(driver_b[d]), int(driver_cf_gidx[d]))
+                groups.setdefault(key, []).append(ds)
+
+            for (b_idx, cf_gidx), driver_list in groups.items():
+                sample_idx = boundary_idx[b_idx]
+                rows.append({
+                    'Sample_ID':             original_indices[sample_idx],
+                    'CF_Neighbor_ID':        cf_gidx,
+                    'Counterfactual_Values': sorted(driver_list),
+                })
 
         print(f'    - done: {len(rows)} (sample, CF-neighbour) pairs '
               f'with at least one driver\n')
@@ -685,11 +744,12 @@ def main(
                       this file when run standalone.
     """
     if base_dir is None:
-        base_dir = (
-            Path('/content')
-            if Path('/content').exists()
-            else Path(__file__).resolve().parent.parent
-        )
+        if Path('/kaggle/working').exists():
+            base_dir = Path('/kaggle/working')
+        elif Path('/content').exists():
+            base_dir = Path('/content')
+        else:
+            base_dir = Path(__file__).resolve().parent.parent
     base_dir = Path(base_dir)
 
     if k_values is None:
