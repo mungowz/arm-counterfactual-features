@@ -73,6 +73,40 @@ ACSIncomeSouth = folktables.BasicProblem(
 
 
 # --------------------------------------------------------------------------- #
+# continuous → categorical binning — standard ACS / BLS groupings
+#
+# AGEP (Age): Census Bureau standard age groups for working-age population.
+#   - adult_filter keeps ages ≥16 who reported ≥1 work-hour & income > $100
+#   - ACS PUMS Data Dictionary 2024, variable AGEP (integer 0–99)
+#
+# WKHP (Usual Hours Worked Per Week Past 12 Months): Bureau of Labor
+#   Statistics part-time / full-time boundary at 35 hours, with finer
+#   granularity for overtime analysis.
+#   - ACS PUMS Data Dictionary 2024, variable WKHP (integer 1–99)
+# --------------------------------------------------------------------------- #
+
+AGEP_BINS   = [0, 24, 34, 44, 54, 64, 200]
+AGEP_LABELS = [
+    'Age-16-24',
+    'Age-25-34',
+    'Age-35-44',
+    'Age-45-54',
+    'Age-55-64',
+    'Age-65-Plus',
+]
+
+WKHP_BINS   = [0, 19, 34, 39, 40, 49, 200]
+WKHP_LABELS = [
+    'WorkHrs-1-19',
+    'WorkHrs-20-34',
+    'WorkHrs-35-39',
+    'WorkHrs-40',
+    'WorkHrs-41-49',
+    'WorkHrs-50-Plus',
+]
+
+
+# --------------------------------------------------------------------------- #
 # categorical mappings — source: 2024 ACS PUMS Data Dictionary (census.gov)
 # codes come from folktables as float64 and are cast to int before lookup,
 # so keys are plain int-strings with no leading zeros
@@ -444,13 +478,21 @@ def build_dataset(
 
     apply_categorical_mappings(features_df)
 
-    for col in ('AGEP', 'WKHP'):
-        if col in features_df.columns:
-            features_df[col] = (
-                pd.to_numeric(features_df[col], errors='coerce')
-                .fillna(-1)
-                .astype(np.int32)
+    # Bin continuous variables into Census/BLS categorical groups
+    if 'AGEP' in features_df.columns:
+        features_df['AGEP'] = pd.Categorical(
+            pd.cut(
+                pd.to_numeric(features_df['AGEP'], errors='coerce'),
+                bins=AGEP_BINS, labels=AGEP_LABELS, right=True,
             )
+        )
+    if 'WKHP' in features_df.columns:
+        features_df['WKHP'] = pd.Categorical(
+            pd.cut(
+                pd.to_numeric(features_df['WKHP'], errors='coerce'),
+                bins=WKHP_BINS, labels=WKHP_LABELS, right=True,
+            )
+        )
 
     pos = features_df['INCOME_ABOVE_THRESHOLD'].mean() * 100
     print(f"  filter: {len(features_df):,} rows  |  pos {pos:.1f}%"
