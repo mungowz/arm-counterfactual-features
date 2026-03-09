@@ -192,8 +192,8 @@ def _parse_args() -> argparse.Namespace:
         formatter_class = argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument('--steps', nargs='+', type=int, choices=[1, 2, 3], default=[1, 2, 3], metavar='{1,2,3}')
-    parser.add_argument('--force', action='store_true')
-    parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('--force', action='store_true', help='Force overwrite of existing output files.')
+    parser.add_argument('--dry-run', action='store_true', help='Print execution plan without running.')
 
     g1 = parser.add_argument_group('Step 1: dataset')
     g1.add_argument('--survey-year', default='2024')

@@ -8,6 +8,7 @@ categorical codes to human-readable labels, and writes one CSV per region to dis
 
 import os
 import time
+import threading
 import numpy as np
 import pandas as pd
 import folktables
@@ -52,7 +53,7 @@ _INCOME_FEATURES = [
     'WKHP',     # usual hours worked per week past 12 months
     'SEX',      # sex
     'RAC1P',    # race
-    'ST',       # state of current residence
+    'ST',       # state of current residence (Spatial Feature)
 ]
 
 # ---------------------------------------------------------------------------
@@ -215,7 +216,7 @@ _COLUMN_MAPS = {
     'COW': COW_MAP, 'SCHL': SCHL_MAP, 'MAR': MAR_MAP,
     'RELSHIPP': RELSHIPP_MAP, 'SEX': SEX_MAP, 'RAC1P': RAC1P_MAP,
     'POBP': POBP_MAP, 'OCCP': OCCP_MAP,
-    'ST': POBP_MAP,   # <-- La colonna Stato è mappata con gli stessi codici FIPS
+    # 'ST' (Stato) è gestito dinamicamente bypassando i codici FIPS
 }
 
 # ---------------------------------------------------------------------------
@@ -253,32 +254,50 @@ def _make_income_task(threshold: int) -> folktables.BasicProblem:
         target_transform = lambda x: x > threshold,
         group            = 'RAC1P',
         preprocess       = folktables.adult_filter,
-        postprocess      = lambda x: np.nan_to_num(x, nan=-1),
+        # FIX: np.where(pd.isna) funziona perfettamente con NumPy array e colonne testuali
+        postprocess      = lambda x: np.where(pd.isna(x), -1, x),
     )
 
 # ---------------------------------------------------------------------------
 # Download helpers
 # ---------------------------------------------------------------------------
 def _download_state(data_source: ACSDataSource, state: str) -> pd.DataFrame:
-    return data_source.get_data(states=[state], download=True)
+    df = data_source.get_data(states=[state], download=True)
+    # INIEZIONE DIRETTA DELLO STATO: inseriamo la sigla (es. 'CA')
+    df['ST'] = state 
+    return df
+
+# Lock that serialises the initial ACS zip download so concurrent threads
+# (state-level or region-level) never corrupt the shared cache file.
+_zip_lock = threading.Lock()
 
 def parallel_get_data(data_source: ACSDataSource, states: list[str], label: str) -> pd.DataFrame:
     n_workers = min(len(states), _DOWNLOAD_WORKERS)
     print(f'  > [{label}] {len(states)} states — {n_workers} workers')
 
-    results: dict[str, pd.DataFrame] = {}
-    with ThreadPoolExecutor(max_workers=n_workers) as pool:
-        futures = {pool.submit(_download_state, data_source, s): s for s in states}
-        for fut in as_completed(futures):
-            state = futures[fut]
-            try:
-                results[state] = fut.result()
-                print(f'    - {state} done')
-            except Exception as exc:
-                raise RuntimeError(
-                    f'Download failed for {state}: {exc}\n'
-                    f'If the requested survey year is not yet available, try an earlier year.'
-                ) from exc
+    # Download the first state under a lock so the ACS zip archive is
+    # fully cached before any parallel worker tries to read it.
+    with _zip_lock:
+        first_df = _download_state(data_source, states[0])
+    print(f'    - {states[0]} done (cache primed)')
+
+    results: dict[str, pd.DataFrame] = {states[0]: first_df}
+    remaining = states[1:]
+
+    if remaining:
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futures = {pool.submit(_download_state, data_source, s): s for s in remaining}
+            for fut in as_completed(futures):
+                state = futures[fut]
+                try:
+                    results[state] = fut.result()
+                    print(f'    - {state} done')
+                except Exception as exc:
+                    raise RuntimeError(
+                        f'Download failed for {state}: {exc}\n'
+                        f'If the requested survey year is not yet available, try an earlier year.'
+                    ) from exc
+
     return pd.concat([results[s] for s in states], ignore_index=True)
 
 def build_dataset(task: folktables.BasicProblem, states: list[str], data_source: ACSDataSource, label: str) -> pd.DataFrame:
@@ -291,6 +310,10 @@ def build_dataset(task: folktables.BasicProblem, states: list[str], data_source:
     features_df['INCOME_ABOVE_THRESHOLD'] = labels.to_numpy(dtype=np.int8)
 
     apply_categorical_mappings(features_df)
+
+    # Convertiamo la colonna Stato iniettata in pd.Categorical
+    if 'ST' in features_df.columns:
+        features_df['ST'] = pd.Categorical(features_df['ST'])
 
     if 'AGEP' in features_df.columns:
         features_df['AGEP'] = pd.Categorical(pd.cut(
@@ -371,6 +394,10 @@ def main(
     with ThreadPoolExecutor(max_workers=min(len(datasets), 4)) as pool:
         write_futs = []
         for reg, df in datasets.items():
+            
+            # INIEZIONE ANNO: Inseriamo l'anno come colonna index 0 per analisi longitudinali
+            df.insert(0, 'YEAR', str(survey_year))
+            
             out_path = os.path.join(output_dir, f'acs_income_{reg}_{survey_year}.csv')
             pos_pct = df['INCOME_ABOVE_THRESHOLD'].mean() * 100
             print(f'  > {reg.capitalize():<10}: {len(df):>8,} rows  |  positive class: {pos_pct:.1f}%')
