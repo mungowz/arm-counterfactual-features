@@ -457,15 +457,19 @@ def _process_one_support(min_sup, sup_idx, n_sup, df, output_dir,
         conviction_vals = rules['conviction'].replace([np.inf, -np.inf], np.nan)
 
         # compact output
-        # support_pct   : proportion of transactions where both sides change (0-100 %)
-        # confidence_pct: P(consequent | antecedent) expressed as 0-100 %
+        # support_raw   : proportion as decimal (e.g. 0.3790)
+        # support_pct   : proportion as percentage (e.g. 37.90)
+        # confidence_raw: P(consequent | antecedent) as decimal
+        # confidence_pct: P(consequent | antecedent) as percentage
         # lift          : ratio -- kept as-is (1.0=independence, >1 positive, <1 negative)
-        # leverage      : support(A|B) - support(A)*support(B), signed difference
+        # leverage      : support(A∪B) - support(A)*support(B), signed difference
         # conviction    : directional strength (inf -> NaN when confidence=1.0)
         fmt = pd.DataFrame()
         fmt['antecedents']    = rules['antecedents'].apply(lambda x: ', '.join(sorted(x)))
         fmt['consequents']    = rules['consequents'].apply(lambda x: ', '.join(sorted(x)))
+        fmt['support_raw']    = rules['support'].round(4)
         fmt['support_pct']    = (rules['support']    * 100).round(2)
+        fmt['confidence_raw'] = rules['confidence'].round(4)
         fmt['confidence_pct'] = (rules['confidence'] * 100).round(2)
         fmt['lift']           = rules['lift'].round(4)
         fmt['leverage']       = rules['leverage'].round(6)
@@ -478,9 +482,13 @@ def _process_one_support(min_sup, sup_idx, n_sup, df, output_dir,
         det['antecedent_length']      = rules['antecedents'].apply(len)
         det['consequent_length']      = rules['consequents'].apply(len)
         det['rule_length']            = det['antecedent_length'] + det['consequent_length']
+        det['antecedent_support_raw'] = rules['antecedent support'].round(4)
         det['antecedent_support_pct'] = (rules['antecedent support'] * 100).round(2)
+        det['consequent_support_raw'] = rules['consequent support'].round(4)
         det['consequent_support_pct'] = (rules['consequent support'] * 100).round(2)
+        det['support_raw']            = rules['support'].round(4)
         det['support_pct']            = (rules['support']    * 100).round(2)
+        det['confidence_raw']         = rules['confidence'].round(4)
         det['confidence_pct']         = (rules['confidence'] * 100).round(2)
         det['lift']                   = rules['lift'].round(4)
         det['leverage']               = rules['leverage'].round(6)
