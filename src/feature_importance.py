@@ -660,8 +660,8 @@ if __name__ == "__main__":
     results_dir = base_dir / "results"
 
     regions = {
-        'northeast': data_dir / "ACSIncome_northeast_2018_balanced.csv",
-        'south':     data_dir / "ACSIncome_south_2018_balanced.csv",
+        'northeast': data_dir / "acs_income_northeast_2024.csv",
+        'south':     data_dir / "acs_income_south_2024.csv",
     }
 
     k_values       = [1, 3, 5, 7]
