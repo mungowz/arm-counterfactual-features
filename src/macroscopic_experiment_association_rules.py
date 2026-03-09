@@ -464,12 +464,16 @@ def _process_one_support(min_sup, sup_idx, n_sup, df, output_dir,
         # lift          : ratio -- kept as-is (1.0=independence, >1 positive, <1 negative)
         # leverage      : support(A∪B) - support(A)*support(B), signed difference
         # conviction    : directional strength (inf -> NaN when confidence=1.0)
+        # *_raw columns are pre-formatted as strings (like item_supports.csv)
+        # so that trailing zeros are never silently dropped by pandas
+        # (e.g. round(0.3790, 4) → float 0.379 → written as 0.379).
+        # *_pct columns use floats -- 2 decimal places, no trailing-zero issue.
         fmt = pd.DataFrame()
         fmt['antecedents']    = rules['antecedents'].apply(lambda x: ', '.join(sorted(x)))
         fmt['consequents']    = rules['consequents'].apply(lambda x: ', '.join(sorted(x)))
-        fmt['support_raw']    = rules['support'].round(4)
+        fmt['support_raw']    = [f"{v:.4f}" for v in rules['support']]
         fmt['support_pct']    = (rules['support']    * 100).round(2)
-        fmt['confidence_raw'] = rules['confidence'].round(4)
+        fmt['confidence_raw'] = [f"{v:.4f}" for v in rules['confidence']]
         fmt['confidence_pct'] = (rules['confidence'] * 100).round(2)
         fmt['lift']           = rules['lift'].round(4)
         fmt['leverage']       = rules['leverage'].round(6)
@@ -482,13 +486,13 @@ def _process_one_support(min_sup, sup_idx, n_sup, df, output_dir,
         det['antecedent_length']      = rules['antecedents'].apply(len)
         det['consequent_length']      = rules['consequents'].apply(len)
         det['rule_length']            = det['antecedent_length'] + det['consequent_length']
-        det['antecedent_support_raw'] = rules['antecedent support'].round(4)
+        det['antecedent_support_raw'] = [f"{v:.4f}" for v in rules['antecedent support']]
         det['antecedent_support_pct'] = (rules['antecedent support'] * 100).round(2)
-        det['consequent_support_raw'] = rules['consequent support'].round(4)
+        det['consequent_support_raw'] = [f"{v:.4f}" for v in rules['consequent support']]
         det['consequent_support_pct'] = (rules['consequent support'] * 100).round(2)
-        det['support_raw']            = rules['support'].round(4)
+        det['support_raw']            = [f"{v:.4f}" for v in rules['support']]
         det['support_pct']            = (rules['support']    * 100).round(2)
-        det['confidence_raw']         = rules['confidence'].round(4)
+        det['confidence_raw']         = [f"{v:.4f}" for v in rules['confidence']]
         det['confidence_pct']         = (rules['confidence'] * 100).round(2)
         det['lift']                   = rules['lift'].round(4)
         det['leverage']               = rules['leverage'].round(6)
@@ -1285,26 +1289,32 @@ if __name__ == "__main__":
         )
 
         # Append post-run summary to experiment_log.txt.
-        total_rules = sum(
-            int(sdf['Number_of_Rules'].max())
-            for sdf in k_summaries.values()
+        # sum_rules: total signal produced (sum of per-k best combos).
+        # max_rules: strongest single (sup, conf, lift) combination across all k.
+        # Both are reported -- they answer different questions.
+        k_max_per_k = {
+            k: int(sdf['Number_of_Rules'].max())
+            for k, sdf in k_summaries.items()
             if not sdf.empty and 'Number_of_Rules' in sdf.columns
-        )
+        }
+        sum_rules  = sum(k_max_per_k.values())
+        max_rules  = max(k_max_per_k.values()) if k_max_per_k else 0
+        best_k     = max(k_max_per_k, key=k_max_per_k.get) if k_max_per_k else None
         k_ran      = sorted(k_summaries.keys())
         k_skipped  = sorted(set(k_labels_map.keys()) - set(k_summaries.keys()))
-        k_with_rules = sorted(
-            k for k, sdf in k_summaries.items()
-            if not sdf.empty and int(sdf['Number_of_Rules'].max()) > 0
-        )
+        k_with_rules = sorted(k for k, n in k_max_per_k.items() if n > 0)
         with open(log_path, "a") as f:
             f.write(f"\n{'='*70}\n")
             f.write("Post-run Summary:\n")
             f.write(f"{'-'*60}\n")
-            f.write(f"  k values ran          : {k_ran}\n")
-            f.write(f"  k values skipped      : {k_skipped if k_skipped else 'none'}\n")
-            f.write(f"  k values with rules   : {k_with_rules if k_with_rules else 'none'}\n")
-            f.write(f"  Max rules (best combo): {total_rules}\n")
-            f.write(f"  Completed at          : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"  k values ran              : {k_ran}\n")
+            f.write(f"  k values skipped          : {k_skipped if k_skipped else 'none'}\n")
+            f.write(f"  k values with rules       : {k_with_rules if k_with_rules else 'none'}\n")
+            f.write(f"  Sum of max rules across k : {sum_rules}  "
+                    f"(total signal across all k)\n")
+            f.write(f"  Max rules in best combo   : {max_rules}  "
+                    f"(strongest single combination, k={best_k})\n")
+            f.write(f"  Completed at              : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
 
     print("\n" + "="*70)
     print("Done.")
