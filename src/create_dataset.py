@@ -87,22 +87,22 @@ ACSIncomeSouth = folktables.BasicProblem(
 
 AGEP_BINS   = [0, 24, 34, 44, 54, 64, 200]
 AGEP_LABELS = [
-    'Age-16-24',
-    'Age-25-34',
-    'Age-35-44',
-    'Age-45-54',
-    'Age-55-64',
-    'Age-65-Plus',
+    'Young',          # 16–24
+    'Young-Adult',    # 25–34
+    'Mid-Career',     # 35–44
+    'Experienced',    # 45–54
+    'Late-Career',    # 55–64
+    'Retirement-Age', # 65+
 ]
 
 WKHP_BINS   = [0, 19, 34, 39, 40, 49, 200]
 WKHP_LABELS = [
-    'WorkHrs-1-19',
-    'WorkHrs-20-34',
-    'WorkHrs-35-39',
-    'WorkHrs-40',
-    'WorkHrs-41-49',
-    'WorkHrs-50-Plus',
+    'Part-Time-Low',      #  1–19 hrs/wk
+    'Part-Time',          # 20–34 hrs/wk
+    'Near-Full-Time',     # 35–39 hrs/wk
+    'Full-Time',          # 40    hrs/wk
+    'Over-Full-Time',     # 41–49 hrs/wk
+    'Extended-Hours',     # 50–99 hrs/wk
 ]
 
 
