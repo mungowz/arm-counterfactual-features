@@ -653,6 +653,16 @@ def explore_association_rules(df, output_dir,
     removed_conf, removed_sup = cleanup_empty_folders(output_dir)
     print(f"  > Removed {removed_conf} conf folder(s) and {removed_sup} sup folder(s)")
 
+    # Append cleanup counts and parallelism info to exploration_summary.txt
+    # (file already written above -- we reopen in append mode to add these lines
+    # which are only available after the parallel workers have finished)
+    with open(output_dir / "exploration_summary.txt", 'a') as f:
+        f.write(f"\nParallelism:\n")
+        f.write(f"  n_jobs used      : {n_jobs} (of {_CPU_CORES} logical / {_PERF_CORES} perf cores)\n\n")
+        f.write(f"Folder cleanup:\n")
+        f.write(f"  conf dirs removed: {removed_conf}\n")
+        f.write(f"  sup dirs removed : {removed_sup}\n")
+
     plot_heatmaps(summary_df, output_dir,
                   lift_neutral_half_window=lift_neutral_half_window,
                   lift_delta=lift_delta)
@@ -1212,13 +1222,51 @@ if __name__ == "__main__":
             elif p_orig.exists():
                 k_labels_map[k] = (p_orig, "original (fallback)")
 
+        ks_with_agg  = sum(1 for _, (_, src) in k_labels_map.items() if "aggregated" in src)
+        ks_with_orig = len(k_labels_map) - ks_with_agg
+
+        # Write experiment_log.txt (pre-run section) -- captures region,
+        # experiment label, configuration and input file sources.
+        # Written before run_k_comparison so it exists even if execution fails.
+        # A post-run section is appended after run_k_comparison returns.
+        log_path = ar_output_dir / "experiment_log.txt"
+        with open(log_path, "w") as f:
+            f.write("EXPERIMENT LOG\n")
+            f.write(f"{'='*70}\n\n")
+            f.write(f"Generated     : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Region        : {region.upper()}\n")
+            f.write(f"Experiment    : {exp_label}\n")
+            f.write(f"Output dir    : {ar_output_dir}\n\n")
+            f.write("Configuration:\n")
+            f.write(f"  auto_calibrate          : {AUTO_CALIBRATE}\n")
+            f.write(f"  sup_min / sup_max       : {SUP_MIN} / {SUP_MAX}  (fallback if auto=False)\n")
+            f.write(f"  sup_delta               : {SUP_DELTA}\n")
+            f.write(f"  conf_min / conf_max     : {CONF_MIN} / {CONF_MAX}  (conf_min is floor when calibrating)\n")
+            f.write(f"  conf_delta              : {CONF_DELTA}\n")
+            f.write(f"  lift_min / lift_max     : {LIFT_MIN} / {LIFT_MAX}  (lift_min=0.0 includes negative correlations)\n")
+            f.write(f"  lift_delta              : {LIFT_DELTA}\n")
+            f.write(f"  lift_neutral_half_window: {LIFT_NEUTRAL_HALF_WIN}  "
+                    f"(excludes [{round(1.0 - LIFT_NEUTRAL_HALF_WIN, 4)}, {round(1.0 + LIFT_NEUTRAL_HALF_WIN, 4)}])\n\n")
+            f.write(f"Parallelism   : {_CPU_CORES} logical cores / {_PERF_CORES} perf cores (joblib loky)\n\n")
+
+            if not k_labels_map:
+                f.write("Input files   : NONE FOUND\n")
+                f.write(f"  Searched under: {important_features_dir}\n")
+                f.write("  Run feature_importance.py first.\n")
+            else:
+                f.write(f"Input files found ({len(k_labels_map)} k-values):\n")
+                f.write(f"{'-'*60}\n")
+                for k_val, (path, src) in sorted(k_labels_map.items()):
+                    f.write(f"  k={k_val:<3}  [{src}]  {path}\n")
+                f.write(f"\n  {ks_with_agg} aggregated (preferred)\n")
+                if ks_with_orig:
+                    f.write(f"  {ks_with_orig} original (fallback)\n")
+
         if not k_labels_map:
             print(f"  > No labels files found under {important_features_dir}")
             print(f"    Run feature_importance.py first.")
             continue
 
-        ks_with_agg  = sum(1 for _, (_, src) in k_labels_map.items() if "aggregated" in src)
-        ks_with_orig = len(k_labels_map) - ks_with_agg
         print(f"  > Found labels for k = {sorted(k_labels_map.keys())}")
         print(f"    - {ks_with_agg} k-values using aggregated format (preferred)")
         if ks_with_orig:
@@ -1226,7 +1274,7 @@ if __name__ == "__main__":
 
         k_paths_map = {k: path for k, (path, _) in k_labels_map.items()}
 
-        run_k_comparison(
+        k_summaries = run_k_comparison(
             k_labels_map=k_paths_map,
             output_dir=ar_output_dir,
             auto_calibrate=AUTO_CALIBRATE,
@@ -1235,6 +1283,28 @@ if __name__ == "__main__":
             lift_min=LIFT_MIN, lift_max=LIFT_MAX, lift_delta=LIFT_DELTA,
             lift_neutral_half_window=LIFT_NEUTRAL_HALF_WIN,
         )
+
+        # Append post-run summary to experiment_log.txt.
+        total_rules = sum(
+            int(sdf['Number_of_Rules'].max())
+            for sdf in k_summaries.values()
+            if not sdf.empty and 'Number_of_Rules' in sdf.columns
+        )
+        k_ran      = sorted(k_summaries.keys())
+        k_skipped  = sorted(set(k_labels_map.keys()) - set(k_summaries.keys()))
+        k_with_rules = sorted(
+            k for k, sdf in k_summaries.items()
+            if not sdf.empty and int(sdf['Number_of_Rules'].max()) > 0
+        )
+        with open(log_path, "a") as f:
+            f.write(f"\n{'='*70}\n")
+            f.write("Post-run Summary:\n")
+            f.write(f"{'-'*60}\n")
+            f.write(f"  k values ran          : {k_ran}\n")
+            f.write(f"  k values skipped      : {k_skipped if k_skipped else 'none'}\n")
+            f.write(f"  k values with rules   : {k_with_rules if k_with_rules else 'none'}\n")
+            f.write(f"  Max rules (best combo): {total_rules}\n")
+            f.write(f"  Completed at          : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
 
     print("\n" + "="*70)
     print("Done.")
