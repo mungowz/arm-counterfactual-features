@@ -216,7 +216,7 @@ _COLUMN_MAPS = {
     'COW': COW_MAP, 'SCHL': SCHL_MAP, 'MAR': MAR_MAP,
     'RELSHIPP': RELSHIPP_MAP, 'SEX': SEX_MAP, 'RAC1P': RAC1P_MAP,
     'POBP': POBP_MAP, 'OCCP': OCCP_MAP,
-    # 'ST' (Stato) è gestito dinamicamente bypassando i codici FIPS
+    # 'ST' is handled dynamically (state abbreviations injected directly, bypassing FIPS codes).
 }
 
 # ---------------------------------------------------------------------------
@@ -254,7 +254,7 @@ def _make_income_task(threshold: int) -> folktables.BasicProblem:
         target_transform = lambda x: x > threshold,
         group            = 'RAC1P',
         preprocess       = folktables.adult_filter,
-        # FIX: np.where(pd.isna) funziona perfettamente con NumPy array e colonne testuali
+        # np.where(pd.isna) handles both numeric and string columns correctly.
         postprocess      = lambda x: np.where(pd.isna(x), -1, x),
     )
 
@@ -263,7 +263,7 @@ def _make_income_task(threshold: int) -> folktables.BasicProblem:
 # ---------------------------------------------------------------------------
 def _download_state(data_source: ACSDataSource, state: str) -> pd.DataFrame:
     df = data_source.get_data(states=[state], download=True)
-    # INIEZIONE DIRETTA DELLO STATO: inseriamo la sigla (es. 'CA')
+    # Inject the state abbreviation (e.g. 'CA') directly into the raw DataFrame.
     df['ST'] = state 
     return df
 
@@ -311,7 +311,7 @@ def build_dataset(task: folktables.BasicProblem, states: list[str], data_source:
 
     apply_categorical_mappings(features_df)
 
-    # Convertiamo la colonna Stato iniettata in pd.Categorical
+    # Convert the injected state column to pd.Categorical.
     if 'ST' in features_df.columns:
         features_df['ST'] = pd.Categorical(features_df['ST'])
 
@@ -356,6 +356,29 @@ def main(
     income_threshold_usa: int        = 100_000,
     regions_to_build: list[str]      = None,
 ) -> None:
+    """
+    Download ACS data for the specified regions, build processed datasets,
+    and save them as CSV files under output_dir.
+
+    Sampling note
+    -------------
+    When both 'northeast' and 'south' are present, the South dataset is
+    stratified-undersampled to match the Northeast row count (seed=random_seed).
+    The 'usa' dataset, if requested, is written at its full post-filter size
+    and is intentionally not undersampled — it is meant for independent
+    national-level analysis.
+
+    Parameters
+    ----------
+    survey_year                  ACS survey year (e.g. '2024').
+    horizon                      Survey horizon ('1-Year' or '5-Year').
+    random_seed                  Random seed for reproducibility.
+    output_dir                   Directory where CSV files are written.
+    income_threshold_northeast   Annual income threshold (USD) for the Northeast positive class.
+    income_threshold_south       Annual income threshold (USD) for the South positive class.
+    income_threshold_usa         Annual income threshold (USD) for the USA positive class.
+    regions_to_build             List of region names to build; defaults to ['northeast', 'south'].
+    """
     t0 = time.perf_counter()
     os.makedirs(output_dir, exist_ok=True)
     data_source = ACSDataSource(survey_year=survey_year, horizon=horizon, survey='person')
@@ -395,7 +418,7 @@ def main(
         write_futs = []
         for reg, df in datasets.items():
             
-            # INIEZIONE ANNO: Inseriamo l'anno come colonna index 0 per analisi longitudinali
+            # Insert the survey year as the first column for longitudinal analysis.
             df.insert(0, 'YEAR', str(survey_year))
             
             out_path = os.path.join(output_dir, f'acs_income_{reg}_{survey_year}.csv')

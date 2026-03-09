@@ -61,7 +61,7 @@ def _outputs_step1_exist(survey_year: str, output_dir: str, regions: list[str]) 
     return True
 
 def _outputs_step2_exist(regions: list[str], k_values: list[int]) -> bool:
-    results_dir = _HERE.parent / 'results'
+    results_dir = _HERE / 'results'
     for region in regions:
         for k in k_values:
             p = results_dir / region / 'important_features' / f'k_{k}' / 'transactions_values.csv'
@@ -80,7 +80,7 @@ def _inputs_step2_exist(regions: list[str], survey_year: str, output_dir: str) -
     return ok
 
 def _inputs_step3_exist(regions: list[str], k_values: list[int]) -> bool:
-    results_dir = _HERE.parent / 'results'
+    results_dir = _HERE / 'results'
     ok = True
     for region in regions:
         for k in k_values:
@@ -141,7 +141,8 @@ def run_step2(args: argparse.Namespace) -> bool:
             k_values       = args.k_values,
             perc_threshold = args.perc_threshold,
             target_col     = args.target_col,
-            base_dir       = _HERE.parent,
+            metadata_cols  = args.metadata_cols,
+            base_dir       = _HERE,
         )
     except Exception:
         print('\n  [ERROR] Step 2 failed:')
@@ -173,7 +174,7 @@ def run_step3(args: argparse.Namespace) -> bool:
             lift_max                 = args.lift_max,
             lift_delta               = args.lift_delta,
             lift_neutral_half_window = args.lift_neutral_half_window,
-            base_dir                 = _HERE.parent,
+            base_dir                 = _HERE,
         )
     except Exception:
         print('\n  [ERROR] Step 3 failed:')
@@ -199,7 +200,8 @@ def _parse_args() -> argparse.Namespace:
     g1.add_argument('--survey-year', default='2024')
     g1.add_argument('--horizon', default='1-Year')
     g1.add_argument('--random-seed', type=int, default=42)
-    g1.add_argument('--output-dir', default='data')
+    g1.add_argument('--output-dir', default=str(_HERE / 'data'),
+                    help='Directory for dataset CSV files (default: <script_dir>/data).')
     g1.add_argument('--income-threshold-ne', type=int, default=110_000)
     g1.add_argument('--income-threshold-south', type=int, default=90_000)
     g1.add_argument('--income-threshold-usa', type=int, default=100_000, help='USA global income threshold in USD.')
@@ -208,6 +210,14 @@ def _parse_args() -> argparse.Namespace:
     g2.add_argument('--k-values', nargs='+', type=int, default=[1, 3, 5, 7])
     g2.add_argument('--perc-threshold', type=int, default=10)
     g2.add_argument('--target-col', default='INCOME_ABOVE_THRESHOLD')
+    g2.add_argument(
+        '--metadata-cols', nargs='*', default=['YEAR'], metavar='COL',
+        help=(
+            'Columns excluded from feature matrix X in Step 2 '
+            '(data-provenance, not predictive features). '
+            'Default: YEAR. Pass --metadata-cols with no args to exclude nothing.'
+        ),
+    )
 
     parser.add_argument(
         '--regions', nargs='+', choices=['northeast', 'south', 'usa'],
@@ -239,9 +249,23 @@ def main() -> None:
     _banner('PIPELINE ORCHESTRATOR')
     print(f'  Steps selected               : {sorted(args.steps)}')
     print(f'  Regions                      : {args.regions}')
-    print(f'  Income threshold — Northeast : ${args.income_threshold_ne:,}')
-    print(f'  Income threshold — South     : ${args.income_threshold_south:,}')
-    print(f'  Income threshold — USA       : ${args.income_threshold_usa:,}')
+    print(f'  Survey year                  : {args.survey_year}')
+    print(f'  Horizon                      : {args.horizon}')
+    print(f'  Random seed                  : {args.random_seed}')
+    print(f'  Output dir (datasets)        : {args.output_dir}')
+    if 'northeast' in args.regions:
+        print(f'  Income threshold — Northeast : ${args.income_threshold_ne:,}')
+    if 'south' in args.regions:
+        print(f'  Income threshold — South     : ${args.income_threshold_south:,}')
+    if 'usa' in args.regions:
+        print(f'  Income threshold — USA       : ${args.income_threshold_usa:,}')
+    print(f'  k values                     : {args.k_values}')
+    print(f'  Perc threshold               : {args.perc_threshold}')
+    print(f'  Target column                : {args.target_col}')
+    print(f'  Auto-calibrate (ARM)         : {args.auto_calibrate}')
+    print(f'  Force re-run                 : {args.force}')
+    print(f'  Dry-run                      : {args.dry_run}')
+    print(f'  Working directory            : {_HERE}')
 
     if not _check_source_files():
         print('\n  [ERROR] One or more source files are missing. Aborting.')

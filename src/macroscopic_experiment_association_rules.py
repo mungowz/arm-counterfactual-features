@@ -1334,7 +1334,7 @@ def main(
         elif Path('/content').exists():
             base_dir = Path('/content')
         else:
-            base_dir = Path(__file__).resolve().parent.parent
+            base_dir = Path(__file__).resolve().parent
     base_dir = Path(base_dir)
 
     if regions is None:

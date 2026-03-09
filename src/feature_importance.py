@@ -33,7 +33,6 @@ from catboost import CatBoostClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import OrdinalEncoder, LabelEncoder
 from sklearn.neighbors import BallTree
-from joblib import Parallel, delayed
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +76,7 @@ class CategoricalBoCSoR:
        Midpoints between two categorical instances are not meaningful.
        Following the authors' suggestion, only real instances from the
        opposite class are used as counterfactuals.  Every candidate CF is
-       verified against the model before use (see _process_single_sample).
+       verified against the model before use (see explain()).
 
     3. Inverted swap direction
        Instead of injecting the original feature value into the CF, the CF
@@ -94,15 +93,12 @@ class CategoricalBoCSoR:
 
     Performance design
     ------------------
-    - model.predict calls reduced from O(1 + 2k) to O(3) per boundary sample:
-        * 1 call for the original instance
-        * 1 batched call for all k CF verifications
-        * 1 batched call for all perturbations across all valid CFs
+    explain() uses a mega-batch strategy (2 model.predict() calls per class):
+    - One batched predict for all B×k CF candidates.
+    - One batched predict for all perturbations across all valid CFs.
     - Perturbation matrix built via NumPy broadcasting (no Python inner loops).
-    - Per-class global indices pre-cached in fit() so workers never recompute
-      np.where(y_enc == label) on every parallel call.
+    - Per-class global indices pre-cached in fit() to avoid redundant np.where calls.
     - X_enc stored as C-contiguous int32 for optimal cache behaviour.
-    - joblib 'loky' backend provides true multiprocessing, bypassing the GIL.
     """
 
     def __init__(self, k_neighbors: int = 10, perc_threshold: int = 10) -> None:
@@ -170,95 +166,6 @@ class CategoricalBoCSoR:
             for label in np.unique(y_enc)
         }
 
-    # ------------------------------------------------------------------
-    # _process_single_sample  (worker dispatched by joblib)
-    # ------------------------------------------------------------------
-
-    def _process_single_sample(
-        self,
-        sample_idx: int,
-        orig_enc_sample: np.ndarray,
-        ind_row: np.ndarray,
-        opp_label: int,
-    ):
-        """
-        Process one boundary instance against its k CF neighbours.
-
-        Performance profile per call:
-            model.predict calls : 3  (vs. 1 + 2k in the naive version)
-            NumPy ops           : fully vectorised, no Python inner loops
-
-        Steps
-        -----
-        1.  Predict orig_pred with a single call.
-        2.  Retrieve all k CF candidates; verify all of them in one batched
-            predict call; discard those not predicted as opp_label.
-        3.  Build the full perturbation matrix in one NumPy operation:
-                shape = (total_diff_positions_across_valid_CFs, n_features)
-            using np.tile + advanced indexing.
-        4.  Predict all perturbations in one batched call.
-        5.  Group driver strings by CF neighbour.
-
-        Returns
-        -------
-        sample_idx           : int
-        per_neighbor_results : list of (cf_global_idx, sorted_driver_list)
-        """
-        orig      = orig_enc_sample
-        orig_pred = self.model.predict([orig])[0]
-
-        # Map BallTree-local indices to global row indices (pre-cached).
-        global_ind = self.class_indices[int(opp_label)][ind_row]
-        neighbors  = self.X_enc[global_ind]       # shape: (k, n_features)
-
-        # Batch-verify all k CF candidates in one predict call.
-        cf_preds     = self.model.predict(neighbors).ravel()
-        valid_mask   = cf_preds == opp_label
-        valid_global = global_ind[valid_mask]
-        valid_neigh  = neighbors[valid_mask]       # shape: (n_valid, n_features)
-
-        if len(valid_neigh) == 0:
-            return sample_idx, []
-
-        # Build perturbation matrix via NumPy broadcasting.
-        # diff_matrix[i, j] is True where valid CF i differs from orig at j.
-        # np.where returns aligned (cf_row, feat_col) index arrays.
-        diff_matrix      = valid_neigh != orig          # (n_valid, n_feat)
-        cf_row, feat_col = np.where(diff_matrix)        # both: shape (P,)
-        n_perturbations  = len(cf_row)
-
-        if n_perturbations == 0:
-            return sample_idx, []
-
-        # Build (P, n_features) matrix: start from P copies of orig, then
-        # inject each CF value at the corresponding feature position.
-        perturb_matrix = np.tile(orig, (n_perturbations, 1))
-        perturb_matrix[np.arange(n_perturbations), feat_col] = \
-            valid_neigh[cf_row, feat_col]
-
-        # Predict all perturbations in one batched call.
-        all_preds = self.model.predict(perturb_matrix).ravel()
-
-        # Build driver strings for all perturbations (vectorised decode).
-        driver_strings = [
-            f'{self.feature_names[feat_col[p]]}'
-            f'={self.feature_encoder.categories_[feat_col[p]][valid_neigh[cf_row[p], feat_col[p]]]}'
-            for p in range(n_perturbations)
-        ]
-
-        # Collect drivers per valid CF neighbour.
-        cf_drivers: dict[int, list] = {}
-        for p, (pred, driver_str) in enumerate(zip(all_preds, driver_strings)):
-            if pred != orig_pred:
-                gidx = int(valid_global[cf_row[p]])
-                cf_drivers.setdefault(gidx, []).append(driver_str)
-
-        per_neighbor_results = [
-            (gidx, sorted(drivers))
-            for gidx, drivers in cf_drivers.items()
-        ]
-
-        return sample_idx, per_neighbor_results
 
     # ------------------------------------------------------------------
     # explain
@@ -605,8 +512,9 @@ def run_for_k_values(
     k_values: list[int],
     data_path: Path,
     output_base_dir: Path,
-    target_col: str  = 'INCOME_ABOVE_THRESHOLD',
-    perc_threshold: int = 10,
+    target_col: str          = 'INCOME_ABOVE_THRESHOLD',
+    perc_threshold: int      = 10,
+    metadata_cols: list[str] = None,
 ) -> dict[int, Path]:
     """
     Train CategoricalBoCSoR once and run counterfactual extraction for each k.
@@ -621,11 +529,26 @@ def run_for_k_values(
     output_base_dir : root directory for per-k result sub-folders
     target_col      : name of the target column in the CSV
     perc_threshold  : boundary filter percentile
+    metadata_cols   : columns to exclude from the feature matrix X even if
+                      present in the CSV.  These are data-provenance or
+                      bookkeeping columns that must not enter the model or
+                      appear as counterfactual drivers.
+                      Defaults to ['YEAR'].
+
+                      Rationale for YEAR: the survey year is injected by
+                      create_dataset.py to support longitudinal analysis.
+                      It is kept in the CSV so multi-year datasets remain
+                      identifiable, but must not enter the feature matrix —
+                      changing the survey year is not a valid individual-level
+                      CF driver.
 
     Returns
     -------
     dict mapping k → Path of labels_only_unique.csv for that k
     """
+    if metadata_cols is None:
+        metadata_cols = ['YEAR']
+
     output_base_dir = Path(output_base_dir)
     output_base_dir.mkdir(parents=True, exist_ok=True)
 
@@ -635,6 +558,8 @@ def run_for_k_values(
     print(f'  > k values        : {k_values}')
     print(f'  > perc_threshold  : {perc_threshold}')
     print(f'  > target column   : {target_col}')
+    if metadata_cols:
+        print(f'  > metadata cols   : {metadata_cols} (excluded from X)')
     print('-' * 50)
 
     print('  > Loading dataset and splitting...')
@@ -643,7 +568,11 @@ def run_for_k_values(
     if target_col != 'target':
         df = df.rename(columns={target_col: 'target'})
 
-    X, y = df.drop(columns=['target']), df['target']
+    # Exclude target and any metadata columns from the feature matrix.
+    # YEAR is excluded by default: it is a data-provenance column injected
+    # by create_dataset.py for longitudinal tracking, not a predictive feature.
+    cols_to_drop = ['target'] + [c for c in metadata_cols if c in df.columns]
+    X, y = df.drop(columns=cols_to_drop), df['target']
     X_tr, X_te, y_tr, y_te = train_test_split(
         X, y, test_size=0.2, random_state=42, stratify=y
     )
@@ -722,12 +651,13 @@ class _TeeWriter:
 # ---------------------------------------------------------------------------
 
 def main(
-    survey_year: str       = '2024',
-    regions: dict          = None,
-    k_values: list[int]    = None,
-    perc_threshold: int    = 10,
-    target_col: str        = 'INCOME_ABOVE_THRESHOLD',
-    base_dir: Path         = None,
+    survey_year: str          = '2024',
+    regions: dict             = None,
+    k_values: list[int]       = None,
+    perc_threshold: int       = 10,
+    target_col: str           = 'INCOME_ABOVE_THRESHOLD',
+    metadata_cols: list[str]  = None,
+    base_dir: Path            = None,
 ) -> None:
     """
     Run counterfactual extraction for all specified regions and k values.
@@ -740,8 +670,9 @@ def main(
     k_values        : neighbourhood sizes for BoCSoR.
     perc_threshold  : boundary filter percentile.
     target_col      : name of the binary target column in the CSV.
-    base_dir        : project root directory.  Defaults to two levels above
-                      this file when run standalone.
+    metadata_cols   : non-feature columns to exclude from X (see run_for_k_values).
+                      Defaults to ['YEAR'].
+    base_dir        : project root directory.
     """
     if base_dir is None:
         if Path('/kaggle/working').exists():
@@ -749,7 +680,7 @@ def main(
         elif Path('/content').exists():
             base_dir = Path('/content')
         else:
-            base_dir = Path(__file__).resolve().parent.parent
+            base_dir = Path(__file__).resolve().parent
     base_dir = Path(base_dir)
 
     if k_values is None:
@@ -787,6 +718,7 @@ def main(
                 output_base_dir= output_dir,
                 target_col     = target_col,
                 perc_threshold = perc_threshold,
+                metadata_cols  = metadata_cols,
             )
 
             print('  > k_labels_map ready:')
