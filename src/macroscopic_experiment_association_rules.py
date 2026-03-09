@@ -1,38 +1,3 @@
-"""
-Association Rule Mining on Counterfactual Drivers
-===================================================
-
-Pipeline (from feature_importance.py):
-  1. BoCSoR.explain()  -> finds one differing feature per (sample, CF_neighbor) pair
-                         -> transactions_values.csv
-  2. extract_labels()  -> extracts change labels (e.g., "SCHL=changes")
-                         -> labels_only_unique.csv (one row per sample-CF pair)
-  3. aggregate_drivers_by_sample() -> consolidates all drivers per sample across
-                                      all its CF neighbors into one transaction
-                                      -> aggregated_labels_by_sample.csv
-
-This module (macroscopic_experiment_association_rules.py):
-  - Reads aggregated_labels_by_sample.csv (preferred) or labels_only_unique.csv
-  - Runs FP-Growth to discover itemsets and association rules
-  - Auto-calibrates support/confidence/lift thresholds based on transaction sparsity
-  - Keeps both directions of each rule (A->B and B->A) to support directional analysis
-  - Generates heatmaps and cross-k comparison summaries
-
-Example rule discovered:
-  When SCHL (education level) changes on the decision boundary,
-  OCCP (occupation) also changes 70% of the time (confidence=0.70, lift=2.1)
-
-Input CSV format (aggregated_labels_by_sample.csv):
-  Sample_ID | Labels          | Num_Labels | Num_CF_Neighbors
-  1284      | ['OCCP']        | 1          | 1
-  1442      | ['WKHP']        | 1          | 1
-  ...
-
-  The 'Labels' column contains Python list literals -- parsed with ast.literal_eval.
-  Multi-item rows (e.g. ['OCCP', 'SCHL']) arise when a sample has multiple CF
-  neighbors that each identify a different driver; these enable pairwise rules.
-"""
-
 import ast
 import datetime
 import os
@@ -47,13 +12,13 @@ from joblib import Parallel, delayed
 from mlxtend.preprocessing import TransactionEncoder
 from mlxtend.frequent_patterns import fpgrowth, association_rules
 
-# headless backend -- needed when running on a server without a display
+# headless backend — needed when running on a server without a display
 matplotlib.use('Agg')
 
-# Total logical cores -- used for logging only.
+# Total logical cores — used for logging only.
 _CPU_CORES = os.cpu_count() or 1
 
-# PERF OPT 2 -- platform-aware parallelism.
+# PERF OPT 2 — platform-aware parallelism.
 # On macOS (M-series) we cap n_jobs at the P-core count to avoid the
 # E-core straggler bottleneck.  On Linux/Windows all cores are equivalent.
 # Adjust _PERF_CORES manually: M2 base=4, Pro=6/8, Max=8-12, Ultra=16.
@@ -66,7 +31,7 @@ del _platform
 
 
 # ---------------------------------------------------------------------------
-# Neutral-window helper  -- SINGLE SOURCE OF TRUTH
+# Neutral-window helper — SINGLE SOURCE OF TRUTH
 # ---------------------------------------------------------------------------
 
 def _neutral_window(lift_neutral_half_window):
@@ -96,7 +61,7 @@ def _neutral_window(lift_neutral_half_window):
 
     NEGATIVE CORRELATIONS:
     Rules with lift < lo (e.g. lift < 0.75) indicate pairs of features that
-    tend NOT to co-occur on the decision boundary -- an anti-correlation that
+    tend NOT to co-occur on the decision boundary — an anti-correlation that
     is analytically meaningful.  Only the [lo, hi] band is removed; rules
     below lo are intentionally preserved.  Set LIFT_MIN=0.0 in the entry
     point to include them in the grid search.
@@ -119,7 +84,7 @@ def extract_labels(labels_only_path):
       - labels_only_unique.csv           : one row per sample-CF pair, 'Labels' column
 
     Both files use the same 'Labels' column containing Python list literals
-    (e.g. "['OCCP', 'SCHL']") -- parsed with ast.literal_eval.
+    (e.g. "['OCCP', 'SCHL']") — parsed with ast.literal_eval.
     """
     print("  > Loading and encoding labels...")
     df = pd.read_csv(labels_only_path)
@@ -150,7 +115,7 @@ def extract_labels(labels_only_path):
 
 def cleanup_empty_folders(output_dir):
     """
-    After filtering, some conf_* folders end up with no rules -- delete them.
+    After filtering, some conf_* folders end up with no rules — delete them.
     If a sup_* folder loses all its conf_* subfolders, delete that too.
     Returns (n_conf_removed, n_sup_removed).
     """
@@ -218,7 +183,7 @@ def grid_search_fpgrowth_delta(df, sup_min, sup_max, sup_delta,
         if len(frequent_itemsets) == 0:
             continue
 
-        # PERF OPT 1 -- single association_rules() call, then filter by confidence.
+        # PERF OPT 1 — single association_rules() call, then filter by confidence.
         try:
             all_rules_base = association_rules(
                 frequent_itemsets, metric="confidence", min_threshold=float(confidence_grid[0])
@@ -274,8 +239,8 @@ def plot_heatmaps(summary_df, output_dir, lift_display_step=0.1,
     3 heatmaps: support-confidence, support-lift, confidence-lift.
     Each cell = max rules over the third parameter (darker = more rules).
 
-    The neutral-window masking on lift axes uses _neutral_window() --
-    the same helper used during FP-Growth filtering -- so the columns hidden
+    The neutral-window masking on lift axes uses _neutral_window() —
+    the same helper used during FP-Growth filtering — so the columns hidden
     here are exactly the values excluded during computation.
 
     Negative-correlation columns (lift < neutral_lo) are kept and appear on
@@ -302,7 +267,7 @@ def plot_heatmaps(summary_df, output_dir, lift_display_step=0.1,
         (df['Lift_threshold'] / lift_display_step).round() * lift_display_step
     ).round(4)
 
-    # Unified neutral window -- identical to FP-Growth filter boundaries.
+    # Unified neutral window — identical to FP-Growth filter boundaries.
     neutral_lo, neutral_hi = _neutral_window(lift_neutral_half_window)
 
     configs = [
@@ -322,7 +287,7 @@ def plot_heatmaps(summary_df, output_dir, lift_display_step=0.1,
         )
 
         if x_is_lift:
-            # Mask neutral window. Negative-correlation columns survive.
+            # Mask neutral window — negative-correlation columns survive.
             pivot = pivot.loc[:, ~pivot.columns.to_series().between(
                 neutral_lo, neutral_hi, inclusive='both')]
             if (pivot != 0).any(axis=0).any():
@@ -344,7 +309,7 @@ def plot_heatmaps(summary_df, output_dir, lift_display_step=0.1,
         ax.set_xlabel(x_label, fontsize=11, labelpad=8)
         ax.set_ylabel(y_col, fontsize=11, labelpad=8)
         ax.set_title(
-            f"Max Number of Rules -- {y_col} vs {x_label}\n"
+            f"Max Number of Rules — {y_col} vs {x_label}\n"
             f"(darker = more rules; max over the third parameter)",
             fontsize=11, pad=14
         )
@@ -424,7 +389,7 @@ def _process_one_support(min_sup, sup_idx, n_sup, df, output_dir,
 
     local_summary_rows = []
 
-    # PERF OPT 1 -- single association_rules() call at conf_min, then filter.
+    # PERF OPT 1 — single association_rules() call at conf_min, then filter.
     try:
         all_rules_base = association_rules(
             frequent_itemsets, metric="confidence", min_threshold=float(confidence_grid[0])
@@ -448,7 +413,7 @@ def _process_one_support(min_sup, sup_idx, n_sup, df, output_dir,
         conf_label = f"{min_conf:.2f}"
         conf_dir = sup_dir / f"conf_{conf_label}"
 
-        # Cheap pandas filter -- no recomputation of metrics.
+        # Cheap pandas filter — no recomputation of metrics.
         rules = all_rules_base[all_rules_base['confidence'] >= min_conf].reset_index(drop=True)
         if len(rules) == 0:
             continue
@@ -461,13 +426,13 @@ def _process_one_support(min_sup, sup_idx, n_sup, df, output_dir,
         # support_pct   : proportion as percentage (e.g. 37.90)
         # confidence_raw: P(consequent | antecedent) as decimal
         # confidence_pct: P(consequent | antecedent) as percentage
-        # lift          : ratio -- kept as-is (1.0=independence, >1 positive, <1 negative)
+        # lift          : ratio — kept as-is (1.0=independence, >1 positive, <1 negative)
         # leverage      : support(A∪B) - support(A)*support(B), signed difference
         # conviction    : directional strength (inf -> NaN when confidence=1.0)
         # *_raw columns are pre-formatted as strings (like item_supports.csv)
         # so that trailing zeros are never silently dropped by pandas
         # (e.g. round(0.3790, 4) → float 0.379 → written as 0.379).
-        # *_pct columns use floats -- 2 decimal places, no trailing-zero issue.
+        # *_pct columns use floats — 2 decimal places, no trailing-zero issue.
         fmt = pd.DataFrame()
         fmt['antecedents']    = rules['antecedents'].apply(lambda x: ', '.join(sorted(x)))
         fmt['consequents']    = rules['consequents'].apply(lambda x: ', '.join(sorted(x)))
@@ -593,7 +558,7 @@ def explore_association_rules(df, output_dir,
     print(f"  > support    : {len(support_grid)} values [{support_grid[0]} ... {support_grid[-1]}, step={sup_delta}]")
     print(f"  > confidence : {len(confidence_grid)} values [{confidence_grid[0]} ... {confidence_grid[-1]}, step={conf_delta}]")
     print(f"  > lift       : {len(lift_grid_used)} values used (of {len(lift_grid)} total, "
-          f"{len(lift_grid)-len(lift_grid_used)} skipped -- neutral window [{lift_window_lo}, {lift_window_hi}]), step={lift_delta}")
+          f"{len(lift_grid)-len(lift_grid_used)} skipped — neutral window [{lift_window_lo}, {lift_window_hi}]), step={lift_delta}")
     print(f"  > total combinations: {total_combos:,}")
     print("-" * 50)
 
@@ -658,7 +623,7 @@ def explore_association_rules(df, output_dir,
     print(f"  > Removed {removed_conf} conf folder(s) and {removed_sup} sup folder(s)")
 
     # Append cleanup counts and parallelism info to exploration_summary.txt
-    # (file already written above -- we reopen in append mode to add these lines
+    # (file already written above — we reopen in append mode to add these lines
     # which are only available after the parallel workers have finished)
     with open(output_dir / "exploration_summary.txt", 'a') as f:
         f.write(f"\nParallelism:\n")
@@ -700,7 +665,7 @@ def calibrate_parameters(encoded_df, sup_delta=0.02, lift_delta=0.05,
         print(f"    {item}: {sup:.4f}")
 
     if len(item_supports) < 2:
-        print("  > Warning: fewer than 2 items -- cannot form pairwise rules.")
+        print("  > WARNING: fewer than 2 items — cannot form pairwise rules.")
         return None
 
     rarest = item_supports.iloc[0]
@@ -732,8 +697,9 @@ def calibrate_parameters(encoded_df, sup_delta=0.02, lift_delta=0.05,
     lift_max = min(round(np.ceil(raw_lift_max * 2) / 2, 1), 10.0)
 
     if not prev_had_2itemsets:
-        print(f"  > Warning: no 2-itemsets found at any support threshold for this k.")
-        print(f"    Transactions are too sparse to generate association rules.")
+        print(f"    - WARNING: no 2-itemsets found at any support threshold "
+              f"for this k.")
+        print(f"      Transactions are too sparse to generate association rules.")
         print("-" * 50)
         return None
 
@@ -764,7 +730,7 @@ def calibrate_parameters(encoded_df, sup_delta=0.02, lift_delta=0.05,
         'conf_min':          calibrated_conf_min,
         'conf_max':          conf_max,
         'conf_delta':        conf_delta,
-        'lift_min':          0.0,   # always 0.0 -- negative correlations included
+        'lift_min':          0.0,   # always 0.0 — negative correlations included
         'lift_max':          lift_max,
         'lift_delta':        lift_delta,
         # diagnostic values for calibration_log
@@ -790,8 +756,8 @@ def _write_calibration_log(k_dir, k, n_transactions, item_supports,
                             params, auto_calibrate, manual_params=None):
     """
     Write per-k calibration artefacts:
-      item_supports.csv     -- one row per feature (sorted ascending)
-      calibration_log.txt   -- human-readable parameter summary
+      item_supports.csv     — one row per feature (sorted ascending)
+      calibration_log.txt   — human-readable parameter summary
 
     Called for every k, including skipped ones (params=None), so the log
     always documents why a k was included or excluded.
@@ -810,7 +776,7 @@ def _write_calibration_log(k_dir, k, n_transactions, item_supports,
     sup_df.to_csv(k_dir / "item_supports.csv", index=False)
 
     with open(k_dir / "calibration_log.txt", 'w') as f:
-        f.write(f"CALIBRATION LOG -- k={k}\n")
+        f.write(f"CALIBRATION LOG — k={k}\n")
         f.write(f"{'='*60}\n\n")
         f.write(f"Transactions : {n_transactions:,}\n")
         f.write(f"Items        : {len(item_supports)}\n\n")
@@ -848,7 +814,7 @@ def _write_calibration_log(k_dir, k, n_transactions, item_supports,
         f.write(f"  conf_max         : {params['conf_max']}\n")
         f.write(f"  conf_delta       : {params['conf_delta']}\n")
         f.write(f"  lift_min         : {params['lift_min']}  "
-                f"(0.0 -- negative correlations included)\n")
+                f"(0.0 — negative correlations included)\n")
         f.write(f"  lift_max         : {params['lift_max']}  "
                 f"(raw ceiling = {params['raw_lift_max']:.4f}, capped at 10.0)\n")
         f.write(f"  lift_delta       : {params['lift_delta']}\n")
@@ -875,7 +841,7 @@ def run_k_comparison(k_labels_map, output_dir,
     comp_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n{'='*70}")
-    print(f"K-VARIATION EXPERIMENT -- {len(k_labels_map)} values of k")
+    print(f"K-VARIATION EXPERIMENT — {len(k_labels_map)} values of k")
     print(f"{'='*70}")
     print(f"  > k values: {sorted(k_labels_map.keys())}")
     print(f"  > auto_calibrate: {auto_calibrate}")
@@ -927,7 +893,7 @@ def run_k_comparison(k_labels_map, output_dir,
             )
 
             if params is None:
-                print(f"  > Skipping k={k} -- not enough co-occurrences to generate rules.")
+                print(f"  > Skipping k={k} — not enough co-occurrences to generate rules.")
                 comparison_rows.append({
                     'k': k, 'skipped_reason': 'too_sparse',
                     'n_transactions': len(df_encoded),
@@ -1049,7 +1015,7 @@ def run_k_comparison(k_labels_map, output_dir,
         all_summaries.append(tmp)
 
     if not all_summaries:
-        print('  > No rules found in any k -- skipping cross-k heatmaps.')
+        print('  > No rules found in any k — skipping cross-k heatmaps.')
         print(f'  > Cross-k comparison saved to {comp_dir}/')
         return k_summaries
 
@@ -1058,7 +1024,7 @@ def run_k_comparison(k_labels_map, output_dir,
         combined = pd.concat(all_summaries, ignore_index=True)
 
     if combined.empty or 'Lift_threshold' not in combined.columns:
-        print('  > No rules found in any k -- skipping cross-k heatmaps.')
+        print('  > No rules found in any k — skipping cross-k heatmaps.')
         print(f'  > Cross-k comparison saved to {comp_dir}/')
         return k_summaries
 
@@ -1088,7 +1054,7 @@ def run_k_comparison(k_labels_map, output_dir,
         )
 
         if 'lift' in suffix:
-            # Mask neutral window. Negative-correlation columns survive.
+            # Mask neutral window — negative-correlation columns survive.
             pivot = pivot.loc[:, ~pivot.columns.to_series().between(
                 neutral_lo, neutral_hi, inclusive='both')]
             if (pivot != 0).any(axis=0).any():
@@ -1112,7 +1078,7 @@ def run_k_comparison(k_labels_map, output_dir,
         ax.set_xlabel(x_label, fontsize=11, labelpad=8)
         ax.set_ylabel('k', fontsize=11, labelpad=8)
         ax.set_title(
-            f"Max Number of Rules -- k vs {x_label}\n"
+            f"Max Number of Rules — k vs {x_label}\n"
             f"(darker = more rules; max over the other two parameters)",
             fontsize=11, pad=14
         )
@@ -1149,7 +1115,7 @@ def _experiment_label(auto_calibrate,
     """
     Build a human-readable folder name for one experiment configuration.
 
-    conf_min shown here is the floor value, not the per-k calibrated value --
+    conf_min shown here is the floor value, not the per-k calibrated value —
     the label identifies the configuration, not derived per-k parameters.
     """
     def fmt(v):
@@ -1174,7 +1140,7 @@ def _experiment_label(auto_calibrate,
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    print(f"  > M2 parallel backend -- {_CPU_CORES} logical cores / {_PERF_CORES} perf cores (joblib loky)")
+    print(f"  > M2 parallel backend — {_CPU_CORES} logical cores / {_PERF_CORES} perf cores (joblib loky)")
 
     if Path("/content").exists():
         base_dir = Path("/content")
@@ -1194,9 +1160,9 @@ if __name__ == "__main__":
     SUP_DELTA             = 0.02
     CONF_MIN, CONF_MAX    = 0.05, 1.00   # CONF_MIN is conf_min_floor when calibrating
     CONF_DELTA            = 0.05
-    LIFT_MIN, LIFT_MAX    = 0.0,  5.0    # 0.0 -- negative correlations (lift < 0.75) included
+    LIFT_MIN, LIFT_MAX    = 0.0,  5.0    # 0.0 — negative correlations (lift < 0.75) included
     LIFT_DELTA            = 0.05
-    LIFT_NEUTRAL_HALF_WIN = 0.25         # excludes [0.75, 1.25] -- no analytical signal
+    LIFT_NEUTRAL_HALF_WIN = 0.25         # excludes [0.75, 1.25] — no analytical signal
     # ------------------------------------------------------------------ #
 
     exp_label = _experiment_label(
@@ -1213,7 +1179,7 @@ if __name__ == "__main__":
         ar_output_dir.mkdir(parents=True, exist_ok=True)
 
         print("\n" + "="*70)
-        print(f"ASSOCIATION RULES -- {region.upper()}")
+        print(f"ASSOCIATION RULES — {region.upper()}")
         print(f"Experiment: {exp_label}")
         print("="*70 + "\n")
 
@@ -1229,7 +1195,7 @@ if __name__ == "__main__":
         ks_with_agg  = sum(1 for _, (_, src) in k_labels_map.items() if "aggregated" in src)
         ks_with_orig = len(k_labels_map) - ks_with_agg
 
-        # Write experiment_log.txt (pre-run section) -- captures region,
+        # Write experiment_log.txt (pre-run section) — captures region,
         # experiment label, configuration and input file sources.
         # Written before run_k_comparison so it exists even if execution fails.
         # A post-run section is appended after run_k_comparison returns.
@@ -1291,7 +1257,7 @@ if __name__ == "__main__":
         # Append post-run summary to experiment_log.txt.
         # sum_rules: total signal produced (sum of per-k best combos).
         # max_rules: strongest single (sup, conf, lift) combination across all k.
-        # Both are reported -- they answer different questions.
+        # Both are reported — they answer different questions.
         k_max_per_k = {
             k: int(sdf['Number_of_Rules'].max())
             for k, sdf in k_summaries.items()

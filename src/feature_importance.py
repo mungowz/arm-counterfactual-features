@@ -1,4 +1,6 @@
 import ast
+import sys
+import io
 import pandas as pd
 import numpy as np
 import subprocess
@@ -647,6 +649,28 @@ def run_for_k_values(k_values, data_path, output_base_dir,
 
 
 # ---------------------------------------------------------------------------
+# Tee writer: duplicates stdout to both the terminal and a buffer
+# ---------------------------------------------------------------------------
+
+class _TeeWriter:
+    """Write to the original stdout AND capture everything in a StringIO."""
+
+    def __init__(self, original_stdout):
+        self._orig = original_stdout
+        self._buf  = io.StringIO()
+
+    def write(self, text):
+        self._orig.write(text)
+        self._buf.write(text)
+
+    def flush(self):
+        self._orig.flush()
+
+    def getvalue(self):
+        return self._buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -668,29 +692,62 @@ if __name__ == "__main__":
     perc_threshold = 10
     target_col     = 'INCOME_ABOVE_THRESHOLD'
 
-    for region, data_path in regions.items():
-        output_dir = results_dir / region / "important_features"
-        output_dir.mkdir(parents=True, exist_ok=True)
+    # Redirect stdout through a tee so every print goes to both
+    # the terminal AND a StringIO buffer we can dump to files later.
+    tee = _TeeWriter(sys.stdout)
+    sys.stdout = tee
+
+    try:
+        for region, data_path in regions.items():
+            output_dir = results_dir / region / "important_features"
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            print("\n" + "=" * 70)
+            print(f"COUNTERFACTUAL EXTRACTION — {region.upper()}")
+            print("=" * 70 + "\n")
+
+            if not data_path.exists():
+                print(f"  > Error: {data_path.name} not found — "
+                      f"run create_dataset.py first.")
+                continue
+
+            k_labels_map = run_for_k_values(
+                k_values, data_path, output_dir,
+                target_col=target_col,
+                perc_threshold=perc_threshold
+            )
+
+            print("  > k_labels_map ready:")
+            for k, path in k_labels_map.items():
+                print(f"    k={k:>2} -> {path}")
 
         print("\n" + "=" * 70)
-        print(f"COUNTERFACTUAL EXTRACTION — {region.upper()}")
+        print("Done.")
         print("=" * 70 + "\n")
 
-        if not data_path.exists():
-            print(f"  > Error: {data_path.name} not found — "
-                  f"run create_dataset.py first.")
-            continue
+    finally:
+        sys.stdout = tee._orig
 
-        k_labels_map = run_for_k_values(
-            k_values, data_path, output_dir,
-            target_col=target_col,
-            perc_threshold=perc_threshold
-        )
+    # Save the full log to a global file and per-region files
+    full_log = tee.getvalue()
 
-        print("  > k_labels_map ready:")
-        for k, path in k_labels_map.items():
-            print(f"    k={k:>2} -> {path}")
+    results_dir.mkdir(parents=True, exist_ok=True)
+    global_log_path = results_dir / "feature_importance_log.txt"
+    global_log_path.write_text(full_log, encoding="utf-8")
+    print(f"  > Full log saved to {global_log_path}")
 
-    print("\n" + "=" * 70)
-    print("Done.")
-    print("=" * 70 + "\n")
+    for region in regions:
+        region_dir = results_dir / region / "important_features"
+        if region_dir.exists():
+            region_log_path = region_dir / "feature_importance_log.txt"
+            # Extract the region-specific section from the full log
+            marker = f"COUNTERFACTUAL EXTRACTION — {region.upper()}"
+            start = full_log.find(marker)
+            if start != -1:
+                # Find the next region marker or end of log
+                next_start = full_log.find("COUNTERFACTUAL EXTRACTION",
+                                           start + len(marker))
+                region_log = full_log[start:next_start] if next_start != -1 \
+                    else full_log[start:]
+                region_log_path.write_text(region_log, encoding="utf-8")
+                print(f"  > Region log saved to {region_log_path}")

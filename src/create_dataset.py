@@ -1,18 +1,3 @@
-"""
-build_acs_datasets.py
-
-Downloads 2024 ACS 1-Year PUMS person records for two US regions and
-produces classification-ready CSVs with human-readable categorical labels.
-The South dataset is undersampled to match the Northeast size.
-
-    Northeast (9 states)  — income threshold $110,000
-    South     (16 states) — income threshold $90,000
-
-Usage:
-    pip install folktables pandas numpy
-    python build_acs_datasets.py
-"""
-
 import os
 import time
 import numpy as np
@@ -36,21 +21,21 @@ RANDOM_SEED = 42
 OUTPUT_DIR = 'data'
 
 
-# --------------------------------------------------------------------------- #
-# prediction tasks
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
+# Prediction tasks
+# ---------------------------------------------------------------------------
 
 _INCOME_FEATURES = [
-    'AGEP', # age
-    'COW', # class of worker
-    'SCHL', # educational attainment
-    'MAR', # marital status
-    'OCCP', # occupation
-    'POBP', # place of birth
+    'AGEP',     # age
+    'COW',      # class of worker
+    'SCHL',     # educational attainment
+    'MAR',      # marital status
+    'OCCP',     # occupation
+    'POBP',     # place of birth
     'RELSHIPP', # relationship to reference person
-    'WKHP', # usual hours worked per week
-    'SEX', # sex
-    'RAC1P', # race
+    'WKHP',     # usual hours worked per week
+    'SEX',      # sex
+    'RAC1P',    # race
 ]
 
 ACSIncomeNortheast = folktables.BasicProblem(
@@ -72,8 +57,8 @@ ACSIncomeSouth = folktables.BasicProblem(
 )
 
 
-# --------------------------------------------------------------------------- #
-# continuous → categorical binning — standard ACS / BLS groupings
+# ---------------------------------------------------------------------------
+# Continuous → categorical binning — standard ACS / BLS groupings
 #
 # AGEP (Age): Census Bureau standard age groups for working-age population.
 #   - adult_filter keeps ages ≥16 who reported ≥1 work-hour & income > $100
@@ -83,7 +68,7 @@ ACSIncomeSouth = folktables.BasicProblem(
 #   Statistics part-time / full-time boundary at 35 hours, with finer
 #   granularity for overtime analysis.
 #   - ACS PUMS Data Dictionary 2024, variable WKHP (integer 1–99)
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
 
 AGEP_BINS   = [0, 24, 34, 44, 54, 64, 200]
 AGEP_LABELS = [
@@ -106,11 +91,11 @@ WKHP_LABELS = [
 ]
 
 
-# --------------------------------------------------------------------------- #
-# categorical mappings — source: 2024 ACS PUMS Data Dictionary (census.gov)
-# codes come from folktables as float64 and are cast to int before lookup,
-# so keys are plain int-strings with no leading zeros
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
+# Categorical mappings — source: 2024 ACS PUMS Data Dictionary (census.gov)
+# Codes come from folktables as float64 and are cast to int before lookup,
+# so keys are plain int-strings with no leading zeros.
+# ---------------------------------------------------------------------------
 
 COW_MAP = {
     '1': 'Employee-Private-For-Profit',
@@ -394,9 +379,9 @@ COLUMN_MAPS = {
 }
 
 
-# --------------------------------------------------------------------------- #
-# lookup arrays
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
+# Lookup arrays
+# ---------------------------------------------------------------------------
 
 def _build_lookup(mapping: dict, fallback: str) -> np.ndarray:
     max_code = max(int(k) for k in mapping) if mapping else 0
@@ -413,9 +398,9 @@ _LOOKUPS: dict[str, np.ndarray] = {
 }
 
 
-# --------------------------------------------------------------------------- #
-# helpers
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _decode_column(series: pd.Series, lookup: np.ndarray) -> np.ndarray:
     codes = pd.to_numeric(series, errors='coerce').fillna(-1).to_numpy(dtype=np.int32)
@@ -440,7 +425,7 @@ def parallel_get_data(
     label: str,
 ) -> pd.DataFrame:
     n_workers = min(len(states), DOWNLOAD_WORKERS)
-    print(f"  [{label}] {len(states)} states — {n_workers} workers")
+    print(f"  > [{label}] {len(states)} states — {n_workers} workers")
 
     results: dict[str, pd.DataFrame] = {}
     with ThreadPoolExecutor(max_workers=n_workers) as pool:
@@ -449,7 +434,7 @@ def parallel_get_data(
             state = futures[fut]
             try:
                 results[state] = fut.result()
-                print(f"    {state} done")
+                print(f"    - {state} done")
             except Exception as exc:
                 raise RuntimeError(
                     f"Download failed for {state}: {exc}\n"
@@ -467,11 +452,12 @@ def build_dataset(
     label: str,
 ) -> pd.DataFrame:
     t0 = time.perf_counter()
-    print(f"\n{label}")
-    print("-" * len(label))
+    print(f"\n{'='*70}")
+    print(f"{label}")
+    print(f"{'='*70}")
 
     raw = parallel_get_data(data_source, states, label)
-    print(f"  raw: {len(raw):,} rows ({time.perf_counter() - t0:.1f}s)")
+    print(f"  > raw: {len(raw):,} rows ({time.perf_counter() - t0:.1f}s)")
 
     features_df, labels, _ = task.df_to_pandas(raw)
     features_df['INCOME_ABOVE_THRESHOLD'] = labels.to_numpy(dtype=np.int8)
@@ -495,15 +481,15 @@ def build_dataset(
         )
 
     pos = features_df['INCOME_ABOVE_THRESHOLD'].mean() * 100
-    print(f"  filter: {len(features_df):,} rows  |  pos {pos:.1f}%"
+    print(f"  > filter: {len(features_df):,} rows  |  pos {pos:.1f}%"
           f"  ({time.perf_counter() - t0:.1f}s)")
 
     return features_df
 
 
-# --------------------------------------------------------------------------- #
-# sampling
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
+# Sampling
+# ---------------------------------------------------------------------------
 
 def undersample_to(df: pd.DataFrame, n: int, seed: int) -> pd.DataFrame:
     """Stratified random undersample to n rows, preserving the class ratio."""
@@ -524,9 +510,9 @@ def undersample_to(df: pd.DataFrame, n: int, seed: int) -> pd.DataFrame:
     return sampled.sample(frac=1, random_state=seed).reset_index(drop=True)
 
 
-# --------------------------------------------------------------------------- #
-# main
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     t0 = time.perf_counter()
@@ -538,7 +524,9 @@ def main() -> None:
     out_ne = os.path.join(OUTPUT_DIR, f'acs_income_northeast_{SURVEY_YEAR}.csv')
     out_s = os.path.join(OUTPUT_DIR, f'acs_income_south_{SURVEY_YEAR}.csv')
 
-    print(f"ACS Income {SURVEY_YEAR}\n")
+    print(f"\n{'='*70}")
+    print(f"ACS INCOME DATASET BUILDER — {SURVEY_YEAR}")
+    print(f"{'='*70}")
 
     with ThreadPoolExecutor(max_workers=REGION_WORKERS) as pool:
         fut_ne = pool.submit(
@@ -556,8 +544,8 @@ def main() -> None:
 
     pos_ne = df_ne['INCOME_ABOVE_THRESHOLD'].mean() * 100
     pos_s  = df_s['INCOME_ABOVE_THRESHOLD'].mean()  * 100
-    print(f"\n  Northeast: {len(df_ne):>7,} rows  |  pos {pos_ne:.1f}%")
-    print(f"  South: {len(df_s):>7,} rows  |  pos {pos_s:.1f}%")
+    print(f"\n  > Northeast: {len(df_ne):>7,} rows  |  pos {pos_ne:.1f}%")
+    print(f"  > South:     {len(df_s):>7,} rows  |  pos {pos_s:.1f}%")
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         w1 = pool.submit(df_ne.to_csv, out_ne, index=False)
@@ -565,10 +553,12 @@ def main() -> None:
         w1.result()
         w2.result()
 
-    print(f"\ndone in {time.perf_counter() - t0:.1f}s")
-    print(f"  {out_ne}")
-    print(f"  {out_s}")
-    print(f"\ndtypes:\n{df_ne.dtypes.to_string()}")
+    print(f"\n{'='*70}")
+    print(f"Done in {time.perf_counter() - t0:.1f}s")
+    print(f"{'='*70}")
+    print(f"  > {out_ne}")
+    print(f"  > {out_s}")
+    print(f"\n  > dtypes:\n{df_ne.dtypes.to_string()}")
 
 
 if __name__ == '__main__':
