@@ -52,6 +52,7 @@ _INCOME_FEATURES = [
     'WKHP',     # usual hours worked per week past 12 months
     'SEX',      # sex
     'RAC1P',    # race
+    'ST',       # state of current residence
 ]
 
 # ---------------------------------------------------------------------------
@@ -214,6 +215,7 @@ _COLUMN_MAPS = {
     'COW': COW_MAP, 'SCHL': SCHL_MAP, 'MAR': MAR_MAP,
     'RELSHIPP': RELSHIPP_MAP, 'SEX': SEX_MAP, 'RAC1P': RAC1P_MAP,
     'POBP': POBP_MAP, 'OCCP': OCCP_MAP,
+    'ST': POBP_MAP,   # <-- La colonna Stato è mappata con gli stessi codici FIPS
 }
 
 # ---------------------------------------------------------------------------
