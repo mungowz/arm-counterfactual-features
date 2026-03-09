@@ -453,30 +453,38 @@ def _process_one_support(min_sup, sup_idx, n_sup, df, output_dir,
         if len(rules) == 0:
             continue
 
-        # compact output
-        fmt = pd.DataFrame()
-        fmt['antecedents'] = rules['antecedents'].apply(lambda x: ', '.join(sorted(x)))
-        fmt['consequents'] = rules['consequents'].apply(lambda x: ', '.join(sorted(x)))
-        fmt['support']     = rules['support'].round(4)
-        fmt['confidence']  = rules['confidence'].round(4)
-        fmt['lift']        = rules['lift'].round(4)
-
-        # detailed output (conviction=inf -> NaN)
+        # conviction=inf (confidence=1.0) -> NaN, computed once, shared by both outputs
         conviction_vals = rules['conviction'].replace([np.inf, -np.inf], np.nan)
 
+        # compact output
+        # support_pct   : proportion of transactions where both sides change (0-100 %)
+        # confidence_pct: P(consequent | antecedent) expressed as 0-100 %
+        # lift          : ratio -- kept as-is (1.0=independence, >1 positive, <1 negative)
+        # leverage      : support(A|B) - support(A)*support(B), signed difference
+        # conviction    : directional strength (inf -> NaN when confidence=1.0)
+        fmt = pd.DataFrame()
+        fmt['antecedents']    = rules['antecedents'].apply(lambda x: ', '.join(sorted(x)))
+        fmt['consequents']    = rules['consequents'].apply(lambda x: ', '.join(sorted(x)))
+        fmt['support_pct']    = (rules['support']    * 100).round(2)
+        fmt['confidence_pct'] = (rules['confidence'] * 100).round(2)
+        fmt['lift']           = rules['lift'].round(4)
+        fmt['leverage']       = rules['leverage'].round(6)
+        fmt['conviction']     = conviction_vals.round(4)
+
+        # detailed output
         det = pd.DataFrame()
-        det['antecedents']        = rules['antecedents'].apply(lambda x: ', '.join(sorted(x)))
-        det['consequents']        = rules['consequents'].apply(lambda x: ', '.join(sorted(x)))
-        det['antecedent_length']  = rules['antecedents'].apply(len)
-        det['consequent_length']  = rules['consequents'].apply(len)
-        det['rule_length']        = det['antecedent_length'] + det['consequent_length']
-        det['antecedent support'] = rules['antecedent support'].values
-        det['consequent support'] = rules['consequent support'].values
-        det['support']            = rules['support'].values
-        det['confidence']         = rules['confidence'].values
-        det['lift']               = rules['lift'].values
-        det['leverage']           = rules['leverage'].values
-        det['conviction']         = conviction_vals.values
+        det['antecedents']            = rules['antecedents'].apply(lambda x: ', '.join(sorted(x)))
+        det['consequents']            = rules['consequents'].apply(lambda x: ', '.join(sorted(x)))
+        det['antecedent_length']      = rules['antecedents'].apply(len)
+        det['consequent_length']      = rules['consequents'].apply(len)
+        det['rule_length']            = det['antecedent_length'] + det['consequent_length']
+        det['antecedent_support_pct'] = (rules['antecedent support'] * 100).round(2)
+        det['consequent_support_pct'] = (rules['consequent support'] * 100).round(2)
+        det['support_pct']            = (rules['support']    * 100).round(2)
+        det['confidence_pct']         = (rules['confidence'] * 100).round(2)
+        det['lift']                   = rules['lift'].round(4)
+        det['leverage']               = rules['leverage'].round(6)
+        det['conviction']             = conviction_vals.round(4)
 
         conf_dir.mkdir(parents=True, exist_ok=True)
         fmt.to_csv(conf_dir / "rules.csv", index=False)
@@ -493,10 +501,11 @@ def _process_one_support(min_sup, sup_idx, n_sup, df, output_dir,
             f.write(f"  Frequent Itemsets: {len(frequent_itemsets)}\n")
             f.write(f"  Association Rules: {len(rules)}\n\n")
             f.write(f"Statistics:\n")
-            f.write(f"  Avg Support:     {rules['support'].mean():.4f}\n")
-            f.write(f"  Avg Confidence:  {rules['confidence'].mean():.4f}\n")
+            f.write(f"  Avg Support:     {rules['support'].mean()*100:.2f}%\n")
+            f.write(f"  Avg Confidence:  {rules['confidence'].mean()*100:.2f}%\n")
             f.write(f"  Avg Lift:        {rules['lift'].mean():.4f}\n")
             f.write(f"  Lift Range:      {rules['lift'].min():.4f} - {rules['lift'].max():.4f}\n")
+            f.write(f"  Avg Leverage:    {rules['leverage'].mean():.6f}\n")
             f.write(f"  Avg Rule Length: {det['rule_length'].mean():.2f}\n\n")
             n_inf = conviction_vals.isna().sum()
             if n_inf > 0:
@@ -505,7 +514,7 @@ def _process_one_support(min_sup, sup_idx, n_sup, df, output_dir,
             f.write(f"Top 10 Rules (by Lift):\n{'-'*60}\n")
             for idx, row in fmt.head(10).iterrows():
                 f.write(f"{idx+1}. {row['antecedents']} => {row['consequents']}\n")
-                f.write(f"   support={row['support']:.4f} | confidence={row['confidence']:.4f} | lift={row['lift']:.4f}\n\n")
+                f.write(f"   support={row['support_pct']:.2f}% | confidence={row['confidence_pct']:.2f}% | lift={row['lift']:.4f} | leverage={row['leverage']:.6f}\n\n")
 
         print(f"    > [conf={min_conf}] {len(rules)} rules saved to {conf_dir.relative_to(output_dir)}/")
 
