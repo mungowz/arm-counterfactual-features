@@ -2,13 +2,42 @@
 macroscopic_experiment_association_rules.py
 ===========================================
 Runs FP-Growth association-rule mining on the feature-driver transactions
-produced by feature_importance.py, searching a grid of support, confidence
+produced by feature_importance.py, searching a grid of support, confidence,
 and lift thresholds for each value of k.
 
-The neutral lift window [1 - half_window, 1 + half_window] is excluded
-everywhere (FP-Growth filtering and heatmap masking) via a single helper
-(_neutral_window) to guarantee consistency between the two stages.
-Negative correlations (lift < neutral_lo) are preserved and analysed.
+Pipeline position
+-----------------
+    create_dataset.py  →  feature_importance.py  →  [macroscopic_experiment_association_rules.py]
+
+Input  : results/{region}/important_features/k_{k}/aggregated_labels_by_sample.csv
+         (or labels_only_unique.csv as fallback)
+Outputs: results/{region}/association_rules/{experiment_label}/k_{k}/
+           rules.csv, rules_detailed.csv, summary.csv
+           heatmaps/heatmap_support_confidence.png  (and two others)
+         results/{region}/association_rules/{experiment_label}/k_comparison/
+           k_comparison_summary.csv, heatmap_k_support.png  (and two others)
+
+Neutral lift window
+-------------------
+The window [1 - half_window, 1 + half_window] (default [0.75, 1.25]) is
+excluded from both the FP-Growth filtering and the heatmap masking via a
+single helper (_neutral_window).  Rules in this band are close to statistical
+independence and carry little actionable signal.  Rules with lift < lo
+(negative correlations — features that tend NOT to co-occur on the boundary)
+are intentionally preserved; set lift_min=0.0 to include them in the grid.
+
+Auto-calibration
+----------------
+calibrate_parameters() scans item frequencies and FP-Growth output to set
+sup_min, sup_max, lift_max, and conf_min automatically.  lift_min is always
+forced to 0.0 regardless of calibration mode so negative correlations are
+never accidentally excluded.
+
+Parallelism
+-----------
+explore_association_rules() parallelises over support thresholds using joblib's
+loky backend (process-based, bypasses GIL).  On Apple Silicon the worker count
+is capped at the P-core count to avoid the E-core straggler problem.
 
 Public API
 ----------
@@ -45,12 +74,16 @@ matplotlib.use('Agg')
 # Hardware-aware parallelism
 # ---------------------------------------------------------------------------
 
+# Total logical CPU count (including hyperthreading / SMT siblings).
 _CPU_CORES = os.cpu_count() or 1
 
-# On Apple Silicon, cap n_jobs at the P-core count to avoid the E-core
-# straggler bottleneck.  Adjust _PERF_CORES manually if needed
-# (M2 base=4, Pro=6/8, Max=8–12, Ultra=16).
-# On Linux/Windows all cores are equivalent.
+# On Apple Silicon (Darwin), efficiency cores (E-cores) are significantly
+# slower than performance cores (P-cores).  When joblib distributes work
+# evenly across all cores, the slowest E-core worker becomes the bottleneck
+# (straggler effect), slowing the entire parallel section.
+# Capping at P-core count avoids this.  Adjust manually for your chip:
+#   M2 base: 4P cores  |  M2 Pro: 6/8P  |  M2 Max: 8–12P  |  M2 Ultra: 16P
+# On Linux / Windows all cores are roughly equivalent — use all of them.
 _PERF_CORES = 4 if platform.system() == 'Darwin' else _CPU_CORES
 
 
@@ -112,8 +145,14 @@ def extract_labels(labels_only_path: Path) -> pd.DataFrame:
         )
 
     print(f'    (file: {Path(labels_only_path).name}, {len(df):,} rows)')
+
+    # Each cell in the 'Labels' column is a stringified Python list
+    # (e.g. "['SCHL', 'OCCP']").  ast.literal_eval safely parses it back.
     itemsets = df['Labels'].apply(ast.literal_eval)
 
+    # TransactionEncoder converts a list-of-lists into a Boolean matrix
+    # suitable for mlxtend's fpgrowth().  Each column is one item (feature name);
+    # each row is one transaction (True = item present in that transaction).
     te     = TransactionEncoder()
     te_ary = te.fit(itemsets).transform(itemsets)
     enc_df = pd.DataFrame(te_ary, columns=te.columns_)
@@ -184,10 +223,14 @@ def grid_search_fpgrowth_delta(
     print('GRID SEARCH: FP-GROWTH (IN-MEMORY)')
     print(f'{"=" * 70}')
 
+    # Build the three parameter grids.
+    # Adding half a step before rounding avoids floating-point undercount
+    # (e.g. np.arange(0.02, 0.50, 0.02) can miss 0.50 due to FP rounding).
     support_grid    = np.round(np.arange(sup_min,  sup_max  + sup_delta  / 2, sup_delta),  4)
     confidence_grid = np.round(np.arange(conf_min, conf_max + conf_delta / 2, conf_delta), 4)
     lift_grid       = np.round(np.arange(lift_min, lift_max + lift_delta / 2, lift_delta), 4)
 
+    # Compute the neutral window once; reused for every lift threshold comparison.
     lift_neutral_lo, lift_neutral_hi = _neutral_window(lift_neutral_half_window)
 
     print(f'  > support grid    : {support_grid}')
@@ -199,12 +242,15 @@ def grid_search_fpgrowth_delta(
     results = []
 
     for min_sup in support_grid:
+        # FP-Growth: mine all frequent itemsets at this support threshold.
         frequent_itemsets = fpgrowth(df, min_support=min_sup, use_colnames=True)
         if len(frequent_itemsets) == 0:
             continue
 
-        # Single association_rules() call at the lowest confidence threshold,
-        # then filter in-memory — avoids redundant FP-Growth runs per conf.
+        # Generate rules at the *lowest* confidence threshold in one call,
+        # then filter in-memory for higher thresholds.  This avoids calling
+        # FP-Growth and association_rules() separately for each confidence level
+        # (which would be O(|conf_grid|) times more expensive).
         try:
             all_rules = association_rules(
                 frequent_itemsets,
@@ -212,12 +258,15 @@ def grid_search_fpgrowth_delta(
                 min_threshold=float(confidence_grid[0]),
             )
         except ValueError:
+            # mlxtend raises ValueError if no rules can be generated
+            # (e.g. single-item transactions only).
             continue
 
         if len(all_rules) == 0:
             continue
 
-        # Exclude neutral window; preserve negative correlations (lift < lo).
+        # Remove rules in the neutral window; keep negative correlations (lift < lo).
+        # This is the in-memory equivalent of the _process_one_support filter.
         all_rules = all_rules[
             (all_rules['lift'] < lift_neutral_lo) |
             (all_rules['lift'] > lift_neutral_hi)
@@ -226,11 +275,13 @@ def grid_search_fpgrowth_delta(
             continue
 
         for min_conf in confidence_grid:
+            # In-memory confidence filter — no additional FP-Growth run needed.
             rules = all_rules[all_rules['confidence'] >= min_conf]
             if len(rules) == 0:
                 continue
 
             for min_lift in lift_grid:
+                # Skip lift values inside the neutral window.
                 if lift_neutral_lo <= min_lift <= lift_neutral_hi:
                     continue
                 filtered = rules[rules['lift'] >= min_lift]
@@ -418,6 +469,9 @@ def _process_one_support(
     print(f'\n  [{sup_idx}/{n_sup}] support = {min_sup}')
     print('    > running FP-Growth...')
 
+    # Run FP-Growth to mine all frequent itemsets at this support level.
+    # Each itemset is a frozenset of feature names that co-occur in at least
+    # min_sup fraction of transactions.
     frequent_itemsets = fpgrowth(df, min_support=min_sup, use_colnames=True)
     print(f'    > {len(frequent_itemsets)} frequent itemsets found')
 
@@ -485,7 +539,11 @@ def _process_one_support(
         if len(rules) == 0:
             continue
 
-        # conviction=inf (confidence=1.0) → NaN; computed once and shared.
+            # conviction = P(¬consequent) / P(¬consequent | antecedent).
+        # When confidence = 1.0, P(¬consequent | antecedent) = 0, giving
+        # conviction = inf.  We replace inf with NaN before writing to CSV
+        # to avoid breaking CSV parsers that don't handle inf strings.
+        # Computed once and reused for both fmt and det DataFrames.
         conviction_vals = rules['conviction'].replace([np.inf, -np.inf], np.nan)
 
         # Compact output.
@@ -634,6 +692,10 @@ def explore_association_rules(
     print(f'  > total combinations: {total_combos:,}')
     print('-' * 50)
 
+    # Each support threshold is independent: no shared mutable state.
+    # loky backend: true multiprocessing (bypasses GIL); each worker gets
+    # its own copy of df and the parameter arrays.
+    # Cap n_jobs at the number of support values to avoid spawning idle workers.
     n_jobs = min(_PERF_CORES, len(support_grid))
     print(f'  > Launching parallel FP-Growth over {len(support_grid)} support '
           f'values (n_jobs={n_jobs} of {_CPU_CORES} logical / '
@@ -753,12 +815,18 @@ def calibrate_parameters(
         print('  > WARNING: fewer than 2 items — cannot form pairwise rules.')
         return None
 
-    rarest = item_supports.iloc[0]
-    second = item_supports.iloc[1]
-    freq_2 = item_supports.iloc[-2]
+    # The theoretical minimum support for a 2-itemset containing items A and B
+    # is support(A) × support(B) (if they were independent).  Using the two
+    # rarest items gives a lower bound on sup_min that is guaranteed to find
+    # at least some 2-itemsets without being so low that the grid is dominated
+    # by trivial single-item rules.
+    rarest = item_supports.iloc[0]    # rarest item
+    second = item_supports.iloc[1]    # second rarest
+    freq_2 = item_supports.iloc[-2]   # second most frequent (used for sup_max scan)
 
     raw_sup_min = rarest * second
-    sup_min     = max(
+    # Floor to the nearest sup_delta step; ensure at least sup_delta (never 0.0).
+    sup_min = max(
         round(np.floor(raw_sup_min / sup_delta) * sup_delta, 4), sup_delta
     )
 
@@ -782,6 +850,9 @@ def calibrate_parameters(
         elif prev_had_2itemsets:
             break
 
+    # The theoretical maximum lift for a rule involving the rarest item is
+    # approximately 1 / support(rarest).  We round up to the nearest 0.5
+    # and cap at 10.0 to avoid unbounded grids when very rare items exist.
     raw_lift_max = 1.0 / rarest
     lift_max     = min(round(np.ceil(raw_lift_max * 2) / 2, 1), 10.0)
 
@@ -869,6 +940,9 @@ def _write_calibration_log(
     k_dir = Path(k_dir)
     k_dir.mkdir(parents=True, exist_ok=True)
 
+    # Write item support frequencies to CSV for offline inspection.
+    # These values are the per-feature "prevalence" in the transaction set —
+    # how often each feature name appears as a driver across all samples.
     sup_df = pd.DataFrame({
         'item':        list(item_supports.index),
         'support_raw': [f'{v:.4f}' for v in item_supports.values],
@@ -996,6 +1070,8 @@ def run_k_comparison(
             })
             continue
 
+        # Load and one-hot-encode the transaction CSV.
+        # item_supports: fraction of transactions containing each feature name.
         df_encoded    = extract_labels(labels_csv)
         item_supports = df_encoded.mean().sort_values()
 
@@ -1334,7 +1410,7 @@ def main(
         elif Path('/content').exists():
             base_dir = Path('/content')
         else:
-            base_dir = Path(__file__).resolve().parent
+            base_dir = Path(__file__).resolve().parent.parent
     base_dir = Path(base_dir)
 
     if regions is None:
@@ -1362,7 +1438,12 @@ def main(
         print(f'Experiment: {exp_label}')
         print('=' * 70 + '\n')
 
-        # Prefer aggregated format; fall back to per-(sample, CF) format.
+        # Select the best available input file for each k value.
+        # aggregated_labels_by_sample.csv (preferred): one row per sample;
+        #   each transaction is the union of drivers across all CF neighbours
+        #   for that sample.  This produces cleaner, less noisy transactions.
+        # labels_only_unique.csv (fallback): one row per (sample, CF) pair;
+        #   noisier but available when aggregation failed.
         k_labels_map = {}
         for k in k_values:
             p_agg  = important_features_dir / f'k_{k}' / 'aggregated_labels_by_sample.csv'
