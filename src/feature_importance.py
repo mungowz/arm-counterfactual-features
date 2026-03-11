@@ -98,6 +98,7 @@ CategoricalBoCSoR
 import ast
 import copy
 import io
+import json
 import os
 import platform
 import sys
@@ -767,16 +768,14 @@ class CategoricalBoCSoR:
         # use those as group boundaries.
         _, first_occurrence = np.unique(keys_sorted, return_index=True)
         group_starts = first_occurrence
-        group_ends   = np.append(first_occurrence[1:], len(keys_sorted))
 
         n_groups      = len(group_starts)
         out_b_idx     = b_sorted[group_starts]
         out_cf_gidx   = cf_sorted[group_starts]
-        out_strs      = np.empty(n_groups, dtype=object)
-        for g, (gs, ge) in enumerate(zip(group_starts, group_ends)):
-            # Items within each group are already in key-sort order;
-            # sort only the string slice (≤ 11 items — essentially free).
-            out_strs[g] = sorted(strs_sorted[gs:ge])
+        # np.split avoids the enumerate/zip Python overhead; each group slice
+        # is ≤ 11 items so sorted() on the .tolist() is essentially free.
+        groups   = np.split(strs_sorted, group_starts[1:])
+        out_strs = np.array([sorted(g.tolist()) for g in groups], dtype=object)
 
         return (
             boundary_idx[out_b_idx],
@@ -874,7 +873,12 @@ class CategoricalBoCSoR:
         result_df = pd.DataFrame({
             'Sample_ID':             original_indices[all_b_idx],
             'CF_Neighbor_ID':        all_cf_gidx.astype(int),
-            'Counterfactual_Values': all_strs,
+            # Serialise as JSON strings so downstream readers can use
+            # json.loads (C-accelerated, GIL-releasing) instead of the
+            # slow pure-Python ast.literal_eval.
+            'Counterfactual_Values': np.array(
+                [json.dumps(lst) for lst in all_strs], dtype=object
+            ),
         })
 
         print(
@@ -953,11 +957,19 @@ def extract_labels_and_values(results_dir: Path, parse_workers: int = None) -> N
 
     # ── Vectorized parsing — eliminates iterrows() ────────────────────
     def _parse_items(cell: str) -> tuple[list, list]:
-        """Parse one Counterfactual_Values cell → (labels, values) lists."""
+        """Parse one Counterfactual_Values cell → (labels, values) lists.
+
+        Tries json.loads first (C-accelerated, GIL-releasing, 5–10× faster
+        than ast.literal_eval) and falls back to ast.literal_eval for any
+        legacy files written before the JSON serialisation change.
+        """
         try:
-            items = ast.literal_eval(str(cell))
-        except (ValueError, SyntaxError):
-            return [], []
+            items = json.loads(cell)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            try:
+                items = ast.literal_eval(str(cell))
+            except (ValueError, SyntaxError):
+                return [], []
         labels, values = [], []
         for item in items:
             s = str(item)
@@ -1081,10 +1093,16 @@ def aggregate_drivers_by_sample(results_dir: Path, parse_workers: int = None) ->
     # Guard against malformed cells: a single bad cell would otherwise crash
     # the entire aggregation step with an unhandled ValueError/SyntaxError.
     def _safe_literal_eval(cell):
+        # json.loads is C-accelerated and GIL-releasing — much faster than
+        # ast.literal_eval for cells written by the new JSON serialiser.
+        # ast fallback handles any legacy files with Python-repr strings.
         try:
-            return ast.literal_eval(str(cell))
-        except (ValueError, SyntaxError):
-            return []
+            return json.loads(cell)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            try:
+                return ast.literal_eval(str(cell))
+            except (ValueError, SyntaxError):
+                return []
 
     # ── Parallel parse of stringified lists ──────────────────────────
     # df['Labels'].apply(_safe_literal_eval) is a serial Python loop —
@@ -1105,24 +1123,38 @@ def aggregate_drivers_by_sample(results_dir: Path, parse_workers: int = None) ->
             parsed.extend(chunk_result)
     df['Labels'] = parsed
 
-    # ── Single-pass aggregation — 1 groupby instead of 3 ─────────────
-    def _agg_one_sample(series: pd.Series) -> tuple:
-        unique_set: set = set()
-        dupl_list: list = []
-        for lst in series:
-            unique_set.update(lst)
-            dupl_list.extend(lst)
-        return sorted(unique_set), sorted(dupl_list), len(series)
+    # ── Single-pass aggregation via explode + native pandas ops ──────
+    # groupby().apply(_agg_one_sample) calls a Python function once per
+    # unique Sample_ID — expensive at 100 K+ samples.  explode() flattens
+    # the list column into individual rows so pandas can aggregate on a
+    # plain string Series using its C-level internals, which is
+    # significantly faster.
+    #
+    # n_cf (Num_CF_Neighbors) = number of original (sample, CF) rows,
+    # which must be computed *before* exploding to avoid counting labels.
+    n_cf_map = df.groupby('Sample_ID', sort=False).size()   # Series: sid → count
 
-    combined = (
-        df.groupby('Sample_ID', sort=False)['Labels']
-        .apply(_agg_one_sample)
+    df_exp = (
+        df[['Sample_ID', 'Labels']]
+        .explode('Labels')
+        .dropna(subset=['Labels'])
+    )
+    # Exclude empty strings that may appear after exploding empty lists.
+    df_exp = df_exp[df_exp['Labels'] != '']
+
+    unique_series = (
+        df_exp.groupby('Sample_ID', sort=False)['Labels']
+        .agg(lambda s: sorted(set(s)))
+    )
+    dupl_series = (
+        df_exp.groupby('Sample_ID', sort=False)['Labels']
+        .agg(lambda s: sorted(s.tolist()))
     )
 
-    sample_ids    = combined.index.values
-    unique_labels = [v[0] for v in combined.values]
-    dupl_labels   = [v[1] for v in combined.values]
-    n_cf_vals     = [v[2] for v in combined.values]
+    sample_ids    = unique_series.index.values
+    unique_labels = unique_series.tolist()
+    dupl_labels   = dupl_series.tolist()
+    n_cf_vals     = n_cf_map.loc[sample_ids].tolist()
 
     unique_df = pd.DataFrame({
         'Sample_ID':        sample_ids,
