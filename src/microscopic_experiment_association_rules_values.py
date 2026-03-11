@@ -1,5 +1,5 @@
 """
-macroscopic_experiment_association_rules_values.py
+microscopic_experiment_association_rules_values.py
 ==================================================
 Runs FP-Growth association-rule mining at the **value level**, starting from
 the label-level rules already produced by
