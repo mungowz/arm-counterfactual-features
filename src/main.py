@@ -225,14 +225,17 @@ def _outputs_step3_exist(regions: list[str], k_values: list[int]) -> bool:
     with the other output-check helpers and to make adding a future
     --skip-arm flag straightforward without restructuring run_step3().
 
-    The sentinel file checked is association_rules.csv inside each k_{k}/
-    subdirectory under results/<region>/association_rules/.
+    The sentinel file checked is summary.csv inside k_{k}/ under any
+    experiment-label subdirectory of results/<region>/association_rules/.
+    The experiment label is not known at this point (it encodes the grid
+    parameters), so we use rglob to find any matching file.
     """
     results_dir = _HERE.parent / 'results'
     for region in regions:
         for k in k_values:
-            p = results_dir / region / 'association_rules' / f'k_{k}' / 'association_rules.csv'
-            if not p.exists():
+            ar_base = results_dir / region / 'association_rules'
+            found   = ar_base.exists() and any(ar_base.rglob(f'k_{k}/summary.csv'))
+            if not found:
                 return False
     return True
 
@@ -387,7 +390,7 @@ def run_step2(args: argparse.Namespace) -> bool:
             k_values       = args.k_values,
             perc_threshold = args.perc_threshold,
             target_col     = args.target_col,
-            metadata_cols  = args.metadata_cols,   # columns excluded from feature matrix X
+            metadata_cols  = args.metadata_cols or [],   # nargs='*' can yield None in edge cases
             base_dir       = _HERE.parent,                # results/ and data/ resolved under _HERE.parent (project root)
         )
     except Exception:
@@ -637,6 +640,10 @@ def main() -> None:
     print(f'  Perc threshold               : {args.perc_threshold}')
     print(f'  Target column                : {args.target_col}')
     print(f'  Auto-calibrate (ARM)         : {args.auto_calibrate}')
+    if not args.auto_calibrate:
+        print(f'  Support grid                 : [{args.sup_min}, {args.sup_max}] step={args.sup_delta}')
+        print(f'  Confidence grid              : [{args.conf_min}, {args.conf_max}] step={args.conf_delta}')
+        print(f'  Lift grid                    : [{args.lift_min}, {args.lift_max}] step={args.lift_delta} window=±{args.lift_neutral_half_window}')
     print(f'  Force re-run                 : {args.force}')
     print(f'  Dry-run                      : {args.dry_run}')
     print(f'  Script directory (src/)      : {_HERE}')

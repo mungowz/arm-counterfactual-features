@@ -56,6 +56,7 @@ import datetime
 import os
 import platform
 import shutil
+import subprocess
 import warnings
 from pathlib import Path
 
@@ -77,14 +78,66 @@ matplotlib.use('Agg')
 # Total logical CPU count (including hyperthreading / SMT siblings).
 _CPU_CORES = os.cpu_count() or 1
 
-# On Apple Silicon (Darwin), efficiency cores (E-cores) are significantly
-# slower than performance cores (P-cores).  When joblib distributes work
-# evenly across all cores, the slowest E-core worker becomes the bottleneck
-# (straggler effect), slowing the entire parallel section.
-# Capping at P-core count avoids this.  Adjust manually for your chip:
-#   M2 base: 4P cores  |  M2 Pro: 6/8P  |  M2 Max: 8–12P  |  M2 Ultra: 16P
-# On Linux / Windows all cores are roughly equivalent — use all of them.
-_PERF_CORES = 4 if platform.system() == 'Darwin' else _CPU_CORES
+# _PERF_CORES is initialised lazily on first use via _get_perf_cores() to avoid
+# running a subprocess at module import time (which would print to stdout and
+# slow down any code that merely imports this module without using parallelism).
+_PERF_CORES: int | None = None
+
+
+def _detect_perf_cores() -> int:
+    """
+    Detect the number of performance (P) cores available.
+
+    On Apple Silicon (Darwin), E-cores are significantly slower than P-cores.
+    When joblib distributes work evenly across all cores, the slowest E-core
+    worker becomes the bottleneck (straggler effect).  Capping at the P-core
+    count avoids this.
+
+    Strategy
+    --------
+    - macOS: query ``sysctl hw.perflevel0.logicalcpu`` — returns the exact
+      logical P-core count for any Apple Silicon chip without hard-coding
+      per-model values.  On Intel Macs this key is absent; the fallback
+      uses the full logical CPU count (all cores are equivalent on Intel).
+    - Linux / Windows: all cores are roughly equivalent — use all of them.
+
+    Chip reference (logical P-core counts):
+        M1 base:  4P   |  M1 Pro: 6/8P  |  M1 Max: 8P  |  M1 Ultra: 16P
+        M2 base:  4P   |  M2 Pro: 6/8P  |  M2 Max: 8P  |  M2 Ultra: 16P
+        M3 base:  4P   |  M3 Pro: 6P    |  M3 Max: 12P
+        M4 base:  4P   |  M4 Pro: 10P   |  M4 Max: 12P
+    """
+    if platform.system() == 'Darwin':
+        try:
+            result = subprocess.run(
+                ['sysctl', '-n', 'hw.perflevel0.logicalcpu'],
+                capture_output=True, text=True, check=True,
+            )
+            p_cores = int(result.stdout.strip())
+            print(
+                f'  > Apple Silicon detected: {p_cores} P-cores '
+                f'(of {_CPU_CORES} logical total) — '
+                f'joblib capped at {p_cores} workers'
+            )
+            return p_cores
+        except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
+            # Intel Mac or unexpected sysctl failure — use all cores.
+            pass
+    return _CPU_CORES
+
+
+def _get_perf_cores() -> int:
+    """
+    Return the cached P-core count, detecting it on the first call.
+
+    Lazy initialisation avoids running a subprocess at import time, which
+    would print to stdout and slow down any code that imports this module
+    without actually using parallelism (e.g. unit tests, dry-run checks).
+    """
+    global _PERF_CORES
+    if _PERF_CORES is None:
+        _PERF_CORES = _detect_perf_cores()
+    return _PERF_CORES
 
 
 # ---------------------------------------------------------------------------
@@ -387,7 +440,7 @@ def plot_heatmaps(
 
         ax.set_xticks(range(n_cols))
         ax.set_xticklabels(
-            [f'{v:.2f}' for v in pivot.columns],
+            [f'{v:.2f}' if isinstance(v, float) else str(v) for v in pivot.columns],
             rotation=40, ha='right', fontsize=8,
         )
         ax.set_yticks(range(n_rows))
@@ -539,7 +592,7 @@ def _process_one_support(
         if len(rules) == 0:
             continue
 
-            # conviction = P(¬consequent) / P(¬consequent | antecedent).
+        # conviction = P(¬consequent) / P(¬consequent | antecedent).
         # When confidence = 1.0, P(¬consequent | antecedent) = 0, giving
         # conviction = inf.  We replace inf with NaN before writing to CSV
         # to avoid breaking CSV parsers that don't handle inf strings.
@@ -696,12 +749,23 @@ def explore_association_rules(
     # loky backend: true multiprocessing (bypasses GIL); each worker gets
     # its own copy of df and the parameter arrays.
     # Cap n_jobs at the number of support values to avoid spawning idle workers.
-    n_jobs = min(_PERF_CORES, len(support_grid))
+    perf_cores = _get_perf_cores()
+    n_jobs = min(perf_cores, len(support_grid))
     print(f'  > Launching parallel FP-Growth over {len(support_grid)} support '
           f'values (n_jobs={n_jobs} of {_CPU_CORES} logical / '
-          f'{_PERF_CORES} perf cores)')
+          f'{perf_cores} perf cores)')
 
-    parallel_results = Parallel(n_jobs=n_jobs, backend='loky', verbose=0)(
+    parallel_results = Parallel(
+        n_jobs     = n_jobs,
+        backend    = 'loky',
+        verbose    = 0,
+        # pre_dispatch limits how many tasks are sent to workers at once.
+        # On Apple Silicon the unified memory bus is shared between all cores
+        # and the GPU.  Setting pre_dispatch = n_jobs (not 2× n_jobs) ensures
+        # that at most n_jobs serialised copies of df are resident in memory
+        # simultaneously, preventing peak RSS from doubling during task queuing.
+        pre_dispatch = n_jobs,
+    )(
         delayed(_process_one_support)(
             min_sup        = min_sup,
             sup_idx        = sup_idx,
@@ -767,7 +831,7 @@ def explore_association_rules(
     with open(output_dir / 'exploration_summary.txt', 'a') as f:
         f.write('\nParallelism:\n')
         f.write(f'  n_jobs used      : {n_jobs} '
-                f'(of {_CPU_CORES} logical / {_PERF_CORES} perf cores)\n\n')
+                f'(of {_CPU_CORES} logical / {perf_cores} perf cores)\n\n')
         f.write('Folder cleanup:\n')
         f.write(f'  conf dirs removed: {removed_conf}\n')
         f.write(f'  sup dirs removed : {removed_sup}\n')
@@ -802,6 +866,11 @@ def calibrate_parameters(
     frequencies.  lift_min is always set to 0.0 to include negative
     correlations in the grid from the start.
 
+    conf_min is set to the MINIMUM confidence observed in the probe rules
+    (floored to the nearest conf_delta step, clamped to conf_min_floor).
+    This ensures the full confidence grid is explored rather than collapsing
+    to a single point when rules happen to have uniformly high confidence.
+
     Returns None if no 2-itemsets can be formed (transactions too sparse).
     """
     print('  > Calibrating parameters from item frequencies...')
@@ -830,25 +899,55 @@ def calibrate_parameters(
         round(np.floor(raw_sup_min / sup_delta) * sup_delta, 4), sup_delta
     )
 
-    scan_grid                = np.round(
+    # ── Stage 1: scan for the natural 2-itemset ceiling ──────────────
+    # Walk from sup_min upward, one sup_delta step at a time, until either
+    # FP-Growth returns no itemsets at all (data too sparse) or we see the
+    # first threshold after which 2-itemsets disappear.  The last threshold
+    # that still produced a 2-itemset is the natural ceiling: above it no
+    # association rules can be generated from this dataset.
+    #
+    # Scan upper bound: support of the second-most-frequent item.
+    # A 2-itemset {A, B} cannot have support > min(support(A), support(B)),
+    # so scanning beyond the second-most-frequent item is guaranteed to find
+    # nothing and wastes FP-Growth calls.
+    scan_grid               = np.round(
         np.arange(sup_min, freq_2 + sup_delta / 2, sup_delta), 4
     )
-    sup_max                  = sup_min
-    prev_had_2itemsets       = False
-    fi_first_with_2itemsets  = None
+    natural_sup_max         = sup_min   # updated below as scan progresses
+    prev_had_2itemsets      = False
+    fi_first_with_2itemsets = None
 
     for t in scan_grid:
         fi = fpgrowth(encoded_df, min_support=t, use_colnames=True)
         if fi.empty:
             break
-        has_2 = (fi['itemsets'].apply(len).max() >= 2) if not fi.empty else False
+        has_2 = (fi['itemsets'].apply(len) >= 2).any()
         if has_2:
             if fi_first_with_2itemsets is None:
                 fi_first_with_2itemsets = fi
-            sup_max            = t
+            natural_sup_max    = t
             prev_had_2itemsets = True
         elif prev_had_2itemsets:
+            # First step above the natural ceiling — stop immediately.
             break
+
+    # ── Stage 2: extend grid N steps beyond the natural ceiling ─────────
+    # The natural ceiling is where rules stop existing in these data.
+    # Adding _DECAY_STEPS above it lets the heatmap show the rule-count
+    # curve decaying to zero — which is the diagnostic value of the grid.
+    # Those empty sup_* folders are removed automatically by cleanup_empty_folders.
+    # No fixed minimum width: grid breadth is fully determined by the data.
+    _DECAY_STEPS    = 4
+    sup_max = min(
+        round(natural_sup_max + _DECAY_STEPS * sup_delta, 4),
+        0.50,   # hard cap: above 50% support is trivially dense
+    )
+
+    print(
+        f'  > support grid: [{sup_min} … {sup_max}]  '
+        f'(natural 2-itemset ceiling = {natural_sup_max}, '
+        f'+{_DECAY_STEPS} decay steps)'
+    )
 
     # The theoretical maximum lift for a rule involving the rarest item is
     # approximately 1 / support(rarest).  We round up to the nearest 0.5
@@ -863,21 +962,28 @@ def calibrate_parameters(
         return None
 
     calibrated_conf_min = conf_min_floor
-    max_conf            = None
+    min_conf_observed   = None
+    max_conf_observed   = None
     try:
         if fi_first_with_2itemsets is not None and not fi_first_with_2itemsets.empty:
             rules_probe = association_rules(
                 fi_first_with_2itemsets, metric='confidence', min_threshold=0.01
             )
             if not rules_probe.empty:
-                max_conf            = rules_probe['confidence'].max()
+                # Use the MINIMUM observed confidence to set conf_min so that
+                # the full confidence grid is explored from the lowest meaningful
+                # value.  Using max_conf here (the previous behaviour) collapsed
+                # the grid to a single point whenever rules had high confidence.
+                min_conf_observed   = rules_probe['confidence'].min()
+                max_conf_observed   = rules_probe['confidence'].max()
                 calibrated          = round(
-                    np.floor(max_conf / conf_delta) * conf_delta, 4
+                    np.floor(min_conf_observed / conf_delta) * conf_delta, 4
                 )
                 calibrated_conf_min = max(calibrated, conf_min_floor)
                 print(
                     f'  > conf_min calibrated to {calibrated_conf_min} '
-                    f'(max observed confidence={max_conf:.4f}, '
+                    f'(min observed confidence={min_conf_observed:.4f}, '
+                    f'max observed confidence={max_conf_observed:.4f}, '
                     f'floor={conf_min_floor})'
                 )
             else:
@@ -885,12 +991,16 @@ def calibrate_parameters(
                     f'  > Note: no rules at conf=0.01 for sup_min={sup_min} '
                     f'— conf_min stays at floor={conf_min_floor}'
                 )
-    except Exception:
-        pass
+    except Exception as exc:
+        print(
+            f'  > WARNING: conf_min calibration failed ({exc!r}) — '
+            f'using floor={conf_min_floor}'
+        )
 
     params = {
         'sup_min':           sup_min,
         'sup_max':           sup_max,
+        'natural_sup_max':   natural_sup_max,
         'sup_delta':         sup_delta,
         'conf_min':          calibrated_conf_min,
         'conf_max':          conf_max,
@@ -901,13 +1011,14 @@ def calibrate_parameters(
         # Diagnostic values for calibration_log.txt.
         'raw_sup_min':       round(raw_sup_min, 6),
         'raw_lift_max':      round(raw_lift_max, 4),
-        'max_conf_observed': round(max_conf, 4) if max_conf is not None else None,
+        'min_conf_observed': round(min_conf_observed, 4) if min_conf_observed is not None else None,
+        'max_conf_observed': round(max_conf_observed, 4) if max_conf_observed is not None else None,
         'item_supports':     item_supports.round(4).to_dict(),
     }
 
     print(
         f'  > calibrated: sup_min={sup_min} (raw={raw_sup_min:.4f}), '
-        f'sup_max={sup_max}, conf_min={calibrated_conf_min} (from data), '
+        f'sup_max={sup_max}, conf_min={calibrated_conf_min} (from min observed in data), '
         f'lift_max={lift_max} (raw ceiling={raw_lift_max:.2f})'
     )
     print('-' * 50)
@@ -982,10 +1093,13 @@ def _write_calibration_log(
         f.write('Calibrated Parameters:\n')
         f.write(f'  sup_min          : {params["sup_min"]}  '
                 f'(raw product = {params["raw_sup_min"]:.6f})\n')
-        f.write(f'  sup_max          : {params["sup_max"]}\n')
+        f.write(f'  sup_max          : {params["sup_max"]}  '
+                f'(natural 2-itemset ceiling = {params["natural_sup_max"]}, '
+                f'+{4} decay steps)\n')
         f.write(f'  sup_delta        : {params["sup_delta"]}\n')
         f.write(f'  conf_min         : {params["conf_min"]}  '
-                f'(max observed = {params["max_conf_observed"]})\n')
+                f'(min observed = {params["min_conf_observed"]}, '
+                f'max observed = {params["max_conf_observed"]})\n')
         f.write(f'  conf_max         : {params["conf_max"]}\n')
         f.write(f'  conf_delta       : {params["conf_delta"]}\n')
         f.write(f'  lift_min         : {params["lift_min"]}  '
@@ -998,6 +1112,141 @@ def _write_calibration_log(
 # ---------------------------------------------------------------------------
 # K-comparison experiment
 # ---------------------------------------------------------------------------
+
+def _process_one_k(
+    k: int,
+    labels_csv: Path,
+    output_dir: Path,
+    auto_calibrate: bool,
+    sup_min: float, sup_max: float, sup_delta: float,
+    conf_min: float, conf_max: float, conf_delta: float,
+    lift_min: float, lift_max: float, lift_delta: float,
+    lift_neutral_half_window: float,
+) -> tuple[int, pd.DataFrame | None, dict]:
+    """
+    Process a single k value: load data, (optionally) calibrate, run grid search.
+
+    Called in parallel from run_k_comparison via joblib.
+    Returns (k, summary_df_or_None, comparison_row_dict).
+    Each k writes to its own k_{k}/ subdirectory so there is no shared
+    mutable filesystem state between workers.
+    """
+    labels_csv = Path(labels_csv)
+    k_dir      = output_dir / f'k_{k}'
+    k_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f'\n{"=" * 70}')
+    print(f'  k = {k}  |  {labels_csv.name}')
+    print(f'{"=" * 70}')
+
+    if not labels_csv.exists():
+        print(f'  > File not found: {labels_csv}')
+        row = {
+            'k': k, 'skipped_reason': 'file_not_found',
+            'n_transactions': None, 'n_items': None,
+            'rarest_item_support': None, 'sup_min_used': None,
+            'sup_max_used': None, 'lift_max_used': None,
+            'conf_min_used': None, 'summary_rows': 0,
+            'combos_with_rules': 0, 'max_rules_any_combo': 0,
+            'avg_lift_best_combo': None, 'max_lift_observed': None,
+        }
+        return k, None, row
+
+    df_encoded    = extract_labels(labels_csv)
+    item_supports = df_encoded.mean().sort_values()
+
+    if auto_calibrate:
+        params = calibrate_parameters(
+            encoded_df     = df_encoded,
+            sup_delta      = sup_delta,
+            lift_delta     = lift_delta,
+            conf_delta     = conf_delta,
+            conf_min_floor = conf_min,
+            conf_max       = conf_max,
+        )
+        _write_calibration_log(
+            k_dir=k_dir, k=k,
+            n_transactions=len(df_encoded),
+            item_supports=item_supports,
+            params=params,
+            auto_calibrate=True,
+        )
+
+        if params is None:
+            print(f'  > Skipping k={k} — insufficient co-occurrences for rules.')
+            row = {
+                'k': k, 'skipped_reason': 'too_sparse',
+                'n_transactions': len(df_encoded),
+                'n_items': df_encoded.shape[1],
+                'rarest_item_support': round(item_supports.iloc[0], 4),
+                'sup_min_used': None, 'sup_max_used': None,
+                'lift_max_used': None, 'conf_min_used': None,
+                'summary_rows': 0, 'combos_with_rules': 0,
+                'max_rules_any_combo': 0, 'avg_lift_best_combo': None,
+                'max_lift_observed': None,
+            }
+            return k, None, row
+
+        k_sup_min  = params['sup_min']
+        k_sup_max  = params['sup_max']
+        k_lift_max = params['lift_max']
+        k_conf_min = params['conf_min']
+        k_lift_min = params['lift_min']   # always 0.0
+
+    else:
+        k_sup_min  = sup_min
+        k_sup_max  = sup_max
+        k_lift_max = lift_max
+        k_conf_min = conf_min
+        k_lift_min = lift_min
+
+        _write_calibration_log(
+            k_dir=k_dir, k=k,
+            n_transactions=len(df_encoded),
+            item_supports=item_supports,
+            params=None,
+            auto_calibrate=False,
+            manual_params={
+                'sup_min': k_sup_min, 'sup_max': k_sup_max,
+                'conf_min': k_conf_min, 'lift_max': k_lift_max,
+            },
+        )
+
+    summary_df = explore_association_rules(
+        df          = df_encoded,
+        output_dir  = k_dir,
+        sup_min     = k_sup_min,  sup_max  = k_sup_max,  sup_delta  = sup_delta,
+        conf_min    = k_conf_min, conf_max = conf_max,   conf_delta = conf_delta,
+        lift_min    = k_lift_min, lift_max = k_lift_max, lift_delta = lift_delta,
+        lift_neutral_half_window = lift_neutral_half_window,
+    )
+
+    has_rules_col = (
+        not summary_df.empty and 'Number_of_Rules' in summary_df.columns
+    )
+    with_rules = (
+        summary_df[summary_df['Number_of_Rules'] > 0]
+        if has_rules_col
+        else pd.DataFrame()
+    )
+    row = {
+        'k':                   k,
+        'skipped_reason':      '',
+        'n_transactions':      len(df_encoded),
+        'n_items':             df_encoded.shape[1],
+        'rarest_item_support': round(item_supports.iloc[0], 4),
+        'sup_min_used':        k_sup_min,
+        'sup_max_used':        k_sup_max,
+        'lift_max_used':       k_lift_max,
+        'conf_min_used':       k_conf_min,
+        'summary_rows':        len(summary_df),
+        'combos_with_rules':   len(with_rules),
+        'max_rules_any_combo': int(summary_df['Number_of_Rules'].max()) if has_rules_col else 0,
+        'avg_lift_best_combo': round(with_rules['Avg_Lift'].max(), 4) if not with_rules.empty else 0.0,
+        'max_lift_observed':   round(summary_df['Max_Lift'].max(), 4) if has_rules_col else 0.0,
+    }
+    return k, summary_df, row
+
 
 def run_k_comparison(
     k_labels_map: dict,
@@ -1020,6 +1269,16 @@ def run_k_comparison(
     lift_min=0.0 (default) ensures negative correlations are included in the
     grid for every k in both auto and manual mode.
 
+    Parallelism
+    -----------
+    Each k value is processed in a separate loky worker so that multiple k
+    values run concurrently.  Within each worker, explore_association_rules
+    spawns its own inner Parallel over support thresholds.  The two levels
+    of parallelism are separated by the loky process boundary: the outer
+    level handles the k-loop; the inner level handles the support grid.
+    n_jobs for the outer level is capped at min(n_k_values, perf_cores) to
+    avoid spawning more workers than there is work.
+
     Parameters
     ----------
     k_labels_map    : dict mapping k (int) → Path of the labels CSV.
@@ -1038,135 +1297,41 @@ def run_k_comparison(
     comp_dir   = output_dir / 'k_comparison'
     comp_dir.mkdir(parents=True, exist_ok=True)
 
+    k_sorted = sorted(k_labels_map.keys())
+    perf_cores = _get_perf_cores()
+    # Outer parallelism: one worker per k value, capped at P-core count.
+    # Each worker spawns its own inner Parallel for the support grid.
+    outer_jobs = min(len(k_sorted), perf_cores)
+
     print(f'\n{"=" * 70}')
     print(f'K-VARIATION EXPERIMENT — {len(k_labels_map)} k values')
     print(f'{"=" * 70}')
-    print(f'  > k values        : {sorted(k_labels_map.keys())}')
+    print(f'  > k values        : {k_sorted}')
     print(f'  > auto_calibrate  : {auto_calibrate}')
+    print(f'  > outer n_jobs    : {outer_jobs} '
+          f'(k values in parallel, each spawning inner support-level workers)')
     print('-' * 50)
 
-    k_summaries      = {}
-    comparison_rows  = []
-
-    for k in sorted(k_labels_map.keys()):
-        labels_csv = Path(k_labels_map[k])
-        k_dir      = output_dir / f'k_{k}'
-        k_dir.mkdir(parents=True, exist_ok=True)
-
-        print(f'\n{"=" * 70}')
-        print(f'  k = {k}  |  {labels_csv.name}')
-        print(f'{"=" * 70}')
-
-        if not labels_csv.exists():
-            print(f'  > File not found: {labels_csv}')
-            comparison_rows.append({
-                'k': k, 'skipped_reason': 'file_not_found',
-                'n_transactions': None, 'n_items': None,
-                'rarest_item_support': None, 'sup_min_used': None,
-                'sup_max_used': None, 'lift_max_used': None,
-                'conf_min_used': None, 'summary_rows': 0,
-                'combos_with_rules': 0, 'max_rules_any_combo': 0,
-                'avg_lift_best_combo': None, 'max_lift_observed': None,
-            })
-            continue
-
-        # Load and one-hot-encode the transaction CSV.
-        # item_supports: fraction of transactions containing each feature name.
-        df_encoded    = extract_labels(labels_csv)
-        item_supports = df_encoded.mean().sort_values()
-
-        if auto_calibrate:
-            params = calibrate_parameters(
-                encoded_df     = df_encoded,
-                sup_delta      = sup_delta,
-                lift_delta     = lift_delta,
-                conf_delta     = conf_delta,
-                conf_min_floor = conf_min,
-                conf_max       = conf_max,
-            )
-            _write_calibration_log(
-                k_dir=k_dir, k=k,
-                n_transactions=len(df_encoded),
-                item_supports=item_supports,
-                params=params,
-                auto_calibrate=True,
-            )
-
-            if params is None:
-                print(f'  > Skipping k={k} — insufficient co-occurrences for rules.')
-                comparison_rows.append({
-                    'k': k, 'skipped_reason': 'too_sparse',
-                    'n_transactions': len(df_encoded),
-                    'n_items': df_encoded.shape[1],
-                    'rarest_item_support': round(item_supports.iloc[0], 4),
-                    'sup_min_used': None, 'sup_max_used': None,
-                    'lift_max_used': None, 'conf_min_used': None,
-                    'summary_rows': 0, 'combos_with_rules': 0,
-                    'max_rules_any_combo': 0, 'avg_lift_best_combo': None,
-                    'max_lift_observed': None,
-                })
-                continue
-
-            k_sup_min  = params['sup_min']
-            k_sup_max  = params['sup_max']
-            k_lift_max = params['lift_max']
-            k_conf_min = params['conf_min']
-            k_lift_min = params['lift_min']   # always 0.0
-
-        else:
-            k_sup_min  = sup_min
-            k_sup_max  = sup_max
-            k_lift_max = lift_max
-            k_conf_min = conf_min
-            k_lift_min = lift_min
-
-            _write_calibration_log(
-                k_dir=k_dir, k=k,
-                n_transactions=len(df_encoded),
-                item_supports=item_supports,
-                params=None,
-                auto_calibrate=False,
-                manual_params={
-                    'sup_min': k_sup_min, 'sup_max': k_sup_max,
-                    'conf_min': k_conf_min, 'lift_max': k_lift_max,
-                },
-            )
-
-        summary_df = explore_association_rules(
-            df          = df_encoded,
-            output_dir  = k_dir,
-            sup_min     = k_sup_min,  sup_max  = k_sup_max,  sup_delta  = sup_delta,
-            conf_min    = k_conf_min, conf_max = conf_max,   conf_delta = conf_delta,
-            lift_min    = k_lift_min, lift_max = k_lift_max, lift_delta = lift_delta,
-            lift_neutral_half_window = lift_neutral_half_window,
+    raw_results = Parallel(n_jobs=outer_jobs, backend='loky', verbose=0)(
+        delayed(_process_one_k)(
+            k                    = k,
+            labels_csv           = Path(k_labels_map[k]),
+            output_dir           = output_dir,
+            auto_calibrate       = auto_calibrate,
+            sup_min=sup_min,   sup_max=sup_max,   sup_delta=sup_delta,
+            conf_min=conf_min, conf_max=conf_max, conf_delta=conf_delta,
+            lift_min=lift_min, lift_max=lift_max, lift_delta=lift_delta,
+            lift_neutral_half_window=lift_neutral_half_window,
         )
+        for k in k_sorted
+    )
 
-        k_summaries[k] = summary_df
-
-        has_rules_col = (
-            not summary_df.empty and 'Number_of_Rules' in summary_df.columns
-        )
-        with_rules = (
-            summary_df[summary_df['Number_of_Rules'] > 0]
-            if has_rules_col
-            else pd.DataFrame()
-        )
-        comparison_rows.append({
-            'k':                   k,
-            'skipped_reason':      '',
-            'n_transactions':      len(df_encoded),
-            'n_items':             df_encoded.shape[1],
-            'rarest_item_support': round(item_supports.iloc[0], 4),
-            'sup_min_used':        k_sup_min,
-            'sup_max_used':        k_sup_max,
-            'lift_max_used':       k_lift_max,
-            'conf_min_used':       k_conf_min,
-            'summary_rows':        len(summary_df),
-            'combos_with_rules':   len(with_rules),
-            'max_rules_any_combo': int(summary_df['Number_of_Rules'].max()) if has_rules_col else 0,
-            'avg_lift_best_combo': round(with_rules['Avg_Lift'].max(), 4) if not with_rules.empty else 0.0,
-            'max_lift_observed':   round(summary_df['Max_Lift'].max(), 4) if has_rules_col else 0.0,
-        })
+    k_summaries     = {}
+    comparison_rows = []
+    for k, summary_df, row in raw_results:
+        comparison_rows.append(row)
+        if summary_df is not None:
+            k_summaries[k] = summary_df
 
     print(f'\n{"=" * 70}')
     print('  > Building cross-k comparison...')
@@ -1241,7 +1406,7 @@ def run_k_comparison(
         return k_summaries
 
     combined['Lift_display'] = (
-        (combined['Lift_threshold'] / lift_delta).round() * lift_delta
+        (combined['Lift_threshold'] / 0.1).round() * 0.1
     ).round(4)
 
     neutral_lo, neutral_hi = _neutral_window(lift_neutral_half_window)
@@ -1401,7 +1566,7 @@ def main(
     """
     print(
         f'  > Parallel backend — {_CPU_CORES} logical cores / '
-        f'{_PERF_CORES} perf cores (joblib loky)'
+        f'{_get_perf_cores()} perf cores (joblib loky)'
     )
 
     if base_dir is None:
@@ -1481,7 +1646,7 @@ def main(
                 f'{round(1.0 + lift_neutral_half_window, 4)}])\n\n'
             )
             f.write(f'Parallelism   : {_CPU_CORES} logical / '
-                    f'{_PERF_CORES} perf cores (joblib loky)\n\n')
+                    f'{_get_perf_cores()} perf cores (joblib loky)\n\n')
 
             if not k_labels_map:
                 f.write('Input files   : NONE FOUND\n')
