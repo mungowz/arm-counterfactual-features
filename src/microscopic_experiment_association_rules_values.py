@@ -200,6 +200,81 @@ def _neutral_window(half_window: float) -> tuple[float, float]:
 
 
 # ---------------------------------------------------------------------------
+# Experiment labelling
+#
+# _experiment_label() builds a human-readable folder name that encodes the
+# grid configuration used for a run.  This mirrors the identical function in
+# macroscopic_experiment_association_rules.py and serves the same purpose:
+# ensure that re-running the microscopic step with different parameters writes
+# to a distinct subdirectory rather than overwriting previous results.
+#
+# The label is injected into the output path in main() so the full tree is:
+#     results/{region}/association_rules_values/{experiment_label}/k_{k}/
+#
+# which is consistent with the macroscopic layout:
+#     results/{region}/association_rules/{experiment_label}/k_{k}/
+# ---------------------------------------------------------------------------
+
+def _experiment_label(
+    auto_calibrate: bool,
+    sup_min: float, sup_max: float, sup_delta: float,
+    conf_min: float, conf_max: float, conf_delta: float,
+    lift_min: float, lift_max: float, lift_delta: float,
+    lift_neutral_half_window: float,
+) -> str:
+    """
+    Build a filesystem-safe experiment label encoding the grid configuration.
+
+    The label is inserted as a path component between association_rules_values/
+    and k_{k}/ so that different configurations coexist without overwriting
+    each other.  The format mirrors macroscopic_experiment_association_rules
+    for consistency across pipeline stages.
+
+    Parameters
+    ----------
+    auto_calibrate : bool
+        When True the prefix is 'auto' and sup/lift bounds are omitted
+        (they are derived per-k from the data).  When False the prefix is
+        'manual' and all bounds are encoded.
+    sup_min, sup_max, sup_delta : float
+        Support grid parameters (manual mode only for min/max).
+    conf_min, conf_max, conf_delta : float
+        Confidence grid parameters.  conf_min in the label is the floor
+        value, not the per-k calibrated value.
+    lift_min, lift_max, lift_delta : float
+        Lift grid parameters (manual mode only for min/max).
+    lift_neutral_half_window : float
+        Half-width of the neutral lift band; encoded so that runs with
+        different window widths produce distinguishable directory names.
+
+    Returns
+    -------
+    str
+        Example (auto):
+            'auto_sup=auto_d0.02_conf=0.05-1.00_d0.05_lift=auto_d0.05_w0.25'
+        Example (manual):
+            'manual_sup=0.02-0.50_d0.02_conf=0.05-1.00_d0.05_lift=0.00-5.00_d0.05_w0.25'
+    """
+    def fmt(v: float) -> str:
+        return f'{v:.2f}'
+
+    if auto_calibrate:
+        prefix    = 'auto'
+        sup_part  = f'sup=auto_d{fmt(sup_delta)}'
+        lift_part = f'lift=auto_d{fmt(lift_delta)}_w{fmt(lift_neutral_half_window)}'
+    else:
+        prefix    = 'manual'
+        sup_part  = f'sup={fmt(sup_min)}-{fmt(sup_max)}_d{fmt(sup_delta)}'
+        lift_part = (
+            f'lift={fmt(lift_min)}-{fmt(lift_max)}'
+            f'_d{fmt(lift_delta)}_w{fmt(lift_neutral_half_window)}'
+        )
+
+    conf_part = f'conf={fmt(conf_min)}-{fmt(conf_max)}_d{fmt(conf_delta)}'
+    return f'{prefix}_{sup_part}_{conf_part}_{lift_part}'
+
+
+# ---------------------------------------------------------------------------
 # Label extraction from Step 3 rules
 #
 # Step 3 (macroscopic ARM) produces rules.csv files whose antecedents and
@@ -393,66 +468,51 @@ def build_value_transactions(
 
     print(f'    {len(df):,} rows, {df["Sample_ID"].nunique():,} unique samples')
 
-    # ── Parse and filter ──────────────────────────────────────────────
-    # agg_buffer accumulates the union of filtered items per Sample_ID.
-    # cf_count tracks which CF neighbour IDs have been seen per Sample_ID
-    # so we can populate Num_CF_Neighbors correctly in the aggregated output.
-    pair_rows = []
-    agg_buffer: dict[int, set] = {}   # Sample_ID → union of filtered items
-    cf_count:   dict[int, set] = {}   # Sample_ID → set of CF_Neighbor_IDs seen
-
-    for _, row in df.iterrows():
-        sample_id  = int(row['Sample_ID'])
-        cf_id      = int(row['CF_Neighbor_ID'])
-        raw_values = row['Counterfactual_Values']
-
+    # ── Parse and filter — vectorised ────────────────────────────────
+    # Using apply() instead of iterrows() is ~10-50× faster on large DataFrames
+    # because it avoids per-row Python overhead and keeps the hot path inside
+    # pandas rather than a pure-Python loop.
+    #
+    # _filter_items: parse the stringified list and retain only items whose
+    # label prefix (before '=') is in active_labels.  Returns an empty list
+    # for malformed cells or rows with no matching items (dropped downstream).
+    def _filter_items(raw_values: str) -> list:
         try:
             items = ast.literal_eval(raw_values)
         except (ValueError, SyntaxError):
-            # Malformed cell — skip this (sample, CF) pair entirely.
-            continue
+            return []
+        return [
+            item for item in items
+            if '=' in str(item) and str(item).split('=', 1)[0] in active_labels
+        ]
 
-        # Retain only items whose label prefix is in the active set.
-        filtered = []
-        for item in items:
-            if '=' not in str(item):
-                continue
-            label = str(item).split('=', 1)[0]
-            if label in active_labels:
-                filtered.append(item)
+    df = df.copy()
+    df['_filtered'] = df['Counterfactual_Values'].apply(_filter_items)
 
-        if not filtered:
-            # No relevant items for this (sample, CF) pair — exclude it.
-            continue
-
-        pair_rows.append({
-            'Sample_ID':      sample_id,
-            'CF_Neighbor_ID': cf_id,
-            'Values':         str(filtered),
-        })
-
-        # Accumulate items and CF neighbours for the aggregated view.
-        if sample_id not in agg_buffer:
-            agg_buffer[sample_id] = set()
-            cf_count[sample_id]   = set()
-        agg_buffer[sample_id].update(filtered)
-        cf_count[sample_id].add(cf_id)
+    # Drop rows that produced zero filtered items.
+    df = df[df['_filtered'].map(len) > 0].reset_index(drop=True)
 
     # ── Pair-level DataFrame ──────────────────────────────────────────
-    pair_df = pd.DataFrame(pair_rows, columns=['Sample_ID', 'CF_Neighbor_ID', 'Values'])
+    pair_df = df[['Sample_ID', 'CF_Neighbor_ID', '_filtered']].copy()
+    pair_df = pair_df.rename(columns={'_filtered': 'Values'})
+    pair_df['Values'] = pair_df['Values'].apply(str)
+    pair_df = pair_df.reset_index(drop=True)
 
     # ── Aggregated DataFrame ──────────────────────────────────────────
-    # Items are sorted for deterministic output across runs.
-    agg_rows = []
-    for sample_id, items in agg_buffer.items():
-        items_sorted = sorted(items)
-        agg_rows.append({
-            'Sample_ID':        sample_id,
-            'Values':           str(items_sorted),
-            'Num_Values':       len(items_sorted),
-            'Num_CF_Neighbors': len(cf_count[sample_id]),
-        })
-    agg_df = pd.DataFrame(agg_rows, columns=['Sample_ID', 'Values', 'Num_Values', 'Num_CF_Neighbors'])
+    # For each Sample_ID: union all filtered items across its CF neighbours,
+    # deduplicate, sort for deterministic output, and count unique CF IDs.
+    agg_df = (
+        df.groupby('Sample_ID', sort=False)
+        .agg(
+            _items=('_filtered',
+                    lambda x: sorted({item for sublist in x for item in sublist})),
+            Num_CF_Neighbors=('CF_Neighbor_ID', 'nunique'),
+        )
+        .reset_index()
+    )
+    agg_df['Values']     = agg_df['_items'].apply(str)
+    agg_df['Num_Values'] = agg_df['_items'].apply(len)
+    agg_df = agg_df[['Sample_ID', 'Values', 'Num_Values', 'Num_CF_Neighbors']]
 
     n_kept_samples = agg_df['Sample_ID'].nunique()
     n_total        = df['Sample_ID'].nunique()
@@ -1191,7 +1251,7 @@ def _write_calibration_log(
     params: dict | None,
     auto_calibrate: bool,
     active_labels: set[str],
-    manual_params: dict = None,
+    manual_params: dict | None = None,
 ) -> None:
     """
     Write item_supports.csv and calibration_log.txt to *k_dir*.
@@ -1291,6 +1351,7 @@ def explore_association_rules_values(
     conf_min, conf_max, conf_delta,
     lift_min, lift_max, lift_delta,
     lift_neutral_half_window: float = 0.25,
+    inner_n_jobs: int | None        = None,
 ) -> pd.DataFrame:
     """
     Run the full support × confidence × lift grid search at the value level.
@@ -1315,6 +1376,11 @@ def explore_association_rules_values(
         internally; lift_min is typically 0.0 to include negative correlations.
     lift_neutral_half_window : float
         Half-width of the neutral lift exclusion band (default 0.25).
+    inner_n_jobs : int or None
+        Number of loky workers for the support-level parallel loop.
+        When None (default) the function derives it as
+        max(1, perf_cores // outer_k_jobs) to respect the two-level
+        parallelism budget.  Pass an explicit value to override this.
 
     Returns
     -------
@@ -1347,7 +1413,17 @@ def explore_association_rules_values(
     print('-' * 50)
 
     perf_cores = _get_perf_cores()
-    n_jobs     = min(perf_cores, len(support_grid))
+    # Respect the two-level parallelism budget:
+    #   outer level (k values)   : outer_jobs workers, each calling this function
+    #   inner level (sup values) : inner_n_jobs workers per outer worker
+    #
+    # When inner_n_jobs is provided by the caller (run_k_comparison_values),
+    # it has already been set to max(1, perf_cores // outer_jobs) so that
+    # outer × inner ≤ perf_cores.  When called standalone (inner_n_jobs=None),
+    # we use all available P-cores — safe because there is no outer loop.
+    if inner_n_jobs is None:
+        inner_n_jobs = min(perf_cores, len(support_grid))
+    n_jobs = min(inner_n_jobs, len(support_grid))
     print(
         f'  > Launching parallel FP-Growth over {len(support_grid)} support values '
         f'(n_jobs={n_jobs} of {_CPU_CORES} logical / {perf_cores} perf cores)'
@@ -1466,6 +1542,7 @@ def _process_one_k(
     conf_min: float, conf_max: float, conf_delta: float,
     lift_min: float, lift_max: float, lift_delta: float,
     lift_neutral_half_window: float,
+    inner_n_jobs: int = 1,
 ) -> tuple[int, pd.DataFrame | None, dict]:
     """
     End-to-end value-level ARM pipeline for a single (region, k) pair.
@@ -1490,6 +1567,11 @@ def _process_one_k(
     sup_min … lift_neutral_half_window : float
         Grid parameters — used directly when auto_calibrate=False, or as
         floor/ceiling constraints when auto_calibrate=True.
+    inner_n_jobs : int
+        Number of loky workers for the inner support-level parallel loop
+        inside explore_association_rules_values().  Computed by
+        run_k_comparison_values() as max(1, perf_cores // outer_jobs) so
+        that total worker count stays within the P-core budget.
 
     Returns
     -------
@@ -1653,6 +1735,7 @@ def _process_one_k(
         conf_min=k_conf_min, conf_max=conf_max, conf_delta=conf_delta,
         lift_min=k_lift_min, lift_max=k_lift_max, lift_delta=lift_delta,
         lift_neutral_half_window=lift_neutral_half_window,
+        inner_n_jobs=inner_n_jobs,
     )
 
     has_rules_col = not summary_df.empty and 'Number_of_Rules' in summary_df.columns
@@ -1749,12 +1832,33 @@ def run_k_comparison_values(
     perf_cores = _get_perf_cores()
     outer_jobs = min(len(k_sorted), perf_cores)
 
+    # Two-level parallelism budget for Apple Silicon (and any NUMA system):
+    #
+    #   outer_jobs  : number of k-level workers running concurrently.
+    #   inner_n_jobs: number of support-level workers each k-worker spawns.
+    #
+    # Without budget splitting, outer × inner can reach perf_cores² processes
+    # (e.g. 4 × 16 = 64 on M1 Ultra), all competing for the same 16 P-cores.
+    # loky serialises each DataFrame into every worker; over-subscription
+    # causes quadratic memory pressure and CPU starvation rather than speedup.
+    #
+    # Setting inner_n_jobs = max(1, perf_cores // outer_jobs) ensures:
+    #   outer × inner ≤ perf_cores   (total workers ≤ available P-cores)
+    #
+    # Example: M1 Ultra, 16 P-cores, 4 k-values
+    #   outer_jobs  = min(4, 16) = 4
+    #   inner_n_jobs = max(1, 16 // 4) = 4
+    #   total workers = 4 × 4 = 16  (≤ 16 P-cores — no over-subscription)
+    inner_n_jobs = max(1, perf_cores // outer_jobs)
+
     print(f'\n{"=" * 70}')
     print(f'K-VARIATION EXPERIMENT (VALUE LEVEL) — {len(k_sorted)} k values')
     print(f'{"=" * 70}')
-    print(f'  > k values     : {k_sorted}')
+    print(f'  > k values      : {k_sorted}')
     print(f'  > auto_calibrate: {auto_calibrate}')
-    print(f'  > outer n_jobs : {outer_jobs}')
+    print(f'  > outer n_jobs  : {outer_jobs}  (k-level workers)')
+    print(f'  > inner n_jobs  : {inner_n_jobs}  (support-level workers per k, '
+          f'total ≤ {outer_jobs * inner_n_jobs} / {perf_cores} P-cores)')
     print('-' * 50)
 
     raw_results = Parallel(n_jobs=outer_jobs, backend='loky', verbose=0)(
@@ -1768,6 +1872,7 @@ def run_k_comparison_values(
             conf_min=conf_min, conf_max=conf_max, conf_delta=conf_delta,
             lift_min=lift_min, lift_max=lift_max, lift_delta=lift_delta,
             lift_neutral_half_window=lift_neutral_half_window,
+            inner_n_jobs=inner_n_jobs,
         )
         for k in k_sorted
     )
@@ -2000,12 +2105,27 @@ def main(
 
     results_dir = base_dir / 'results'
 
+    # Build the experiment label once — the same label is used for every
+    # region so that a single pipeline run is always self-consistent.
+    # The label encodes the full grid configuration, mirroring the macroscopic
+    # script so both pipeline stages use a parallel directory structure:
+    #   macroscopic : results/{region}/association_rules/{exp_label}/k_{k}/
+    #   microscopic : results/{region}/association_rules_values/{exp_label}/k_{k}/
+    exp_label = _experiment_label(
+        auto_calibrate=auto_calibrate,
+        sup_min=sup_min,   sup_max=sup_max,   sup_delta=sup_delta,
+        conf_min=conf_min, conf_max=conf_max, conf_delta=conf_delta,
+        lift_min=lift_min, lift_max=lift_max, lift_delta=lift_delta,
+        lift_neutral_half_window=lift_neutral_half_window,
+    )
+
     for region in regions:
-        ar_output_dir = results_dir / region / 'association_rules_values'
+        ar_output_dir = results_dir / region / 'association_rules_values' / exp_label
         ar_output_dir.mkdir(parents=True, exist_ok=True)
 
         print('\n' + '=' * 70)
         print(f'ASSOCIATION RULES (VALUE LEVEL) — {region.upper()}')
+        print(f'Experiment: {exp_label}')
         print('=' * 70 + '\n')
 
         k_summaries = run_k_comparison_values(

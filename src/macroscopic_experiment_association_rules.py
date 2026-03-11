@@ -709,6 +709,7 @@ def explore_association_rules(
     conf_min, conf_max, conf_delta,
     lift_min, lift_max, lift_delta,
     lift_neutral_half_window: float = 0.25,
+    inner_n_jobs: int | None        = None,
 ) -> pd.DataFrame:
     """
     Full grid search over support × confidence × lift using FP-Growth.
@@ -716,6 +717,14 @@ def explore_association_rules(
     Workers are dispatched in parallel over support thresholds (loky backend).
     The neutral lift window is excluded via _neutral_window().
     Negative correlations and both A→B / B→A rule directions are retained.
+
+    Parameters
+    ----------
+    inner_n_jobs : int or None
+        Number of loky workers for the support-level parallel loop.
+        When None (default) the function derives it as
+        max(1, perf_cores // outer_k_jobs) to respect the two-level
+        parallelism budget.  Pass an explicit value to override.
 
     Returns a summary DataFrame sorted by (Number_of_Rules DESC, Max_Lift DESC).
     """
@@ -750,7 +759,16 @@ def explore_association_rules(
     # its own copy of df and the parameter arrays.
     # Cap n_jobs at the number of support values to avoid spawning idle workers.
     perf_cores = _get_perf_cores()
-    n_jobs = min(perf_cores, len(support_grid))
+    # Respect the two-level parallelism budget:
+    #   outer level (k values)   : outer_jobs workers, each calling this function
+    #   inner level (sup values) : inner_n_jobs workers per outer worker
+    #
+    # When inner_n_jobs is provided by run_k_comparison, it has already been
+    # set to max(1, perf_cores // outer_jobs) so outer × inner ≤ perf_cores.
+    # When called standalone (inner_n_jobs=None), we use all P-cores safely.
+    if inner_n_jobs is None:
+        inner_n_jobs = min(perf_cores, len(support_grid))
+    n_jobs = min(inner_n_jobs, len(support_grid))
     print(f'  > Launching parallel FP-Growth over {len(support_grid)} support '
           f'values (n_jobs={n_jobs} of {_CPU_CORES} logical / '
           f'{perf_cores} perf cores)')
@@ -1037,7 +1055,7 @@ def _write_calibration_log(
     item_supports: pd.Series,
     params: dict | None,
     auto_calibrate: bool,
-    manual_params: dict = None,
+    manual_params: dict | None = None,
 ) -> None:
     """
     Write per-k calibration artefacts:
@@ -1122,6 +1140,7 @@ def _process_one_k(
     conf_min: float, conf_max: float, conf_delta: float,
     lift_min: float, lift_max: float, lift_delta: float,
     lift_neutral_half_window: float,
+    inner_n_jobs: int = 1,
 ) -> tuple[int, pd.DataFrame | None, dict]:
     """
     Process a single k value: load data, (optionally) calibrate, run grid search.
@@ -1130,6 +1149,14 @@ def _process_one_k(
     Returns (k, summary_df_or_None, comparison_row_dict).
     Each k writes to its own k_{k}/ subdirectory so there is no shared
     mutable filesystem state between workers.
+
+    Parameters
+    ----------
+    inner_n_jobs : int
+        Number of loky workers for the inner support-level parallel loop
+        inside explore_association_rules().  Computed by run_k_comparison()
+        as max(1, perf_cores // outer_jobs) so that total worker count
+        stays within the P-core budget.
     """
     labels_csv = Path(labels_csv)
     k_dir      = output_dir / f'k_{k}'
@@ -1219,6 +1246,7 @@ def _process_one_k(
         conf_min    = k_conf_min, conf_max = conf_max,   conf_delta = conf_delta,
         lift_min    = k_lift_min, lift_max = k_lift_max, lift_delta = lift_delta,
         lift_neutral_half_window = lift_neutral_half_window,
+        inner_n_jobs             = inner_n_jobs,
     )
 
     has_rules_col = (
@@ -1297,31 +1325,51 @@ def run_k_comparison(
     comp_dir   = output_dir / 'k_comparison'
     comp_dir.mkdir(parents=True, exist_ok=True)
 
-    k_sorted = sorted(k_labels_map.keys())
+    k_sorted   = sorted(k_labels_map.keys())
     perf_cores = _get_perf_cores()
     # Outer parallelism: one worker per k value, capped at P-core count.
-    # Each worker spawns its own inner Parallel for the support grid.
     outer_jobs = min(len(k_sorted), perf_cores)
+
+    # Two-level parallelism budget for Apple Silicon (and any NUMA system):
+    #
+    #   outer_jobs  : k-level workers running concurrently.
+    #   inner_n_jobs: support-level workers each k-worker spawns.
+    #
+    # Without budget splitting, outer × inner can reach perf_cores² processes
+    # (e.g. 4 × 16 = 64 on M1 Ultra), all competing for 16 P-cores.
+    # loky serialises the encoded DataFrame into every worker; over-subscription
+    # causes quadratic memory pressure and CPU starvation rather than speedup.
+    #
+    # Setting inner_n_jobs = max(1, perf_cores // outer_jobs) ensures:
+    #   outer × inner ≤ perf_cores   (total workers ≤ available P-cores)
+    #
+    # Example: M1 Ultra, 16 P-cores, 4 k-values
+    #   outer_jobs   = min(4, 16) = 4
+    #   inner_n_jobs = max(1, 16 // 4) = 4
+    #   total workers = 4 × 4 = 16  (≤ 16 P-cores — no over-subscription)
+    inner_n_jobs = max(1, perf_cores // outer_jobs)
 
     print(f'\n{"=" * 70}')
     print(f'K-VARIATION EXPERIMENT — {len(k_labels_map)} k values')
     print(f'{"=" * 70}')
     print(f'  > k values        : {k_sorted}')
     print(f'  > auto_calibrate  : {auto_calibrate}')
-    print(f'  > outer n_jobs    : {outer_jobs} '
-          f'(k values in parallel, each spawning inner support-level workers)')
+    print(f'  > outer n_jobs    : {outer_jobs}  (k-level workers)')
+    print(f'  > inner n_jobs    : {inner_n_jobs}  (support-level workers per k, '
+          f'total ≤ {outer_jobs * inner_n_jobs} / {perf_cores} P-cores)')
     print('-' * 50)
 
     raw_results = Parallel(n_jobs=outer_jobs, backend='loky', verbose=0)(
         delayed(_process_one_k)(
-            k                    = k,
-            labels_csv           = Path(k_labels_map[k]),
-            output_dir           = output_dir,
-            auto_calibrate       = auto_calibrate,
+            k                        = k,
+            labels_csv               = Path(k_labels_map[k]),
+            output_dir               = output_dir,
+            auto_calibrate           = auto_calibrate,
             sup_min=sup_min,   sup_max=sup_max,   sup_delta=sup_delta,
             conf_min=conf_min, conf_max=conf_max, conf_delta=conf_delta,
             lift_min=lift_min, lift_max=lift_max, lift_delta=lift_delta,
-            lift_neutral_half_window=lift_neutral_half_window,
+            lift_neutral_half_window = lift_neutral_half_window,
+            inner_n_jobs             = inner_n_jobs,
         )
         for k in k_sorted
     )
