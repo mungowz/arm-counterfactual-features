@@ -1243,37 +1243,53 @@ def run_for_k_values(
     print(f'\n  > Running {n_k} k values in parallel '
           f'(pool_size={pool_size})...')
 
+    # ── Phase 1: collect all explain() results without blocking ──────────
+    # Post-processing (CSV I/O, ast.literal_eval, groupby) must NOT run
+    # inside the as_completed loop: doing so would block the main thread
+    # while other k-threads are still computing, serialising the pipeline
+    # and wasting idle P-cores.  Collect all results first, then post-process.
+    transactions_by_k: dict[int, pd.DataFrame] = {}
     with ThreadPoolExecutor(max_workers=pool_size) as pool:
         futures = {pool.submit(_run_one_k, k): k for k in k_values}
         for i, future in enumerate(as_completed(futures), start=1):
             k, transactions = future.result()
-            k_dir = output_base_dir / f'k_{k}'
-            k_dir.mkdir(parents=True, exist_ok=True)
+            transactions_by_k[k] = transactions
+            print(f'  [{i}/{n_k}] k = {k} — explain() done '
+                  f'({len(transactions):,} transactions)')
 
-            print(f'\n  [{i}/{n_k}] k = {k} completed')
+    # ── Phase 2: post-process all k results in parallel ──────────────────
+    # extract_labels_and_values + aggregate_drivers_by_sample are I/O-bound
+    # (CSV write) and CPU-light (ast.literal_eval, pandas groupby).  Running
+    # them in a thread pool keeps all cores busy while CatBoost is idle.
+    print(f'\n  > Post-processing {n_k} k results in parallel...')
 
-            if transactions.empty:
-                print('    > 0 transactions — skipping downstream steps.')
-                continue
+    def _post_process_k(k: int) -> tuple[int, Path | None]:
+        transactions = transactions_by_k[k]
+        k_dir = output_base_dir / f'k_{k}'
+        k_dir.mkdir(parents=True, exist_ok=True)
 
-            transactions_path = k_dir / 'transactions_values.csv'
-            transactions.to_csv(transactions_path, index=False)
-            print(
-                f'    > {len(transactions)} transactions saved to '
-                f'{transactions_path.name}'
-            )
+        if transactions.empty:
+            print(f'    [k={k}] 0 transactions — skipping downstream steps.')
+            return k, None
 
-            extract_labels_and_values(k_dir)
-            aggregate_drivers_by_sample(k_dir)
+        transactions_path = k_dir / 'transactions_values.csv'
+        transactions.to_csv(transactions_path, index=False)
+        print(f'    [k={k}] {len(transactions):,} transactions saved to '
+              f'{transactions_path.name}')
 
-            labels_path = k_dir / 'labels_only_unique.csv'
-            if labels_path.exists() and labels_path.stat().st_size > 0:
-                k_labels_map[k] = labels_path
-            else:
-                print(
-                    f'    - WARNING: labels_only_unique.csv is empty for k={k}, '
-                    f'skipping.'
-                )
+        extract_labels_and_values(k_dir)
+        aggregate_drivers_by_sample(k_dir)
+
+        labels_path = k_dir / 'labels_only_unique.csv'
+        if labels_path.exists() and labels_path.stat().st_size > 0:
+            return k, labels_path
+        print(f'    [k={k}] WARNING: labels_only_unique.csv is empty — skipping.')
+        return k, None
+
+    with ThreadPoolExecutor(max_workers=n_k) as pool:
+        for k, path in pool.map(_post_process_k, sorted(transactions_by_k)):
+            if path is not None:
+                k_labels_map[k] = path
 
     print(f'\n{"=" * 70}')
     print('  > All k values completed.')

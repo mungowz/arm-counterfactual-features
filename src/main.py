@@ -390,7 +390,7 @@ def run_step2(args: argparse.Namespace) -> bool:
             k_values       = args.k_values,
             perc_threshold = args.perc_threshold,
             target_col     = args.target_col,
-            metadata_cols  = args.metadata_cols or [],   # nargs='*' can yield None in edge cases
+            metadata_cols  = args.metadata_cols if args.metadata_cols is not None else [],
             base_dir       = _HERE.parent,                # results/ and data/ resolved under _HERE.parent (project root)
         )
     except Exception:
