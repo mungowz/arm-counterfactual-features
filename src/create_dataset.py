@@ -8,7 +8,7 @@ ACS codes to human-readable labels, and writes one CSV per region to disk.
 
 Pipeline position
 -----------------
-    [create_dataset.py]  →  feature_importance.py  →  macroscopic_experiment_association_rules.py
+[create_dataset.py]  →  feature_importance.py  →  macroscopic_experiment_association_rules.py
 
 The output CSVs are the sole input to feature_importance.py.  Every column
 written here (ST, YEAR, INCOME_ABOVE_THRESHOLD, …) must be consistent with
@@ -62,12 +62,11 @@ import multiprocessing as mp
 # _CATEGORICAL_WORKERS: parallelism inside apply_categorical_mappings().
 #                     8 columns in _COLUMN_MAPS; 8 processes = one per column.
 
-_CORES               = os.cpu_count() or 4
-_DOWNLOAD_WORKERS    = min(_CORES, 16)         # I/O threads — capped at 16
-_REGION_WORKERS      = 3                        # one per region
-_CPU_WORKERS         = min(_CORES - 4, 16)     # CPU processes — leave 4 E-cores free
-_CATEGORICAL_WORKERS = min(len({'COW','SCHL','MAR','RELSHIPP','SEX','RAC1P','POBP','OCCP'}),
-                            _CPU_WORKERS)       # one process per categorical column
+_CORES = os.cpu_count() or 4
+_DOWNLOAD_WORKERS = min(_CORES, 16) # I/O threads — capped at 16
+_REGION_WORKERS = 3 # one per region
+_CPU_WORKERS = min(_CORES - 4, 16) # CPU processes — leave 4 E-cores free
+_CATEGORICAL_WORKERS = min(len({'COW','SCHL','MAR','RELSHIPP','SEX','RAC1P','POBP','OCCP'}),_CPU_WORKERS) # one process per categorical column
 
 # ---------------------------------------------------------------------------
 # Geographic scope
@@ -82,9 +81,9 @@ NORTHEAST_STATES = ['CT', 'ME', 'MA', 'NH', 'RI', 'VT', 'NJ', 'NY', 'PA']
 # South: South Atlantic + East South Central + West South Central
 # (BLS definition, 16 states, excluding DC).
 SOUTH_STATES = [
-    'DE', 'FL', 'GA', 'MD', 'NC', 'SC', 'VA', 'WV',   # South Atlantic
-    'AL', 'KY', 'MS', 'TN',                             # East South Central
-    'AR', 'LA', 'OK', 'TX',                             # West South Central
+    'DE', 'FL', 'GA', 'MD', 'NC', 'SC', 'VA', 'WV', # South Atlantic
+    'AL', 'KY', 'MS', 'TN', # East South Central
+    'AR', 'LA', 'OK', 'TX', # West South Central
 ]
 
 # USA: all 50 states minus AK — used for a national-level experiment that is NOT
@@ -95,11 +94,11 @@ SOUTH_STATES = [
 # a pandas ParserError ("Expected 286 fields, saw 457").  Use the 5-Year horizon
 # if Alaska coverage is required.
 USA_STATES = [
-    'AL',       'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'FL', 'GA',
-    'HI', 'ID', 'IL', 'IN', 'IA', 'KS', 'KY', 'LA', 'ME', 'MD',
-    'MA', 'MI', 'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ',
-    'NM', 'NY', 'NC', 'ND', 'OH', 'OK', 'OR', 'PA', 'RI', 'SC',
-    'SD', 'TN', 'TX', 'UT', 'VT', 'VA', 'WA', 'WV', 'WI', 'WY'
+    'AL', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'FL', 'GA', 'HI', 
+    'ID', 'IL', 'IN', 'IA', 'KS', 'KY', 'LA', 'ME', 'MD', 'MA', 
+    'MI', 'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ', 'NM', 
+    'NY', 'NC', 'ND', 'OH', 'OK', 'OR', 'PA', 'RI', 'SC', 'SD', 
+    'TN', 'TX', 'UT', 'VT', 'VA', 'WA', 'WV', 'WI', 'WY'
 ]
 
 # ---------------------------------------------------------------------------
@@ -119,17 +118,17 @@ USA_STATES = [
 # arrives in the feature matrix already decoded.  It is therefore absent
 # from _COLUMN_MAPS (no numeric→label translation needed).
 _INCOME_FEATURES = [
-    'AGEP',     # Age — continuous; binned into 6 career-stage categories below
-    'COW',      # Class of worker (employee type, self-employed, etc.)
-    'SCHL',     # Educational attainment (24 levels from no schooling to doctorate)
-    'MAR',      # Marital status
-    'OCCP',     # Occupation code (SOC-based, ~500 codes mapped to readable labels)
-    'POBP',     # Place of birth (state or country code)
+    'AGEP', # Age — continuous; binned into 6 career-stage categories below
+    'COW', # Class of worker (employee type, self-employed, etc.)
+    'SCHL', # Educational attainment (24 levels from no schooling to doctorate)
+    'MAR', # Marital status
+    'OCCP', # Occupation code (SOC-based, ~500 codes mapped to readable labels)
+    'POBP', # Place of birth (state or country code)
     'RELSHIPP', # Relationship to household reference person
-    'WKHP',     # Usual hours worked per week — continuous; binned into 6 bands
-    'SEX',      # Sex (binary in ACS PUMS)
-    'RAC1P',    # Race (9 categories)
-    'ST',       # State of residence — injected as abbreviation, bypasses FIPS
+    'WKHP', # Usual hours worked per week — continuous; binned into 6 bands
+    'SEX', # Sex (binary in ACS PUMS)
+    'RAC1P', # Race (9 categories)
+    'ST', # State of residence — injected as abbreviation, bypasses FIPS
 ]
 
 # ---------------------------------------------------------------------------
@@ -137,16 +136,16 @@ _INCOME_FEATURES = [
 # ---------------------------------------------------------------------------
 
 # AGEP bins: right-inclusive intervals capturing the six conventional US
-# career stages.  The upper bound (200) is intentionally large to absorb
+# career stages. The upper bound (200) is intentionally large to absorb
 # any data quality outliers without triggering a NaN.
 AGEP_BINS   = [0, 24, 34, 44, 54, 64, 200]
 AGEP_LABELS = [
-    'Young',           # (0–24]  entry level / student (adult_filter ensures age ≥ 16)
-    'Young-Adult',     # (25–34] early career
-    'Mid-Career',      # (35–44] peak productivity
-    'Experienced',     # (45–54] senior contributor
-    'Late-Career',     # (55–64] approaching retirement
-    'Retirement-Age',  # (65–200] beyond standard retirement age
+    'Young', # (0–24]  entry level / student (adult_filter ensures age ≥ 16)
+    'Young-Adult', # (25–34] early career
+    'Mid-Career', # (35–44] peak productivity
+    'Experienced', # (45–54] senior contributor
+    'Late-Career', # (55–64] approaching retirement
+    'Retirement-Age', # (65–200] beyond standard retirement age
 ]
 
 # WKHP bins: the 40-hour threshold is standard for US full-time employment.
@@ -154,12 +153,12 @@ AGEP_LABELS = [
 # which is policy-relevant for benefits eligibility.
 WKHP_BINS   = [0, 19, 34, 39, 40, 49, 200]
 WKHP_LABELS = [
-    'Part-Time-Low',    #  (0–19]  hrs/wk  marginal attachment
-    'Part-Time',        # (20–34]  hrs/wk  standard part-time
-    'Near-Full-Time',   # (35–39]  hrs/wk  benefits threshold zone
-    'Full-Time',        #    [40]  hrs/wk  exact standard full-time
-    'Over-Full-Time',   # (41–49]  hrs/wk  modest overtime
-    'Extended-Hours',   # (50–200] hrs/wk  heavy overtime / multiple jobs (upper bound 200 absorbs outliers)
+    'Part-Time-Low', # (0–19] hrs/wk marginal attachment
+    'Part-Time', # (20–34] hrs/wk standard part-time
+    'Near-Full-Time', # (35–39] hrs/wk benefits threshold zone
+    'Full-Time', # [40] hrs/wk exact standard full-time
+    'Over-Full-Time', # (41–49]  hrs/wk modest overtime
+    'Extended-Hours', # (50–200] hrs/wk heavy overtime / multiple jobs (upper bound 200 absorbs outliers)
 ]
 
 # ---------------------------------------------------------------------------
@@ -178,8 +177,8 @@ COW_MAP = {
     '3': 'Local-Government-Employee',
     '4': 'State-Government-Employee',
     '5': 'Federal-Government-Employee',
-    '6': 'Self-Employed-Not-Incorporated',   # unincorporated sole proprietor
-    '7': 'Self-Employed-Incorporated',        # incorporated business owner
+    '6': 'Self-Employed-Not-Incorporated', # unincorporated sole proprietor
+    '7': 'Self-Employed-Incorporated', # incorporated business owner
     '8': 'Unpaid-Family-Worker',
     '9': 'Unemployed-5plus-Years-Or-Never-Worked',
 }
@@ -349,7 +348,7 @@ def _build_lookup(mapping: dict, fallback: str) -> np.ndarray:
     Build a fixed-size NumPy array for O(1) integer-indexed label lookup.
 
     Layout: index 0 is reserved for 'unknown/missing' (numeric code -1 maps
-    to index 0).  Index k+1 holds the label for numeric code k.
+    to index 0). Index k+1 holds the label for numeric code k.
 
     This avoids a Python dict lookup for every cell during apply_categorical_mappings,
     reducing the inner loop from O(n) dict lookups to a single NumPy fancy-index
@@ -357,14 +356,14 @@ def _build_lookup(mapping: dict, fallback: str) -> np.ndarray:
 
     Parameters
     ----------
-    mapping  : code (str) → label (str) dictionary
-    fallback : label returned for any code not in mapping
+    mapping: code (str) → label (str) dictionary
+    fallback: label returned for any code not in mapping
     """
     max_code = max(int(k) for k in mapping) if mapping else 0
     # +2: index 0 = fallback, index max_code+1 = last valid code.
     arr = np.full(max_code + 2, fill_value=fallback, dtype=object)
     for k, label in mapping.items():
-        arr[int(k) + 1] = label   # code k → slot k+1
+        arr[int(k) + 1] = label # code k → slot k+1
     return arr
 
 # Pre-build all lookup arrays at import time to avoid rebuilding them on
@@ -393,7 +392,7 @@ def _decode_column(series: pd.Series, lookup: np.ndarray) -> np.ndarray:
     Returns a NumPy object array of label strings.
     """
     codes = pd.to_numeric(series, errors='coerce').fillna(-1).to_numpy(dtype=np.int32)
-    idx   = np.clip(codes + 1, 0, len(lookup) - 1)
+    idx = np.clip(codes + 1, 0, len(lookup) - 1)
     return lookup[idx]
 
 
@@ -402,19 +401,19 @@ def _decode_column_task(args: tuple) -> tuple[str, np.ndarray]:
     Top-level picklable worker for parallel categorical decoding.
 
     ProcessPoolExecutor requires top-level functions (lambdas and closures are
-    not picklable).  Receives (col_name, series_values, lookup_array) and
+    not picklable). Receives (col_name, series_values, lookup_array) and
     returns (col_name, decoded_array) so the caller can reassemble the DataFrame.
 
     Parameters
     ----------
     args : (col, values, lookup)
-        col    – column name (str)
+        col – column name (str)
         values – raw Series values as a NumPy object array
         lookup – pre-built label lookup array from _LOOKUPS
     """
     col, values, lookup = args
     codes = pd.to_numeric(pd.Series(values), errors='coerce').fillna(-1).to_numpy(dtype=np.int32)
-    idx   = np.clip(codes + 1, 0, len(lookup) - 1)
+    idx = np.clip(codes + 1, 0, len(lookup) - 1)
     return col, lookup[idx]
 
 
@@ -474,7 +473,7 @@ def _decode_column_task(args: tuple) -> tuple[str, np.ndarray]:
     Parameters
     ----------
     args : (col, values, lookup)
-        col    – column name string
+        col – column name string
         values – column data as a NumPy object array (cheap to pickle vs Series)
         lookup – pre-built label lookup array from _LOOKUPS
 
@@ -484,7 +483,7 @@ def _decode_column_task(args: tuple) -> tuple[str, np.ndarray]:
     """
     col, values, lookup = args
     codes = pd.to_numeric(pd.Series(values), errors='coerce').fillna(-1).to_numpy(dtype=np.int32)
-    idx   = np.clip(codes + 1, 0, len(lookup) - 1)
+    idx = np.clip(codes + 1, 0, len(lookup) - 1)
     return col, lookup[idx]
 
 
@@ -495,11 +494,11 @@ def apply_categorical_mappings(df: pd.DataFrame) -> None:
     Parallelisation strategy
     ------------------------
     Each column decode is a pure function with no shared state → embarrassingly
-    parallel.  We dispatch one task per column to a ProcessPoolExecutor so that
+    parallel. We dispatch one task per column to a ProcessPoolExecutor so that
     all M1 P-cores are utilised simultaneously and the GIL is bypassed entirely.
 
     Serialisation cost is minimised by passing pre-extracted NumPy object arrays
-    (not the full DataFrame) to each worker.  Results are written back into df
+    (not the full DataFrame) to each worker. Results are written back into df
     in the main process after all workers complete.
 
     'spawn' multiprocessing context is used to avoid inheriting open file
