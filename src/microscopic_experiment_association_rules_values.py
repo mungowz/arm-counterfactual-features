@@ -19,14 +19,26 @@ For every (region, k, experiment_label) triple that already has rules.csv
 files, this script:
 
 1. Collects every label that appears in any rule (antecedent OR consequent).
-2. From transactions_values.csv it keeps only items whose label prefix
-   (the part before '=') is in that set.
+2. Keeps only (Sample_ID, CF_Neighbor_ID) pairs that contain at least one
+   item whose label prefix is in that active set.  All items of qualifying
+   pairs are retained — not just the active-label ones — so that the
+   value-level rules can involve any feature present in the counterfactual,
+   as long as at least one active-label feature is also present in the same
+   transaction.
 3. Builds two transaction formats (same as Step 2 / Step 3):
      - aggregated_values_by_sample.csv   — one row per sample (union of all
        CF-neighbour values, deduplicated)
      - values_only_unique.csv            — one row per (Sample_ID, CF_Neighbor_ID)
 4. Runs the same support × confidence × lift grid search used in Step 3,
    using the same auto-calibration logic.
+   Two filters are applied to generated rules beyond the neutral-lift window:
+     a. Items are always 'LABEL=value' strings — no bare label names.
+     b. A rule is kept only if antecedent and consequent involve *different*
+        labels (e.g. OCCP=X → SCHL=Y is kept; OCCP=X → OCCP=Y is discarded).
+        Same-label rules are semantically invalid at the value level because
+        a sample aggregated across multiple CF neighbours can appear to hold
+        two values for the same feature, but this is an artefact of the
+        aggregation, not a real co-occurrence.
 5. Writes rules.csv, rules_detailed.csv, summary.csv, heatmaps, and all
    companion artefacts under:
        results/{region}/association_rules_values/{experiment_label}/k_{k}/
@@ -387,24 +399,30 @@ def find_rules_csvs(
 # This section builds two transaction formats from that raw file:
 #
 #   1. Pair-level (values_only_unique.csv)
-#      One row per (Sample_ID, CF_Neighbor_ID).  Values are filtered to keep
-#      only items whose label prefix is in active_labels.  This mirrors the
-#      raw granularity of Step 2 output and is saved for reference, but is
-#      NOT used as input to FP-Growth (see aggregated format below).
+#      One row per (Sample_ID, CF_Neighbor_ID).  A pair is eligible if its
+#      item list contains at least one item whose label prefix belongs to
+#      active_labels.  All items in eligible rows are kept unchanged.
+#      Saved for reference; NOT used as input to FP-Growth.
 #
 #   2. Aggregated (aggregated_values_by_sample.csv)
-#      One row per Sample_ID.  Values are the deduplicated union of all
-#      filtered items across every CF neighbour of that sample.  This is the
-#      format consumed by FP-Growth: each sample is treated as a single
-#      "shopping basket" containing the set of value-level changes that appear
-#      in any of its counterfactual explanations.
+#      One row per Sample_ID.  For each sample, the items from ALL eligible
+#      (Sample_ID, CF_Neighbor_ID) pairs are unioned and deduplicated — same
+#      'LABEL=value' string never appears twice for the same sample.
+#      This is the format consumed by FP-Growth.
 #
-# Filtering rationale: restricting items to active_labels ensures that the
-# value-level rules are anchored to the label-level patterns already
-# identified by Step 3.  Items belonging to non-active labels are discarded
-# because their labels never appear in a Step 3 rule, meaning they are not
-# informative about the decision boundary co-occurrence structure we want to
-# characterise at the value level.
+# Filtering rationale: we keep a (Sample_ID, CF_Neighbor_ID) row only when
+# it contains at least one item belonging to an active label.  This ensures
+# that the FP-Growth input is anchored to the features already identified as
+# relevant by Step 3, while preserving the full item context of each eligible
+# pair so that cross-label value associations can be discovered.
+#
+# Example:
+#   active_labels = {'OCCP', 'SCHL'}
+#   row items     = ['OCCP=Software-Developers', 'WKHP=Full-Time', 'AGEP=35']
+#   → row is KEPT (contains 'OCCP=...'), all three items are retained
+#
+#   row items     = ['WKHP=Part-Time', 'AGEP=28']
+#   → row is DROPPED (no item has a label in active_labels)
 # ---------------------------------------------------------------------------
 
 def build_value_transactions(
@@ -413,8 +431,23 @@ def build_value_transactions(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Read transactions_values.csv and build pair-level and aggregated
-    transaction DataFrames, retaining only items whose label prefix belongs
-    to *active_labels*.
+    transaction DataFrames.
+
+    Row-level filtering logic
+    -------------------------
+    A (Sample_ID, CF_Neighbor_ID) pair is kept if and only if its item list
+    contains **at least one** item whose label prefix (the part before '=')
+    belongs to *active_labels*.  All items in qualifying rows are retained
+    in the transaction — not just the active-label ones — so that the
+    FP-Growth step sees the full counterfactual context and can discover
+    cross-label value associations.
+
+    Rationale: active_labels identifies which features are relevant at the
+    label level (from Step 3 rules).  We want value-level rules that involve
+    those features, but we do NOT strip other features from the itemset:
+    stripping them would destroy genuine co-occurrences and prevent the
+    discovery of rules such as OCCP=X → WKHP=Y where WKHP might not be an
+    active label itself but co-occurs reliably with one that is.
 
     Parameters
     ----------
@@ -427,33 +460,23 @@ def build_value_transactions(
                                      strings, e.g. "['OCCP=Nurse-Practitioners',
                                      'SCHL=Regular-HS-Diploma']".
     active_labels : set[str]
-        Set of label names to retain (collected from Step 3 rules.csv files).
-        Items whose label prefix (the portion before '=') is not in this set
-        are silently discarded.
+        Label names extracted from Step 3 rules (antecedents + consequents).
+        A row is eligible if it contains at least one item with a matching
+        label prefix.
 
     Returns
     -------
     agg_df : pd.DataFrame
         Aggregated transactions — one row per Sample_ID.
         Columns: Sample_ID, Values, Num_Values, Num_CF_Neighbors.
-        Values contains the sorted, deduplicated union of all filtered
-        'LABEL=value' strings across every CF neighbour of that sample.
+        Values is the sorted, deduplicated union of ALL 'LABEL=value' items
+        across every eligible CF neighbour of that sample.
         This is the DataFrame passed to encode_transactions() for FP-Growth.
     pair_df : pd.DataFrame
         Pair-level transactions — one row per (Sample_ID, CF_Neighbor_ID).
         Columns: Sample_ID, CF_Neighbor_ID, Values.
+        Contains all items (not just active-label ones) for the eligible rows.
         Saved to disk for traceability but not used directly for mining.
-
-    Filtering logic
-    ---------------
-    For each item in Counterfactual_Values:
-      1. Parse the stringified list with ast.literal_eval.
-      2. Split on the first '=' to extract the label prefix.
-      3. Keep the item only if the prefix is in active_labels.
-      4. Items that do not contain '=' (malformed) are silently dropped.
-    Rows that produce zero filtered items are excluded from both outputs,
-    so samples whose only CF changes involve non-active labels disappear
-    from the transaction set entirely.
     """
     print(f'  > Loading {transactions_values_path.name} ...')
     df = pd.read_csv(transactions_values_path)
@@ -468,44 +491,58 @@ def build_value_transactions(
 
     print(f'    {len(df):,} rows, {df["Sample_ID"].nunique():,} unique samples')
 
-    # ── Parse and filter — vectorised ────────────────────────────────
-    # Using apply() instead of iterrows() is ~10-50× faster on large DataFrames
-    # because it avoids per-row Python overhead and keeps the hot path inside
-    # pandas rather than a pure-Python loop.
-    #
-    # _filter_items: parse the stringified list and retain only items whose
-    # label prefix (before '=') is in active_labels.  Returns an empty list
-    # for malformed cells or rows with no matching items (dropped downstream).
-    def _filter_items(raw_values: str) -> list:
+    # ── Parse all items (no item-level filtering) ──────────────────────
+    # We parse every Counterfactual_Values cell into a Python list of
+    # 'LABEL=value' strings.  Malformed cells (unparseable) produce an empty
+    # list and are dropped below together with zero-item rows.
+    def _parse_items(raw_values: str) -> list:
         try:
             items = ast.literal_eval(raw_values)
         except (ValueError, SyntaxError):
             return []
-        return [
-            item for item in items
-            if '=' in str(item) and str(item).split('=', 1)[0] in active_labels
-        ]
+        # Guard against non-string elements; skip malformed items without '='.
+        return [str(item) for item in items if '=' in str(item)]
 
     df = df.copy()
-    df['_filtered'] = df['Counterfactual_Values'].apply(_filter_items)
+    df['_all_items'] = df['Counterfactual_Values'].apply(_parse_items)
 
-    # Drop rows that produced zero filtered items.
-    df = df[df['_filtered'].map(len) > 0].reset_index(drop=True)
+    # ── Row-level filter: keep rows that contain ≥1 active-label item ──
+    # A row qualifies when at least one of its items has a label prefix that
+    # belongs to active_labels.  The full item list is kept for qualifying rows.
+    def _has_active(items: list) -> bool:
+        return any(item.split('=', 1)[0] in active_labels for item in items)
+
+    qualifies  = df['_all_items'].apply(_has_active)
+    n_before   = df['Sample_ID'].nunique()
+    df         = df[qualifies].reset_index(drop=True)
+    n_after    = df['Sample_ID'].nunique()
+
+    print(
+        f'  > Row filter (≥1 active-label item): '
+        f'{len(df):,} rows retained '
+        f'({n_after:,} / {n_before:,} unique samples)'
+    )
 
     # ── Pair-level DataFrame ──────────────────────────────────────────
-    pair_df = df[['Sample_ID', 'CF_Neighbor_ID', '_filtered']].copy()
-    pair_df = pair_df.rename(columns={'_filtered': 'Values'})
+    # One row per (Sample_ID, CF_Neighbor_ID); Values contains the full
+    # (unpruned) item list for that pair.
+    pair_df = df[['Sample_ID', 'CF_Neighbor_ID', '_all_items']].copy()
+    pair_df = pair_df.rename(columns={'_all_items': 'Values'})
     pair_df['Values'] = pair_df['Values'].apply(str)
     pair_df = pair_df.reset_index(drop=True)
 
     # ── Aggregated DataFrame ──────────────────────────────────────────
-    # For each Sample_ID: union all filtered items across its CF neighbours,
-    # deduplicate, sort for deterministic output, and count unique CF IDs.
+    # For each Sample_ID: union ALL items across its eligible CF neighbours,
+    # deduplicate (frozenset), sort for determinism, count unique CF IDs.
+    # Deduplication here means we never repeat the same 'LABEL=value' string
+    # for a sample even if it appeared in multiple CF neighbours.
     agg_df = (
         df.groupby('Sample_ID', sort=False)
         .agg(
-            _items=('_filtered',
-                    lambda x: sorted({item for sublist in x for item in sublist})),
+            _items=(
+                '_all_items',
+                lambda x: sorted({item for sublist in x for item in sublist}),
+            ),
             Num_CF_Neighbors=('CF_Neighbor_ID', 'nunique'),
         )
         .reset_index()
@@ -514,12 +551,10 @@ def build_value_transactions(
     agg_df['Num_Values'] = agg_df['_items'].apply(len)
     agg_df = agg_df[['Sample_ID', 'Values', 'Num_Values', 'Num_CF_Neighbors']]
 
-    n_kept_samples = agg_df['Sample_ID'].nunique()
-    n_total        = df['Sample_ID'].nunique()
     print(
-        f'  > After filtering to active labels {sorted(active_labels)}: '
-        f'{n_kept_samples:,} / {n_total:,} samples retained, '
-        f'{len(pair_df):,} (sample, CF) pairs'
+        f'  > Aggregated: {len(agg_df):,} samples × avg '
+        f'{agg_df["Num_Values"].mean():.1f} items/sample '
+        f'(active labels used for row selection: {sorted(active_labels)})'
     )
 
     return agg_df, pair_df
@@ -777,6 +812,30 @@ def _process_one_support(
         (all_rules['lift'] < lift_window_lo) |
         (all_rules['lift'] > lift_window_hi)
     ]
+
+    if len(all_rules) == 0:
+        return local_summary_rows
+
+    # Exclude rules where antecedent and consequent share at least one label.
+    # At the value level every item is 'LABEL=value' (e.g. 'OCCP=Software-Developers').
+    # A rule like OCCP=X → OCCP=Y is semantically invalid: a single sample cannot
+    # hold two distinct values for the same feature simultaneously, so such rules
+    # arise from the aggregation step (union over multiple CF neighbours) rather
+    # than genuine co-occurrence.  Only rules that cross label boundaries
+    # (e.g. OCCP=X → SCHL=Y) reflect meaningful feature interactions.
+    def _labels(itemset: frozenset) -> set:
+        return {item.split('=', 1)[0] for item in itemset if '=' in str(item)}
+
+    cross_label_mask = all_rules.apply(
+        lambda row: len(_labels(row['antecedents']) & _labels(row['consequents'])) == 0,
+        axis=1,
+    )
+    n_same_label = (~cross_label_mask).sum()
+    all_rules = all_rules[cross_label_mask].reset_index(drop=True)
+    if n_same_label > 0:
+        print(f'    > {n_same_label} same-label rule(s) discarded '
+              f'(antecedent and consequent share a label prefix)')
+
     all_rules = all_rules.sort_values('lift', ascending=False).reset_index(drop=True)
 
     if len(all_rules) == 0:
