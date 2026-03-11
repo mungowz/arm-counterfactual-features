@@ -206,21 +206,13 @@ def extract_labels(labels_only_path: Path) -> pd.DataFrame:
     # TransactionEncoder converts a list-of-lists into a Boolean matrix
     # suitable for mlxtend's fpgrowth().  Each column is one item (feature name);
     # each row is one transaction (True = item present in that transaction).
-    # sparse=True avoids allocating a dense n_transactions × n_items matrix when
-    # the number of unique labels is large relative to the average transaction length.
+    # dtype=bool is required by mlxtend: float/sparse inputs trigger
+    # DeprecationWarning ("non-bool types result in worse computational
+    # performance") and cause AttributeError on SparseArray.round() and
+    # TypeError on numpy.bool_.__round__ in downstream arithmetic.
     te     = TransactionEncoder()
-    te_ary = te.fit(itemsets).transform(itemsets, sparse=True)
-    # Cast to float32 sparse immediately after construction.
-    # Without this, the sparse dtype carries a bool fill_value which:
-    #   (a) triggers FutureWarning in pandas >= 1.5 ("arbitrary scalar fill_value
-    #       in SparseDtype is deprecated")
-    #   (b) causes numpy.bool_ values from .mean(), breaking round() calls
-    #       downstream with "numpy.bool doesn't define __round__"
-    # float32 preserves the memory benefit of the sparse layout while giving
-    # fpgrowth and all arithmetic a well-behaved numeric dtype.
-    enc_df = pd.DataFrame.sparse.from_spmatrix(te_ary, columns=te.columns_).astype(
-        pd.SparseDtype('float32', fill_value=0.0)
-    )
+    te_ary = te.fit(itemsets).transform(itemsets)
+    enc_df = pd.DataFrame(te_ary, columns=te.columns_)
 
     print('  > First few encoded rows:')
     print(enc_df.head())
