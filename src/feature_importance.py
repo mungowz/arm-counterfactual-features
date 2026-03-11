@@ -743,22 +743,45 @@ class CategoricalBoCSoR:
             prefix = self.feature_names[f_idx] + '='
             driver_strs[mask] = np.char.add(prefix, cats[driver_cf_val[mask]])
 
-        # ── (f) Vectorized grouping via pandas ────────────────────────
-        df_drv = pd.DataFrame({
-            'b_idx':      driver_b.astype(np.int32),
-            'cf_gidx':    driver_cf_idx.astype(np.int32),
-            'driver_str': driver_strs,
-        })
-        grouped_drv = (
-            df_drv.groupby(['b_idx', 'cf_gidx'], sort=False)['driver_str']
-            .agg(lambda s: sorted(s))
-            .reset_index()
-        )
+        # ── (f) Group drivers by (b_idx, cf_gidx) ────────────────────
+        # Build a structured key array for sorting, then use np.unique to
+        # find group boundaries — avoids the pandas groupby overhead of
+        # constructing a lambda and calling sorted() on each group
+        # separately (which becomes expensive with millions of driver rows).
+        #
+        # Encoding: pack (b_idx, cf_gidx) into a single int64 key so that
+        # np.unique operates on a 1-D array (much faster than sorting a
+        # structured array or a DataFrame).
+        # Both arrays are int32 (max value ~ 2^31); shift b_idx left by 32
+        # bits so the composite key is unique for any valid pair.
+        # Mask the lower 32 bits of cf_idx before OR-ing to prevent
+        # sign-extension of large positive int32 values corrupting the key.
+        keys = (driver_b.astype(np.int64) << 32) | (driver_cf_idx.astype(np.int64) & 0xFFFF_FFFF)
+        sort_order  = np.argsort(keys, kind='stable')
+        keys_sorted = keys[sort_order]
+        strs_sorted = driver_strs[sort_order]
+        b_sorted    = driver_b[sort_order]
+        cf_sorted   = driver_cf_idx[sort_order]
+
+        # np.unique returns the index of the first occurrence of each key —
+        # use those as group boundaries.
+        _, first_occurrence = np.unique(keys_sorted, return_index=True)
+        group_starts = first_occurrence
+        group_ends   = np.append(first_occurrence[1:], len(keys_sorted))
+
+        n_groups      = len(group_starts)
+        out_b_idx     = b_sorted[group_starts]
+        out_cf_gidx   = cf_sorted[group_starts]
+        out_strs      = np.empty(n_groups, dtype=object)
+        for g, (gs, ge) in enumerate(zip(group_starts, group_ends)):
+            # Items within each group are already in key-sort order;
+            # sort only the string slice (≤ 11 items — essentially free).
+            out_strs[g] = sorted(strs_sorted[gs:ge])
 
         return (
-            boundary_idx[grouped_drv['b_idx'].values],
-            grouped_drv['cf_gidx'].values,
-            grouped_drv['driver_str'].values,
+            boundary_idx[out_b_idx],
+            out_cf_gidx,
+            out_strs,
         )
 
     # ------------------------------------------------------------------
@@ -865,7 +888,7 @@ class CategoricalBoCSoR:
 # Post-processing helpers
 # ---------------------------------------------------------------------------
 
-def extract_labels_and_values(results_dir: Path) -> None:
+def extract_labels_and_values(results_dir: Path, parse_workers: int = None) -> None:
     """
     Parse transactions_values.csv and write four derived CSV files used by
     the association-rule mining step.
@@ -957,46 +980,60 @@ def extract_labels_and_values(results_dir: Path) -> None:
                 uv.append(val)
         return ul, uv
 
-    # ── Parallel parse over chunks ────────────────────────────────────
-    # Split the column into N_PHYSICAL_CORES chunks, parse each chunk in a
-    # thread.  For large files (> 50 K rows) this is measurably faster than
-    # a single-threaded apply().
+    # ── Parallel parse + dedup over chunks ───────────────────────────
+    # Each chunk thread parses AND deduplicates its slice so that the main
+    # thread only needs to concatenate flat lists — zero serial Python loops
+    # over individual rows after the pool returns.
+    # For large files (> 50 K rows) this is measurably faster than a
+    # single-threaded apply() for both parse and dedup.
     cells = df['Counterfactual_Values'].tolist()
-    n_workers = min(N_PHYSICAL_CORES, len(cells))
+    n_workers  = min(parse_workers or N_PHYSICAL_CORES, len(cells))
     chunk_size = max(1, len(cells) // n_workers)
     chunks = [cells[i : i + chunk_size] for i in range(0, len(cells), chunk_size)]
 
-    def _parse_chunk(chunk):
-        return [_parse_items(c) for c in chunk]
+    def _parse_and_dedup_chunk(chunk):
+        """Parse and deduplicate every cell in one chunk — runs in a thread."""
+        labels_raw, values_raw, labels_uniq, values_uniq = [], [], [], []
+        for c in chunk:
+            lbl, val = _parse_items(c)
+            ul, uv   = _dedup_pairs(lbl, val)
+            labels_raw.append(lbl);  values_raw.append(val)
+            labels_uniq.append(ul);  values_uniq.append(uv)
+        return labels_raw, values_raw, labels_uniq, values_uniq
 
-    parsed_flat: list = []
+    labels_list        = []
+    values_list        = []
+    labels_unique_list = []
+    values_unique_list = []
+
     with ThreadPoolExecutor(max_workers=n_workers) as pool:
-        for chunk_result in pool.map(_parse_chunk, chunks):
-            parsed_flat.extend(chunk_result)
-
-    labels_list = [t[0] for t in parsed_flat]
-    values_list = [t[1] for t in parsed_flat]
-
-    deduped              = [_dedup_pairs(l, v) for l, v in zip(labels_list, values_list)]
-    labels_unique_list   = [d[0] for d in deduped]
-    values_unique_list   = [d[1] for d in deduped]
+        for lr, vr, lu, vu in pool.map(_parse_and_dedup_chunk, chunks):
+            labels_list.extend(lr);        values_list.extend(vr)
+            labels_unique_list.extend(lu); values_unique_list.extend(vu)
 
     base_data = {col: df[col] for col in base_cols}
 
-    # Write all four output files.
-    for filename, col_name, data in [
-        ('labels_only.csv',        'Labels', labels_list),
-        ('labels_only_unique.csv', 'Labels', labels_unique_list),
-        ('values_only.csv',        'Values', values_list),
-        ('values_only_unique.csv', 'Values', values_unique_list),
-    ]:
+    # ── Write all four output files in parallel ───────────────────────
+    # Each to_csv() is an independent I/O operation; running them
+    # concurrently halves wall-clock time on large files.
+    def _write_csv(args):
+        filename, col_name, data = args
         pd.DataFrame({**base_data, col_name: data}).to_csv(
             results_dir / filename, index=False
         )
         print(f'    - saved {filename}')
 
+    write_tasks = [
+        ('labels_only.csv',        'Labels', labels_list),
+        ('labels_only_unique.csv', 'Labels', labels_unique_list),
+        ('values_only.csv',        'Values', values_list),
+        ('values_only_unique.csv', 'Values', values_unique_list),
+    ]
+    with ThreadPoolExecutor(max_workers=len(write_tasks)) as pool:
+        list(pool.map(_write_csv, write_tasks))
 
-def aggregate_drivers_by_sample(results_dir: Path) -> None:
+
+def aggregate_drivers_by_sample(results_dir: Path, parse_workers: int = None) -> None:
     """
     Collapse all (sample, CF-neighbour) rows into one transaction per sample
     and write two aggregated CSV files used as the primary FP-Growth input.
@@ -1041,7 +1078,6 @@ def aggregate_drivers_by_sample(results_dir: Path) -> None:
         print('    - WARNING: labels file is empty, skipping.')
         return
 
-    # Parse stringified lists back to Python lists.
     # Guard against malformed cells: a single bad cell would otherwise crash
     # the entire aggregation step with an unhandled ValueError/SyntaxError.
     def _safe_literal_eval(cell):
@@ -1049,7 +1085,25 @@ def aggregate_drivers_by_sample(results_dir: Path) -> None:
             return ast.literal_eval(str(cell))
         except (ValueError, SyntaxError):
             return []
-    df['Labels'] = df['Labels'].apply(_safe_literal_eval)
+
+    # ── Parallel parse of stringified lists ──────────────────────────
+    # df['Labels'].apply(_safe_literal_eval) is a serial Python loop —
+    # on a large labels_only.csv (100 K+ rows) this is the dominant cost
+    # of aggregate_drivers_by_sample().  Chunking over N_PHYSICAL_CORES
+    # threads parallelises the ast.literal_eval work across P-cores.
+    cells      = df['Labels'].tolist()
+    n_workers  = min(parse_workers or N_PHYSICAL_CORES, len(cells))
+    chunk_size = max(1, len(cells) // n_workers)
+    chunks     = [cells[i : i + chunk_size] for i in range(0, len(cells), chunk_size)]
+
+    def _parse_labels_chunk(chunk):
+        return [_safe_literal_eval(c) for c in chunk]
+
+    parsed: list = []
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        for chunk_result in pool.map(_parse_labels_chunk, chunks):
+            parsed.extend(chunk_result)
+    df['Labels'] = parsed
 
     # ── Single-pass aggregation — 1 groupby instead of 3 ─────────────
     def _agg_one_sample(series: pd.Series) -> tuple:
@@ -1084,8 +1138,13 @@ def aggregate_drivers_by_sample(results_dir: Path) -> None:
         'Num_CF_Neighbors': n_cf_vals,
     })
 
-    unique_df.to_csv(out_unique, index=False)
-    dupl_df.to_csv(out_dupl,    index=False)
+    # ── Write both output files in parallel ───────────────────────────
+    def _write_agg(args):
+        frame, path = args
+        frame.to_csv(path, index=False)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(_write_agg, [(unique_df, out_unique), (dupl_df, out_dupl)]))
 
     n_samples = len(unique_df)
     print(
@@ -1261,7 +1320,15 @@ def run_for_k_values(
     # extract_labels_and_values + aggregate_drivers_by_sample are I/O-bound
     # (CSV write) and CPU-light (ast.literal_eval, pandas groupby).  Running
     # them in a thread pool keeps all cores busy while CatBoost is idle.
-    print(f'\n  > Post-processing {n_k} k results in parallel...')
+    #
+    # Over-subscription guard: each _post_process_k thread spawns its own
+    # internal ThreadPoolExecutors (for parse + CSV write).  With n_k threads
+    # running simultaneously we cap each inner pool at
+    # max(1, N_PHYSICAL_CORES // n_k) workers so the total thread count stays
+    # within the physical core budget and avoids context-switch overhead.
+    inner_workers = max(1, N_PHYSICAL_CORES // n_k)
+    print(f'\n  > Post-processing {n_k} k results in parallel '
+          f'(inner_workers per k: {inner_workers})...')
 
     def _post_process_k(k: int) -> tuple[int, Path | None]:
         transactions = transactions_by_k[k]
@@ -1277,8 +1344,8 @@ def run_for_k_values(
         print(f'    [k={k}] {len(transactions):,} transactions saved to '
               f'{transactions_path.name}')
 
-        extract_labels_and_values(k_dir)
-        aggregate_drivers_by_sample(k_dir)
+        extract_labels_and_values(k_dir, parse_workers=inner_workers)
+        aggregate_drivers_by_sample(k_dir, parse_workers=inner_workers)
 
         labels_path = k_dir / 'labels_only_unique.csv'
         if labels_path.exists() and labels_path.stat().st_size > 0:
