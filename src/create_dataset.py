@@ -87,10 +87,15 @@ SOUTH_STATES = [
     'AR', 'LA', 'OK', 'TX',                             # West South Central
 ]
 
-# USA: all 50 states — used for a national-level experiment that is NOT
+# USA: all 50 states minus AK — used for a national-level experiment that is NOT
 # undersampled (see sampling note in main() docstring).
+# AK (Alaska) is excluded: ACS 1-Year estimates are only published for geographic
+# areas with population ≥ 65,000.  Alaska does not meet this threshold for the
+# 1-Year survey, so folktables returns a malformed/placeholder CSV that causes
+# a pandas ParserError ("Expected 286 fields, saw 457").  Use the 5-Year horizon
+# if Alaska coverage is required.
 USA_STATES = [
-    'AL', 'AK', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'FL', 'GA',
+    'AL',       'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'FL', 'GA',
     'HI', 'ID', 'IL', 'IN', 'IA', 'KS', 'KY', 'LA', 'ME', 'MD',
     'MA', 'MI', 'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ',
     'NM', 'NY', 'NC', 'ND', 'OH', 'OK', 'OR', 'PA', 'RI', 'SC',
