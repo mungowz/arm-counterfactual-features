@@ -42,14 +42,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ---------------------------------------------------------------------------
 
 # _CORES: logical CPU count, used as the basis for the per-region thread pool.
-# _DOWNLOAD_WORKERS: cap at 16 to avoid overwhelming the ACS server with
-#     concurrent HTTP requests while still saturating bandwidth on fast
-#     connections.  Downloads are I/O-bound, so more threads help up to the
-#     point of server-side rate limiting.
+# _DOWNLOAD_WORKERS: cap at 24 to take advantage of Apple Silicon's high
+#     memory bandwidth while avoiding ACS server-side rate limiting.
+#     Downloads are I/O-bound, so more threads help up to the point of
+#     server-side throttling.  24 is a safe ceiling for most connections.
 # _REGION_WORKERS: at most 3 because there are only 3 possible regions; no
 #     benefit from a larger pool.
 _CORES            = os.cpu_count() or 4
-_DOWNLOAD_WORKERS = min(_CORES * 2, 16)
+_DOWNLOAD_WORKERS = min(_CORES * 2, 24)
 _REGION_WORKERS   = 3
 
 # ---------------------------------------------------------------------------
@@ -119,12 +119,12 @@ _INCOME_FEATURES = [
 # any data quality outliers without triggering a NaN.
 AGEP_BINS   = [0, 24, 34, 44, 54, 64, 200]
 AGEP_LABELS = [
-    'Young',           # 16–24  entry level / student
-    'Young-Adult',     # 25–34  early career
-    'Mid-Career',      # 35–44  peak productivity
-    'Experienced',     # 45–54  senior contributor
-    'Late-Career',     # 55–64  approaching retirement
-    'Retirement-Age',  # 65+    beyond standard retirement age
+    'Young',           # (0–24]  entry level / student (adult_filter ensures age ≥ 16)
+    'Young-Adult',     # (25–34] early career
+    'Mid-Career',      # (35–44] peak productivity
+    'Experienced',     # (45–54] senior contributor
+    'Late-Career',     # (55–64] approaching retirement
+    'Retirement-Age',  # (65–200] beyond standard retirement age
 ]
 
 # WKHP bins: the 40-hour threshold is standard for US full-time employment.
@@ -132,12 +132,12 @@ AGEP_LABELS = [
 # which is policy-relevant for benefits eligibility.
 WKHP_BINS   = [0, 19, 34, 39, 40, 49, 200]
 WKHP_LABELS = [
-    'Part-Time-Low',    #  1–19 hrs/wk  marginal attachment
-    'Part-Time',        # 20–34 hrs/wk  standard part-time
-    'Near-Full-Time',   # 35–39 hrs/wk  benefits threshold zone
-    'Full-Time',        # 40    hrs/wk  exact standard full-time
-    'Over-Full-Time',   # 41–49 hrs/wk  modest overtime
-    'Extended-Hours',   # 50–99 hrs/wk  heavy overtime / multiple jobs
+    'Part-Time-Low',    #  (0–19]  hrs/wk  marginal attachment
+    'Part-Time',        # (20–34]  hrs/wk  standard part-time
+    'Near-Full-Time',   # (35–39]  hrs/wk  benefits threshold zone
+    'Full-Time',        #    [40]  hrs/wk  exact standard full-time
+    'Over-Full-Time',   # (41–49]  hrs/wk  modest overtime
+    'Extended-Hours',   # (50–200] hrs/wk  heavy overtime / multiple jobs (upper bound 200 absorbs outliers)
 ]
 
 # ---------------------------------------------------------------------------
@@ -243,7 +243,8 @@ OCCP_MAP = {
     # ACS OCCP variable: Occupation (SOC-based codes).
     # Covers ~80 of the most common codes; anything not listed maps to
     # 'Other-Occupation' via _COLUMN_FALLBACKS.
-    '0': 'Not-In-Labor-Force-Or-Under-16', '10': 'Chief-Executives',
+    '0':  'Not-In-Labor-Force-Or-Under-16',  # NOTE: adult_filter keeps these rows; exclude downstream if needed
+    '10': 'Chief-Executives',
     '20': 'General-Operations-Managers', '120': 'Financial-Managers',
     '136': 'HR-Managers', '220': 'Advertising-And-Marketing-Managers',
     '300': 'Purchasing-Managers', '310': 'Transportation-Managers',
@@ -413,8 +414,10 @@ def _make_income_task(threshold: int) -> folktables.BasicProblem:
         target_transform = lambda x: x > threshold,      # binary: above threshold?
         group            = 'RAC1P',                      # fairness group (not used as feature)
         preprocess       = folktables.adult_filter,       # keep 16–90, PINCP > 100
-        # np.where(pd.isna) handles both numeric and string columns correctly.
-        postprocess      = lambda x: np.where(pd.isna(x), -1, x),
+        # np.where(pd.isna) handles numeric columns correctly.
+        # String columns like ST are never NaN in normal usage, but we guard
+        # explicitly: replacing a string with -1 would silently corrupt the column.
+        postprocess      = lambda x: np.where(pd.isna(x) & ~x.apply(lambda v: isinstance(v, str)), -1, x),
     )
 
 # ---------------------------------------------------------------------------
@@ -591,6 +594,7 @@ def build_dataset(
             pd.to_numeric(features_df['AGEP'], errors='coerce'),
             bins=AGEP_BINS, labels=AGEP_LABELS, right=True,
         ))
+        features_df['AGEP'] = features_df['AGEP'].cat.add_categories('Unknown').fillna('Unknown')
 
     # Bin continuous hours/week into work-intensity categories.
     if 'WKHP' in features_df.columns:
@@ -598,6 +602,7 @@ def build_dataset(
             pd.to_numeric(features_df['WKHP'], errors='coerce'),
             bins=WKHP_BINS, labels=WKHP_LABELS, right=True,
         ))
+        features_df['WKHP'] = features_df['WKHP'].cat.add_categories('Unknown').fillna('Unknown')
 
     pos_pct = features_df['INCOME_ABOVE_THRESHOLD'].mean() * 100
     print(
@@ -644,7 +649,10 @@ def undersample_to(df: pd.DataFrame, n: int, seed: int) -> pd.DataFrame:
     per_class = [max(1, round(len(g) / len(df) * n)) for g in groups]
 
     # Correct for rounding errors so the total is exactly n.
-    per_class[0] += n - sum(per_class)
+    # Apply remainder to the largest group to avoid accidentally shrinking
+    # a minority class — do not assume class 0 is always the majority.
+    largest_idx = max(range(len(groups)), key=lambda i: len(groups[i]))
+    per_class[largest_idx] += n - sum(per_class)
 
     # Sample each class independently then shuffle the combined result.
     sampled = pd.concat(
@@ -658,14 +666,14 @@ def undersample_to(df: pd.DataFrame, n: int, seed: int) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def main(
-    survey_year: str                 = '2024',
-    horizon: str                     = '1-Year',
-    random_seed: int                 = 42,
-    output_dir: str                  = 'data',
-    income_threshold_northeast: int  = 110_000,
-    income_threshold_south: int      = 90_000,
-    income_threshold_usa: int        = 100_000,
-    regions_to_build: list[str]      = None,
+    survey_year: str                      = '2024',
+    horizon: str                          = '1-Year',
+    random_seed: int                      = 42,
+    output_dir: str                       = 'data',
+    income_threshold_northeast: int       = 110_000,
+    income_threshold_south: int           = 90_000,
+    income_threshold_usa: int             = 100_000,
+    regions_to_build: list[str] | None    = None,
 ) -> None:
     """
     Download ACS data for the specified regions, build processed datasets,
@@ -744,8 +752,9 @@ def main(
 
     print('\n  > Saving datasets...')
 
-    # Write all CSVs in parallel (up to 4 writers) to overlap disk I/O.
-    with ThreadPoolExecutor(max_workers=min(len(datasets), 4)) as pool:
+    # Write all CSVs in parallel (up to _REGION_WORKERS writers) to overlap disk I/O.
+    # M1 Ultra's NVMe controller handles multiple concurrent writes efficiently.
+    with ThreadPoolExecutor(max_workers=min(len(datasets), _REGION_WORKERS)) as pool:
         write_futs = []
         for reg, df in datasets.items():
 

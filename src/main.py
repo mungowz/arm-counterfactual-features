@@ -121,6 +121,7 @@ def _load_module(path: Path, name: str):
     """
     spec   = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module   # register before exec so relative imports and re-use work correctly
     spec.loader.exec_module(module)
     return module
 
@@ -203,6 +204,7 @@ def _inputs_step2_exist(
 
     Returns True only if every region's CSV exists.
     """
+    # Resolve path consistently with run_step2 (Path(args.output_dir) — no CWD magic).
     data_dir = Path(output_dir)
     ok = True
     for region in regions:
@@ -211,6 +213,28 @@ def _inputs_step2_exist(
             print(f'  [WARNING] Missing input for Step 2: {p}')
             ok = False
     return ok
+
+
+def _outputs_step3_exist(regions: list[str], k_values: list[int]) -> bool:
+    """
+    Return True if all expected Step 3 output rule CSVs exist for every
+    (region, k) combination.
+
+    NOTE: Step 3 currently has no skip logic — ARM is fast enough that
+    re-running is not a burden.  This function is provided for symmetry
+    with the other output-check helpers and to make adding a future
+    --skip-arm flag straightforward without restructuring run_step3().
+
+    The sentinel file checked is association_rules.csv inside each k_{k}/
+    subdirectory under results/<region>/association_rules/.
+    """
+    results_dir = _HERE.parent / 'results'
+    for region in regions:
+        for k in k_values:
+            p = results_dir / region / 'association_rules' / f'k_{k}' / 'association_rules.csv'
+            if not p.exists():
+                return False
+    return True
 
 
 def _inputs_step3_exist(regions: list[str], k_values: list[int]) -> bool:
@@ -519,6 +543,8 @@ def _parse_args() -> argparse.Namespace:
             'Columns excluded from feature matrix X in Step 2 '
             '(data-provenance columns, not predictive features). '
             'Default: YEAR. '
+            'Note: ST (state) is intentionally kept as a feature by default; '
+            'add --metadata-cols YEAR ST to exclude it too. '
             'Pass --metadata-cols with no arguments to exclude nothing.'
         ),
     )
@@ -586,6 +612,11 @@ def main() -> None:
     """
     args = _parse_args()
 
+    # Ensure the script's own directory is on sys.path so that step modules
+    # can import sibling modules (e.g. 'from utils import ...') without error.
+    if str(_HERE) not in sys.path:
+        sys.path.insert(0, str(_HERE))
+
     # ── Configuration banner ──────────────────────────────────────────
     # Print only the thresholds for the regions the user actually selected
     # to avoid showing irrelevant defaults in the output.
@@ -610,18 +641,20 @@ def main() -> None:
     print(f'  Dry-run                      : {args.dry_run}')
     print(f'  Script directory (src/)      : {_HERE}')
 
-    # Verify all source files exist before doing any work.
-    if not _check_source_files():
-        print('\n  [ERROR] One or more source files are missing. Aborting.')
-        sys.exit(1)
-
     # ── Dry-run mode: print plan and exit ─────────────────────────────
+    # Source file check is intentionally skipped here: dry-run only prints
+    # the execution plan and should not fail due to missing scripts.
     if args.dry_run:
         _banner('DRY RUN — no commands will be executed', char='-')
         for step in sorted(args.steps):
             print(f'  [Step {step}] {_STEP_NAMES[step]}  →  {_SRC[step].name}')
         print()
         return
+
+    # Verify all source files exist before doing any work.
+    if not _check_source_files():
+        print('\n  [ERROR] One or more source files are missing. Aborting.')
+        sys.exit(1)
 
     # ── Execute selected steps in order ───────────────────────────────
     _RUNNERS = {1: run_step1, 2: run_step2, 3: run_step3}
