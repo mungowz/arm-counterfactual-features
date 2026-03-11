@@ -206,9 +206,11 @@ def extract_labels(labels_only_path: Path) -> pd.DataFrame:
     # TransactionEncoder converts a list-of-lists into a Boolean matrix
     # suitable for mlxtend's fpgrowth().  Each column is one item (feature name);
     # each row is one transaction (True = item present in that transaction).
+    # sparse=True avoids allocating a dense n_transactions × n_items matrix when
+    # the number of unique labels is large relative to the average transaction length.
     te     = TransactionEncoder()
-    te_ary = te.fit(itemsets).transform(itemsets)
-    enc_df = pd.DataFrame(te_ary, columns=te.columns_)
+    te_ary = te.fit(itemsets).transform(itemsets, sparse=True)
+    enc_df = pd.DataFrame.sparse.from_spmatrix(te_ary, columns=te.columns_)
 
     print('  > First few encoded rows:')
     print(enc_df.head())
@@ -238,12 +240,16 @@ def cleanup_empty_folders(output_dir: Path) -> tuple[int, int]:
         for conf_dir in sorted(sup_dir.glob('conf_*')):
             if not conf_dir.is_dir():
                 continue
-            rules_csv    = conf_dir / 'rules.csv'
+            rules_csv     = conf_dir / 'rules.csv'
             should_remove = not rules_csv.exists()
             if not should_remove:
+                # A rules.csv that contains only the header row is effectively
+                # empty.  The header alone is < 120 bytes; a file with at least
+                # one data row is always larger.  Using st_size avoids the cost
+                # of reading and parsing the CSV inside a hot cleanup loop.
                 try:
-                    should_remove = pd.read_csv(rules_csv).empty
-                except Exception:
+                    should_remove = rules_csv.stat().st_size < 120
+                except OSError:
                     should_remove = True
             if should_remove:
                 shutil.rmtree(conf_dir)
@@ -296,7 +302,9 @@ def grid_search_fpgrowth_delta(
 
     for min_sup in support_grid:
         # FP-Growth: mine all frequent itemsets at this support threshold.
-        frequent_itemsets = fpgrowth(df, min_support=min_sup, use_colnames=True)
+        # max_len=4 prunes the search space: association rules with antecedent +
+        # consequent length > 4 are rarely actionable and exponentially costly.
+        frequent_itemsets = fpgrowth(df, min_support=min_sup, use_colnames=True, max_len=4)
         if len(frequent_itemsets) == 0:
             continue
 
@@ -362,6 +370,95 @@ def grid_search_fpgrowth_delta(
 # Heatmaps
 # ---------------------------------------------------------------------------
 
+def _render_heatmap(
+    pivot: 'pd.DataFrame',
+    x_label: str,
+    y_label: str,
+    title: str,
+    output_path: Path,
+    neutral_lo: float,
+    neutral_hi: float,
+    x_is_lift: bool,
+    row_fmt: str = '{v:.2f}',
+    row_height: float = 0.55,
+) -> None:
+    """
+    Render a single pivot-table heatmap and save it to *output_path*.
+
+    This is the single implementation shared by plot_heatmaps() (per-k grids)
+    and run_k_comparison() (cross-k grids).  Previously both functions contained
+    ~70 lines of near-identical matplotlib code; any visual change needed to be
+    applied twice.  Extracting this helper eliminates the duplication.
+
+    Parameters
+    ----------
+    pivot      : pre-built pivot table (rows = y-axis, columns = x-axis).
+    x_label    : axis label for the x dimension.
+    y_label    : axis label for the y dimension.
+    title      : figure title (two-line string is fine).
+    output_path: full path including filename for the saved PNG.
+    neutral_lo / neutral_hi : neutral lift window boundaries; used to mask
+                 x-axis columns when x_is_lift=True.
+    x_is_lift  : if True, mask the neutral window from the x-axis columns
+                 and trim trailing all-zero columns.
+    row_fmt    : format string for y-axis tick labels (e.g. '{v:.2f}' or 'k={v}').
+    row_height : inches per row for figsize scaling (use 0.55 for param grids,
+                 0.60 for k-comparison grids).
+    """
+    if x_is_lift:
+        pivot = pivot.loc[
+            :, ~pivot.columns.to_series().between(
+                neutral_lo, neutral_hi, inclusive='both'
+            )
+        ]
+        if (pivot != 0).any(axis=0).any():
+            last_nz = int(np.where((pivot != 0).any(axis=0).values)[0].max())
+            pivot   = pivot.iloc[:, :last_nz + 1]
+
+    n_cols = len(pivot.columns)
+    n_rows = len(pivot.index)
+    fig, ax = plt.subplots(
+        figsize=(max(10, n_cols * 0.75), max(4, n_rows * row_height))
+    )
+
+    img = ax.imshow(
+        pivot.values, aspect='auto', cmap='YlOrBr', interpolation='nearest'
+    )
+
+    ax.set_xticks(range(n_cols))
+    ax.set_xticklabels(
+        [f'{v:.2f}' if isinstance(v, float) else str(v) for v in pivot.columns],
+        rotation=40, ha='right', fontsize=8,
+    )
+    ax.set_yticks(range(n_rows))
+    ax.set_yticklabels(
+        [row_fmt.format(v=v) for v in pivot.index], fontsize=8
+    )
+
+    ax.set_xlabel(x_label, fontsize=11, labelpad=8)
+    ax.set_ylabel(y_label, fontsize=11, labelpad=8)
+    ax.set_title(title, fontsize=11, pad=14)
+
+    max_val = pivot.values.max() if pivot.values.max() > 0 else 1
+    for ri in range(n_rows):
+        for ci in range(n_cols):
+            val = pivot.values[ri, ci]
+            if val > 0:
+                txt_color = 'white' if (val / max_val) > 0.55 else 'black'
+                ax.text(
+                    ci, ri, str(val),
+                    ha='center', va='center', fontsize=7, color=txt_color,
+                )
+
+    cbar = plt.colorbar(img, ax=ax, fraction=0.025, pad=0.02)
+    cbar.set_label('Number of Rules', fontsize=9)
+    plt.tight_layout()
+
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
+
 def plot_heatmaps(
     summary_df: pd.DataFrame,
     output_dir: Path,
@@ -416,64 +513,22 @@ def plot_heatmaps(
             .fillna(0)
             .astype(int)
         )
-
-        if x_is_lift:
-            # Mask neutral window; negative-correlation columns survive.
-            pivot = pivot.loc[
-                :, ~pivot.columns.to_series().between(
-                    neutral_lo, neutral_hi, inclusive='both'
-                )
-            ]
-            if (pivot != 0).any(axis=0).any():
-                last_nz = int(np.where((pivot != 0).any(axis=0).values)[0].max())
-                pivot   = pivot.iloc[:, :last_nz + 1]
-
-        n_cols = len(pivot.columns)
-        n_rows = len(pivot.index)
-        fig, ax = plt.subplots(
-            figsize=(max(10, n_cols * 0.75), max(4, n_rows * 0.55))
-        )
-
-        img = ax.imshow(
-            pivot.values, aspect='auto', cmap='YlOrBr', interpolation='nearest'
-        )
-
-        ax.set_xticks(range(n_cols))
-        ax.set_xticklabels(
-            [f'{v:.2f}' if isinstance(v, float) else str(v) for v in pivot.columns],
-            rotation=40, ha='right', fontsize=8,
-        )
-        ax.set_yticks(range(n_rows))
-        ax.set_yticklabels([f'{v:.2f}' for v in pivot.index], fontsize=8)
-
         x_label = 'Lift' if x_is_lift else x_col
-        ax.set_xlabel(x_label, fontsize=11, labelpad=8)
-        ax.set_ylabel(y_col,   fontsize=11, labelpad=8)
-        ax.set_title(
-            f'Max Number of Rules — {y_col} vs {x_label}\n'
-            f'(darker = more rules; max over the third parameter)',
-            fontsize=11, pad=14,
+        _render_heatmap(
+            pivot       = pivot,
+            x_label     = x_label,
+            y_label     = y_col,
+            title       = (
+                f'Max Number of Rules — {y_col} vs {x_label}\n'
+                f'(darker = more rules; max over the third parameter)'
+            ),
+            output_path = heatmap_dir / f'heatmap_{suffix}.png',
+            neutral_lo  = neutral_lo,
+            neutral_hi  = neutral_hi,
+            x_is_lift   = x_is_lift,
+            row_fmt     = '{v:.2f}',
+            row_height  = 0.55,
         )
-
-        max_val = pivot.values.max() if pivot.values.max() > 0 else 1
-        for ri in range(n_rows):
-            for ci in range(n_cols):
-                val = pivot.values[ri, ci]
-                if val > 0:
-                    txt_color = 'white' if (val / max_val) > 0.55 else 'black'
-                    ax.text(
-                        ci, ri, str(val),
-                        ha='center', va='center', fontsize=7, color=txt_color,
-                    )
-
-        cbar = plt.colorbar(img, ax=ax, fraction=0.025, pad=0.02)
-        cbar.set_label('Number of Rules', fontsize=9)
-        plt.tight_layout()
-
-        fig.savefig(
-            heatmap_dir / f'heatmap_{suffix}.png', dpi=150, bbox_inches='tight'
-        )
-        plt.close(fig)
         print(f'    > saved heatmaps/heatmap_{suffix}.png')
 
     print(f'  > heatmaps saved to {heatmap_dir}/')
@@ -525,7 +580,9 @@ def _process_one_support(
     # Run FP-Growth to mine all frequent itemsets at this support level.
     # Each itemset is a frozenset of feature names that co-occur in at least
     # min_sup fraction of transactions.
-    frequent_itemsets = fpgrowth(df, min_support=min_sup, use_colnames=True)
+    # max_len=4 prunes the search space: rules with antecedent + consequent
+    # length > 4 are rarely actionable and exponentially expensive to mine.
+    frequent_itemsets = fpgrowth(df, min_support=min_sup, use_colnames=True, max_len=4)
     print(f'    > {len(frequent_itemsets)} frequent itemsets found')
 
     if len(frequent_itemsets) == 0:
@@ -777,11 +834,15 @@ def explore_association_rules(
         n_jobs     = n_jobs,
         backend    = 'loky',
         verbose    = 0,
-        # pre_dispatch limits how many tasks are sent to workers at once.
-        # On Apple Silicon the unified memory bus is shared between all cores
-        # and the GPU.  Setting pre_dispatch = n_jobs (not 2× n_jobs) ensures
-        # that at most n_jobs serialised copies of df are resident in memory
-        # simultaneously, preventing peak RSS from doubling during task queuing.
+        # pre_dispatch controls how many tasks are queued in the worker pool
+        # at once.  Setting it equal to n_jobs (instead of the default 2×n_jobs)
+        # limits peak task-queue depth: at most n_jobs tasks are submitted before
+        # a completed task is collected.  On Apple Silicon's unified memory bus
+        # this reduces the window during which multiple large DataFrames coexist
+        # in the task queue simultaneously.  Note: loky serialises the DataFrame
+        # once per worker at spawn time, not per task; pre_dispatch therefore
+        # does not change the number of in-memory DataFrame copies but does
+        # reduce peak memory from queued task arguments.
         pre_dispatch = n_jobs,
     )(
         delayed(_process_one_support)(
@@ -917,12 +978,11 @@ def calibrate_parameters(
         round(np.floor(raw_sup_min / sup_delta) * sup_delta, 4), sup_delta
     )
 
-    # ── Stage 1: scan for the natural 2-itemset ceiling ──────────────
-    # Walk from sup_min upward, one sup_delta step at a time, until either
-    # FP-Growth returns no itemsets at all (data too sparse) or we see the
-    # first threshold after which 2-itemsets disappear.  The last threshold
-    # that still produced a 2-itemset is the natural ceiling: above it no
-    # association rules can be generated from this dataset.
+    # ── Stage 1: binary search for the natural 2-itemset ceiling ────────
+    # FP-Growth is monotone: raising min_support can only remove itemsets,
+    # never add them.  The "natural ceiling" is the highest threshold that
+    # still yields at least one 2-itemset.  A linear scan is O(range/step)
+    # FP-Growth calls; binary search finds the same boundary in O(log(range/step)).
     #
     # Scan upper bound: support of the second-most-frequent item.
     # A 2-itemset {A, B} cannot have support > min(support(A), support(B)),
@@ -931,23 +991,44 @@ def calibrate_parameters(
     scan_grid               = np.round(
         np.arange(sup_min, freq_2 + sup_delta / 2, sup_delta), 4
     )
-    natural_sup_max         = sup_min   # updated below as scan progresses
+    natural_sup_max         = sup_min   # updated below as binary search progresses
     prev_had_2itemsets      = False
     fi_first_with_2itemsets = None
 
-    for t in scan_grid:
-        fi = fpgrowth(encoded_df, min_support=t, use_colnames=True)
-        if fi.empty:
-            break
-        has_2 = (fi['itemsets'].apply(len) >= 2).any()
-        if has_2:
-            if fi_first_with_2itemsets is None:
-                fi_first_with_2itemsets = fi
-            natural_sup_max    = t
-            prev_had_2itemsets = True
-        elif prev_had_2itemsets:
-            # First step above the natural ceiling — stop immediately.
-            break
+    # --- Phase A: verify at least one 2-itemset exists at sup_min ----------
+    # max_len=2: calibration only needs to detect 2-itemset presence/absence —
+    # mining longer itemsets here wastes time without contributing to the result.
+    fi_lo = fpgrowth(encoded_df, min_support=float(scan_grid[0]), use_colnames=True, max_len=2)
+    if not fi_lo.empty and (fi_lo['itemsets'].apply(len) >= 2).any():
+        fi_first_with_2itemsets = fi_lo
+        prev_had_2itemsets = True
+
+        if len(scan_grid) == 1:
+            natural_sup_max = scan_grid[0]
+        else:
+            # --- Phase B: binary search for the last grid index with 2-itemsets
+            lo_idx, hi_idx = 0, len(scan_grid) - 1
+            while lo_idx < hi_idx:
+                mid_idx = (lo_idx + hi_idx + 1) // 2
+                fi_mid  = fpgrowth(
+                    encoded_df,
+                    min_support=float(scan_grid[mid_idx]),
+                    use_colnames=True,
+                    max_len=2,
+                )
+                has_2 = (
+                    not fi_mid.empty
+                    and (fi_mid['itemsets'].apply(len) >= 2).any()
+                )
+                if has_2:
+                    lo_idx = mid_idx          # ceiling is at or above mid
+                else:
+                    hi_idx = mid_idx - 1      # ceiling is below mid
+
+            natural_sup_max = scan_grid[lo_idx]
+    else:
+        # No 2-itemsets even at the lowest threshold — transactions too sparse.
+        prev_had_2itemsets = False
 
     # ── Stage 2: extend grid N steps beyond the natural ceiling ─────────
     # The natural ceiling is where rules stop existing in these data.
@@ -1330,6 +1411,37 @@ def run_k_comparison(
     # Outer parallelism: one worker per k value, capped at P-core count.
     outer_jobs = min(len(k_sorted), perf_cores)
 
+    # RAM-aware cap: each loky worker receives a serialised copy of the encoded
+    # DataFrame (one copy per outer worker, held in memory until the worker
+    # finishes).  On memory-constrained machines spawning too many outer workers
+    # can trigger swapping, which is slower than running serially.
+    # We estimate peak RSS as outer_jobs × df_size × 2 (serialisation overhead)
+    # and reduce outer_jobs until the estimate fits within available RAM.
+    # psutil is a soft dependency; if absent we skip the RAM check gracefully.
+    try:
+        import psutil as _psutil
+        # Load the first available labels CSV to get a proxy for df size.
+        # All k DataFrames share the same columns; row counts differ slightly.
+        _probe_path = Path(next(iter(k_labels_map.values())))
+        if _probe_path.exists():
+            _probe_df     = pd.read_csv(_probe_path, nrows=0)  # header only
+            _n_cols       = len(_probe_df.columns)
+            _n_rows_est   = sum(1 for _ in open(_probe_path)) - 1  # approx
+            # Estimate: bool DataFrame ≈ 1 byte/cell; add 4× headroom for
+            # pandas overhead and association_rules intermediate structures.
+            _df_bytes_est = _n_rows_est * _n_cols * 4
+            _avail_bytes  = _psutil.virtual_memory().available
+            _max_by_ram   = max(1, int(_avail_bytes // (_df_bytes_est * 2)))
+            if _max_by_ram < outer_jobs:
+                print(
+                    f'  > RAM cap: reducing outer_jobs {outer_jobs} → {_max_by_ram} '
+                    f'(est. {_df_bytes_est / 1e6:.1f} MB/worker, '
+                    f'{_avail_bytes / 1e9:.1f} GB available)'
+                )
+                outer_jobs = _max_by_ram
+    except Exception:
+        pass  # psutil absent or probe failed — proceed with CPU-based cap
+
     # Two-level parallelism budget for Apple Silicon (and any NUMA system):
     #
     #   outer_jobs  : k-level workers running concurrently.
@@ -1464,8 +1576,8 @@ def run_k_comparison(
         ('Confidence',   'k_confidence'),
         ('Lift_display', 'k_lift'),
     ]:
-        x_label   = 'Lift' if 'lift' in suffix else x_col
-        is_lift   = 'lift' in suffix
+        x_label = 'Lift' if 'lift' in suffix else x_col
+        is_lift = 'lift' in suffix
 
         pivot = (
             combined.groupby(['k', x_col])['Number_of_Rules']
@@ -1475,62 +1587,21 @@ def run_k_comparison(
             .fillna(0)
             .astype(int)
         )
-
-        if is_lift:
-            pivot = pivot.loc[
-                :, ~pivot.columns.to_series().between(
-                    neutral_lo, neutral_hi, inclusive='both'
-                )
-            ]
-            if (pivot != 0).any(axis=0).any():
-                last_nz = int(np.where((pivot != 0).any(axis=0).values)[0].max())
-                pivot   = pivot.iloc[:, :last_nz + 1]
-
-        n_cols = len(pivot.columns)
-        n_rows = len(pivot.index)
-        fig, ax = plt.subplots(
-            figsize=(max(10, n_cols * 0.75), max(4, n_rows * 0.6))
+        _render_heatmap(
+            pivot       = pivot,
+            x_label     = x_label,
+            y_label     = 'k',
+            title       = (
+                f'Max Number of Rules — k vs {x_label}\n'
+                f'(darker = more rules; max over the other two parameters)'
+            ),
+            output_path = comp_dir / f'heatmap_{suffix}.png',
+            neutral_lo  = neutral_lo,
+            neutral_hi  = neutral_hi,
+            x_is_lift   = is_lift,
+            row_fmt     = 'k={v}',
+            row_height  = 0.60,
         )
-
-        img = ax.imshow(
-            pivot.values, aspect='auto', cmap='YlOrBr', interpolation='nearest'
-        )
-
-        ax.set_xticks(range(n_cols))
-        ax.set_xticklabels(
-            [f'{v:.2f}' if isinstance(v, float) else str(v) for v in pivot.columns],
-            rotation=40, ha='right', fontsize=8,
-        )
-        ax.set_yticks(range(n_rows))
-        ax.set_yticklabels([f'k={v}' for v in pivot.index], fontsize=9)
-
-        ax.set_xlabel(x_label, fontsize=11, labelpad=8)
-        ax.set_ylabel('k',     fontsize=11, labelpad=8)
-        ax.set_title(
-            f'Max Number of Rules — k vs {x_label}\n'
-            f'(darker = more rules; max over the other two parameters)',
-            fontsize=11, pad=14,
-        )
-
-        max_val = pivot.values.max() if pivot.values.max() > 0 else 1
-        for ri in range(n_rows):
-            for ci in range(n_cols):
-                val = pivot.values[ri, ci]
-                if val > 0:
-                    txt_color = 'white' if (val / max_val) > 0.55 else 'black'
-                    ax.text(
-                        ci, ri, str(val),
-                        ha='center', va='center', fontsize=7, color=txt_color,
-                    )
-
-        cbar = plt.colorbar(img, ax=ax, fraction=0.025, pad=0.02)
-        cbar.set_label('Number of Rules', fontsize=9)
-        plt.tight_layout()
-
-        fig.savefig(
-            comp_dir / f'heatmap_{suffix}.png', dpi=150, bbox_inches='tight'
-        )
-        plt.close(fig)
         print(f'    > saved k_comparison/heatmap_{suffix}.png')
 
     print(f'  > Cross-k comparison saved to {comp_dir}/')
