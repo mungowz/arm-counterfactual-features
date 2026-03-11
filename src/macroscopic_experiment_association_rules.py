@@ -210,7 +210,17 @@ def extract_labels(labels_only_path: Path) -> pd.DataFrame:
     # the number of unique labels is large relative to the average transaction length.
     te     = TransactionEncoder()
     te_ary = te.fit(itemsets).transform(itemsets, sparse=True)
-    enc_df = pd.DataFrame.sparse.from_spmatrix(te_ary, columns=te.columns_)
+    # Cast to float32 sparse immediately after construction.
+    # Without this, the sparse dtype carries a bool fill_value which:
+    #   (a) triggers FutureWarning in pandas >= 1.5 ("arbitrary scalar fill_value
+    #       in SparseDtype is deprecated")
+    #   (b) causes numpy.bool_ values from .mean(), breaking round() calls
+    #       downstream with "numpy.bool doesn't define __round__"
+    # float32 preserves the memory benefit of the sparse layout while giving
+    # fpgrowth and all arithmetic a well-behaved numeric dtype.
+    enc_df = pd.DataFrame.sparse.from_spmatrix(te_ary, columns=te.columns_).astype(
+        pd.SparseDtype('float32', fill_value=0.0)
+    )
 
     print('  > First few encoded rows:')
     print(enc_df.head())
