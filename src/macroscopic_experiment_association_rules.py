@@ -206,11 +206,21 @@ def extract_labels(labels_only_path: Path) -> pd.DataFrame:
     # TransactionEncoder converts a list-of-lists into a Boolean matrix
     # suitable for mlxtend's fpgrowth().  Each column is one item (feature name);
     # each row is one transaction (True = item present in that transaction).
-    # sparse=True avoids allocating a dense n_transactions × n_items matrix when
-    # the number of unique labels is large relative to the average transaction length.
+    #
+    # Dense encoding is used intentionally (sparse=False).  The macroscopic
+    # pipeline works with feature *names* (labels), not values, so the item
+    # vocabulary is small (typically 10–20 columns for ACS features).  With
+    # ~10–30k rows × ~11 columns the dense matrix is < 1 MB, well within RAM.
+    #
+    # sparse=True is avoided because in some pandas/scipy combinations the
+    # resulting SparseDtype uses fill_value=True instead of False (a known
+    # regression that triggers a FutureWarning).  This causes DataFrame.mean()
+    # to return 1.0 for every column — every feature appears to be present in
+    # every transaction — which breaks calibrate_parameters() and causes all
+    # k values to be skipped as too_sparse.
     te     = TransactionEncoder()
-    te_ary = te.fit(itemsets).transform(itemsets, sparse=True)
-    enc_df = pd.DataFrame.sparse.from_spmatrix(te_ary, columns=te.columns_)
+    te_ary = te.fit(itemsets).transform(itemsets, sparse=False)
+    enc_df = pd.DataFrame(te_ary, columns=te.columns_)
 
     print('  > First few encoded rows:')
     print(enc_df.head())
