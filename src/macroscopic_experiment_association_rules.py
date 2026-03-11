@@ -206,13 +206,11 @@ def extract_labels(labels_only_path: Path) -> pd.DataFrame:
     # TransactionEncoder converts a list-of-lists into a Boolean matrix
     # suitable for mlxtend's fpgrowth().  Each column is one item (feature name);
     # each row is one transaction (True = item present in that transaction).
-    # dtype=bool is required by mlxtend: float/sparse inputs trigger
-    # DeprecationWarning ("non-bool types result in worse computational
-    # performance") and cause AttributeError on SparseArray.round() and
-    # TypeError on numpy.bool_.__round__ in downstream arithmetic.
+    # sparse=True avoids allocating a dense n_transactions × n_items matrix when
+    # the number of unique labels is large relative to the average transaction length.
     te     = TransactionEncoder()
-    te_ary = te.fit(itemsets).transform(itemsets)
-    enc_df = pd.DataFrame(te_ary, columns=te.columns_)
+    te_ary = te.fit(itemsets).transform(itemsets, sparse=True)
+    enc_df = pd.DataFrame.sparse.from_spmatrix(te_ary, columns=te.columns_)
 
     print('  > First few encoded rows:')
     print(enc_df.head())
@@ -1114,7 +1112,7 @@ def calibrate_parameters(
         'raw_lift_max':      round(raw_lift_max, 4),
         'min_conf_observed': round(min_conf_observed, 4) if min_conf_observed is not None else None,
         'max_conf_observed': round(max_conf_observed, 4) if max_conf_observed is not None else None,
-        'item_supports':     item_supports.astype(float).round(4).to_dict(),
+        'item_supports':     item_supports.round(4).to_dict(),
     }
 
     print(
