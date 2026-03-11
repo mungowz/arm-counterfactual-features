@@ -618,9 +618,13 @@ def cleanup_empty_folders(output_dir: Path) -> tuple[int, int]:
             rules_csv     = conf_dir / 'rules.csv'
             should_remove = not rules_csv.exists()
             if not should_remove:
+                # A rules.csv that contains only the header row is effectively
+                # empty.  The header alone is < 120 bytes; a file with at least
+                # one data row is always larger.  Using st_size avoids the cost
+                # of reading and parsing the CSV inside a hot cleanup loop.
                 try:
-                    should_remove = pd.read_csv(rules_csv).empty
-                except Exception:
+                    should_remove = rules_csv.stat().st_size < 120
+                except OSError:
                     should_remove = True
             if should_remove:
                 shutil.rmtree(conf_dir)
@@ -711,7 +715,10 @@ def _process_one_support(
     print(f'\n  [{sup_idx}/{n_sup}] support = {min_sup}')
     print('    > running FP-Growth...')
 
-    frequent_itemsets = fpgrowth(df, min_support=min_sup, use_colnames=True)
+    # max_len=4 prunes the search space: association rules with antecedent +
+    # consequent length > 4 are rarely actionable and exponentially costly
+    # at the value level where hundreds of distinct items can exist.
+    frequent_itemsets = fpgrowth(df, min_support=min_sup, use_colnames=True, max_len=4)
     print(f'    > {len(frequent_itemsets)} frequent itemsets found')
 
     if len(frequent_itemsets) == 0:
@@ -928,9 +935,10 @@ def _process_one_support(
 #              nearest sup_delta multiple.  This is the tightest threshold at
 #              which at least some 2-itemsets can theoretically exist.
 #
-#   sup_max  — highest support at which 2-itemsets are still found, plus a
-#              small decay margin (_DECAY_STEPS * sup_delta) to include the
-#              region where 2-itemsets begin to vanish.  Capped at 0.50.
+#   sup_max  — highest support at which 2-itemsets are still found (binary
+#              search, O(log n) FP-Growth calls with max_len=2), plus a small
+#              decay margin (_DECAY_STEPS * sup_delta).  Capped at 0.50.
+#              Binary search replaces the original linear scan (O(n) calls).
 #
 #   lift_max — reciprocal of the rarest item frequency, rounded up to the
 #              nearest 0.5 step, capped at 10.0.  This bounds the maximum
@@ -992,7 +1000,7 @@ def calibrate_parameters(
     """
     print('  > Calibrating parameters from item frequencies...')
 
-    item_supports = encoded_df.mean().sort_values()
+    item_supports = encoded_df.mean().astype(float).sort_values()
     if len(item_supports) < 2:
         print('  > WARNING: fewer than 2 items — cannot form pairwise rules.')
         return None
@@ -1009,33 +1017,63 @@ def calibrate_parameters(
         round(np.floor(raw_sup_min / sup_delta) * sup_delta, 4), sup_delta
     )
 
-    # Scan upward from sup_min to find the natural support ceiling: the
-    # highest threshold at which at least one 2-itemset still exists.
-    # We stop scanning as soon as 2-itemsets disappear after having been
-    # present (the first drop-off point), to avoid scanning the full range.
-    _DECAY_STEPS            = 4   # extra steps above natural ceiling for decay margin
+    # ── Stage 1: binary search for the natural 2-itemset ceiling ────────
+    # FP-Growth is monotone: raising min_support can only remove itemsets,
+    # never add them.  The "natural ceiling" is the highest threshold that
+    # still yields at least one 2-itemset.  A linear scan is O(range/step)
+    # FP-Growth calls; binary search finds the same boundary in O(log(range/step)).
+    # max_len=2: calibration only needs to detect 2-itemset presence/absence —
+    # mining longer itemsets here wastes time without contributing to the result.
+    #
+    # Scan upper bound: support of the second-most-frequent item.
+    # A 2-itemset {A, B} cannot have support > min(support(A), support(B)),
+    # so scanning beyond the second-most-frequent item is guaranteed to find
+    # nothing and wastes FP-Growth calls.
+    _DECAY_STEPS            = 4
     scan_grid               = np.round(np.arange(sup_min, freq_2 + sup_delta / 2, sup_delta), 4)
     natural_sup_max         = sup_min
     prev_had_2itemsets      = False
-    fi_first_with_2itemsets = None   # retained for conf_min probe below
+    fi_first_with_2itemsets = None
 
-    for t in scan_grid:
-        fi = fpgrowth(encoded_df, min_support=t, use_colnames=True)
-        if fi.empty:
-            break
-        has_2 = (fi['itemsets'].apply(len) >= 2).any()
-        if has_2:
-            if fi_first_with_2itemsets is None:
-                fi_first_with_2itemsets = fi   # save the first result for conf calibration
-            natural_sup_max    = t
-            prev_had_2itemsets = True
-        elif prev_had_2itemsets:
-            # 2-itemsets have appeared and then vanished — stop scanning.
-            break
+    # --- Phase A: verify at least one 2-itemset exists at sup_min ----------
+    fi_lo = fpgrowth(encoded_df, min_support=float(scan_grid[0]), use_colnames=True, max_len=2)
+    if not fi_lo.empty and (fi_lo['itemsets'].apply(len) >= 2).any():
+        fi_first_with_2itemsets = fi_lo
+        prev_had_2itemsets = True
 
-    # Add decay margin and cap at 0.50 to avoid trivially common itemsets.
+        if len(scan_grid) == 1:
+            natural_sup_max = scan_grid[0]
+        else:
+            # --- Phase B: binary search for the last grid index with 2-itemsets
+            lo_idx, hi_idx = 0, len(scan_grid) - 1
+            while lo_idx < hi_idx:
+                mid_idx = (lo_idx + hi_idx + 1) // 2
+                fi_mid  = fpgrowth(
+                    encoded_df,
+                    min_support=float(scan_grid[mid_idx]),
+                    use_colnames=True,
+                    max_len=2,
+                )
+                has_2 = (
+                    not fi_mid.empty
+                    and (fi_mid['itemsets'].apply(len) >= 2).any()
+                )
+                if has_2:
+                    lo_idx = mid_idx          # ceiling is at or above mid
+                else:
+                    hi_idx = mid_idx - 1      # ceiling is below mid
+
+            natural_sup_max = scan_grid[lo_idx]
+
+    # ── Stage 2: extend grid N steps beyond the natural ceiling ─────────
     sup_max = min(
         round(natural_sup_max + _DECAY_STEPS * sup_delta, 4), 0.50
+    )
+
+    print(
+        f'  > support grid: [{sup_min} … {sup_max}]  '
+        f'(natural 2-itemset ceiling = {natural_sup_max}, '
+        f'+{_DECAY_STEPS} decay steps)'
     )
 
     if not prev_had_2itemsets:
@@ -1085,7 +1123,7 @@ def calibrate_parameters(
         'raw_lift_max':      round(raw_lift_max, 4),
         'min_conf_observed': round(min_conf_observed, 4) if min_conf_observed is not None else None,
         'max_conf_observed': round(max_conf_observed, 4) if max_conf_observed is not None else None,
-        'item_supports':     item_supports.round(4).to_dict(),
+        'item_supports':     item_supports.astype(float).round(4).to_dict(),
     }
 
 
@@ -1664,7 +1702,7 @@ def _process_one_k(
     # FP-Growth runs exclusively on the aggregated format (one transaction
     # per sample).  The pair-level format is saved for traceability only.
     df_encoded    = encode_transactions(agg_df['Values'], col_name='aggregated_values')
-    item_supports = df_encoded.mean().sort_values()
+    item_supports = df_encoded.mean().astype(float).sort_values()
 
     # ── Step E: calibrate grid parameters or apply manual bounds ─────
     # In auto mode, calibrate_parameters() derives data-driven bounds from

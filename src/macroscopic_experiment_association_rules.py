@@ -956,7 +956,7 @@ def calibrate_parameters(
     """
     print('  > Calibrating parameters from item frequencies...')
 
-    item_supports = encoded_df.mean().sort_values()
+    item_supports = encoded_df.mean().astype(float).sort_values()
     print('  > Item supports:')
     for item, sup in item_supports.items():
         print(f'    {item}: {sup:.4f}')
@@ -1114,7 +1114,7 @@ def calibrate_parameters(
         'raw_lift_max':      round(raw_lift_max, 4),
         'min_conf_observed': round(min_conf_observed, 4) if min_conf_observed is not None else None,
         'max_conf_observed': round(max_conf_observed, 4) if max_conf_observed is not None else None,
-        'item_supports':     item_supports.round(4).to_dict(),
+        'item_supports':     item_supports.astype(float).round(4).to_dict(),
     }
 
     print(
@@ -1263,7 +1263,7 @@ def _process_one_k(
         return k, None, row
 
     df_encoded    = extract_labels(labels_csv)
-    item_supports = df_encoded.mean().sort_values()
+    item_supports = df_encoded.mean().astype(float).sort_values()
 
     if auto_calibrate:
         params = calibrate_parameters(

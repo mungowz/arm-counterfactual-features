@@ -1,7 +1,7 @@
 """
 main.py — Pipeline orchestrator
 ================================
-Runs the three pipeline modules in sequence or individually via a unified CLI.
+Runs the four pipeline modules in sequence or individually via a unified CLI.
 
 Pipeline
 --------
@@ -13,15 +13,20 @@ Pipeline
         transaction CSVs for each (region, k) combination.
 
     Step 3: macroscopic_experiment_association_rules.py
-        Run FP-Growth association-rule mining on the transaction CSVs,
-        produce rules + heatmaps for each (region, k) combination.
+        Run FP-Growth association-rule mining on label-level transaction CSVs,
+        produce label-level rules + heatmaps for each (region, k) combination.
+
+    Step 4: microscopic_experiment_association_rules_values.py
+        Run FP-Growth association-rule mining at the value level (LABEL=value
+        items), filtered to the labels that appear in Step 3 rules.
+        Produces value-level rules + heatmaps under association_rules_values/.
+        Requires Step 3 outputs (rules.csv files) to derive the active labels.
 
 Design principles
 -----------------
-- All three step modules are loaded at runtime via importlib.util so that
-  this orchestrator does not need to import them at module level.  This
-  means missing dependencies in one module do not prevent the others from
-  running.
+- All step modules are loaded at runtime via importlib.util so that this
+  orchestrator does not need to import them at module level.  This means
+  missing dependencies in one module do not prevent the others from running.
 - Output pre-existence checks: if outputs already exist and --force is not
   set, the step is skipped with a message.  This makes re-running cheaper
   when only one step needs to be repeated.
@@ -36,11 +41,14 @@ CLI usage (quick reference)
   # Full pipeline, default regions (NE + South):
   python main.py
 
-  # All three regions:
+  # All four regions:
   python main.py --regions northeast south usa
 
   # USA only, skip dataset download (CSV already present):
-  python main.py --regions usa --steps 2 3
+  python main.py --regions usa --steps 2 3 4
+
+  # Only value-level ARM (Step 4), after Steps 1-3 already ran:
+  python main.py --steps 4
 
   # Force re-run all steps even if outputs exist:
   python main.py --force
@@ -51,7 +59,7 @@ CLI usage (quick reference)
   # Custom k values and boundary percentile:
   python main.py --k-values 3 7 --perc-threshold 5
 
-  # ARM with manual grid (disable auto-calibration):
+  # ARM with manual grid (disable auto-calibration, applies to Steps 3 and 4):
   python main.py --no-auto-calibrate --sup-min 0.05 --sup-max 0.40
 
   # Exclude additional columns from feature matrix:
@@ -83,13 +91,15 @@ _SRC = {
     1: _HERE / 'create_dataset.py',
     2: _HERE / 'feature_importance.py',
     3: _HERE / 'macroscopic_experiment_association_rules.py',
+    4: _HERE / 'microscopic_experiment_association_rules_values.py',
 }
 
 # Human-readable step names used in the banner and summary output.
 _STEP_NAMES = {
     1: 'Create Dataset',
     2: 'Feature Importance (CategoricalBoCSoR)',
-    3: 'Association Rules (FP-Growth)',
+    3: 'Association Rules — label level (FP-Growth)',
+    4: 'Association Rules — value level (FP-Growth)',
 }
 
 # ---------------------------------------------------------------------------
@@ -212,6 +222,75 @@ def _inputs_step2_exist(
         if not p.exists():
             print(f'  [WARNING] Missing input for Step 2: {p}')
             ok = False
+    return ok
+
+
+def _outputs_step4_exist(regions: list[str], k_values: list[int]) -> bool:
+    """
+    Return True if all expected Step 4 output summary CSVs exist for every
+    (region, k) combination.
+
+    The sentinel file is summary.csv inside any k_{k}/ subdirectory under
+    results/<region>/association_rules_values/.  The experiment-label component
+    of the path is not known here (it encodes grid parameters), so we use
+    rglob to detect any matching file.
+    """
+    results_dir = _HERE.parent / 'results'
+    for region in regions:
+        for k in k_values:
+            ar_base = results_dir / region / 'association_rules_values'
+            found   = ar_base.exists() and any(ar_base.rglob(f'k_{k}/summary.csv'))
+            if not found:
+                return False
+    return True
+
+
+def _inputs_step4_exist(regions: list[str], k_values: list[int]) -> bool:
+    """
+    Verify that Step 4 has at least one valid input for each region.
+
+    Step 4 requires:
+      - transactions_values.csv from Step 2 (one per (region, k))
+      - at least one rules.csv from Step 3 (produced under
+        association_rules/{exp_label}/k_{k}/sup_*/conf_*/)
+
+    It is normal for low-k values to produce no Step 3 rules (sparse
+    transactions).  A WARNING is printed for each missing k but the step is
+    only blocked if NO k value has any rules.csv for a given region.
+    """
+    results_dir = _HERE.parent / 'results'
+    ok = True
+    for region in regions:
+        has_tv      = False   # any transactions_values.csv for this region
+        has_rules   = False   # any rules.csv from Step 3 for this region
+
+        for k in k_values:
+            tv_path = (
+                results_dir / region / 'important_features'
+                / f'k_{k}' / 'transactions_values.csv'
+            )
+            if tv_path.exists():
+                has_tv = True
+
+            ar_base = results_dir / region / 'association_rules'
+            if ar_base.exists() and any(ar_base.rglob(f'k_{k}/sup_*/conf_*/rules.csv')):
+                has_rules = True
+
+        if not has_tv:
+            print(
+                f'  [ERROR] {region}: no transactions_values.csv found for any k. '
+                f'Run Step 2 first.'
+            )
+            ok = False
+        elif not has_rules:
+            print(
+                f'  [ERROR] {region}: no rules.csv from Step 3 found for any k. '
+                f'Run Step 3 first (Step 4 needs label-level rules to filter '
+                f'value-level items).'
+            )
+            ok = False
+        else:
+            print(f'  [INFO] {region}: transactions_values.csv and Step 3 rules found.')
     return ok
 
 
@@ -453,6 +532,65 @@ def run_step3(args: argparse.Namespace) -> bool:
     print(f'\n  > Step 3 completed in {time.perf_counter() - t0:.1f}s')
     return True
 
+def run_step4(args: argparse.Namespace) -> bool:
+    """
+    Run microscopic_experiment_association_rules_values.py — value-level ARM.
+
+    Prerequisites:
+      - Step 2 output (transactions_values.csv) for all (region, k) pairs.
+      - Step 3 output (rules.csv) for at least one (region, k) pair — needed
+        to derive the active label set that filters value-level items.
+
+    No skip condition: like Step 3, value-level ARM is fast enough that
+    re-running is not a burden, and the user may want to re-run with
+    different grid parameters.
+
+    Parameters
+    ----------
+    args : parsed CLI namespace containing all Step 4 parameters.
+           Step 4 reuses the same grid parameters as Step 3 (same argparse
+           group) so the CLI surface stays minimal.
+
+    Returns True on success, False on failure.
+    """
+    _banner(f'STEP 4 — {_STEP_NAMES[4]}')
+
+    # Abort early if required inputs are missing.
+    if not _inputs_step4_exist(args.regions, args.k_values):
+        print('  [ERROR] Required inputs are missing — run Steps 2 and 3 first.')
+        return False
+
+    mod = _load_module(_SRC[4], 'microscopic_experiment_association_rules_values')
+    t0  = time.perf_counter()
+    try:
+        mod.main(
+            regions                  = args.regions,
+            k_values                 = args.k_values,
+            auto_calibrate           = args.auto_calibrate,
+            # Support grid
+            sup_min                  = args.sup_min,
+            sup_max                  = args.sup_max,
+            sup_delta                = args.sup_delta,
+            # Confidence grid
+            conf_min                 = args.conf_min,
+            conf_max                 = args.conf_max,
+            conf_delta               = args.conf_delta,
+            # Lift grid
+            lift_min                 = args.lift_min,
+            lift_max                 = args.lift_max,
+            lift_delta               = args.lift_delta,
+            lift_neutral_half_window = args.lift_neutral_half_window,
+            base_dir                 = _HERE.parent,
+        )
+    except Exception:
+        print('\n  [ERROR] Step 4 failed:')
+        traceback.print_exc()
+        return False
+
+    print(f'\n  > Step 4 completed in {time.perf_counter() - t0:.1f}s')
+    return True
+
+
 # ---------------------------------------------------------------------------
 # CLI argument parser
 # ---------------------------------------------------------------------------
@@ -476,9 +614,9 @@ def _parse_args() -> argparse.Namespace:
 
     # ── Global options ─────────────────────────────────────────────────
     parser.add_argument(
-        '--steps', nargs='+', type=int, choices=[1, 2, 3],
-        default=[1, 2, 3], metavar='{1,2,3}',
-        help='Steps to run (default: all three).',
+        '--steps', nargs='+', type=int, choices=[1, 2, 3, 4],
+        default=[1, 2, 3, 4], metavar='{1,2,3,4}',
+        help='Steps to run (default: all four).',
     )
     parser.add_argument(
         '--force', action='store_true',
@@ -552,8 +690,12 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
 
-    # ── Step 3: association rules parameters ───────────────────────────
-    g3  = parser.add_argument_group('Step 3: association rules')
+    # ── Steps 3 & 4: association rules parameters ──────────────────────
+    g3  = parser.add_argument_group(
+        'Steps 3 & 4: association rules',
+        'Parameters apply to both the label-level (Step 3) and value-level '
+        '(Step 4) ARM passes.',
+    )
 
     # --auto-calibrate and --no-auto-calibrate are mutually exclusive;
     # auto-calibrate is the default.
@@ -605,9 +747,9 @@ def main() -> None:
     """
     Parse arguments, print the configuration banner, and run the selected steps.
 
-    Each step runner (run_step1, run_step2, run_step3) returns True on success
-    and False on failure.  The pipeline halts at the first failed step to
-    prevent downstream steps from running on incomplete inputs.
+    Each step runner (run_step1, run_step2, run_step3, run_step4) returns True
+    on success and False on failure.  The pipeline halts at the first failed
+    step to prevent downstream steps from running on incomplete inputs.
 
     Exit codes:
         0  — all selected steps completed successfully
@@ -664,7 +806,7 @@ def main() -> None:
         sys.exit(1)
 
     # ── Execute selected steps in order ───────────────────────────────
-    _RUNNERS = {1: run_step1, 2: run_step2, 3: run_step3}
+    _RUNNERS = {1: run_step1, 2: run_step2, 3: run_step3, 4: run_step4}
     total_t0  = time.perf_counter()
     results   = {}
 
