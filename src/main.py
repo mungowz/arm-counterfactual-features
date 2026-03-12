@@ -1,7 +1,7 @@
 """
 main.py — Pipeline orchestrator
 ================================
-Runs the four pipeline modules in sequence or individually via a unified CLI.
+Runs the five pipeline modules in sequence or individually via a unified CLI.
 
 Pipeline
 --------
@@ -22,6 +22,17 @@ Pipeline
         Produces value-level rules + heatmaps under association_rules_values/.
         Requires Step 3 outputs (rules.csv files) to derive the active labels.
 
+    Step 5: fairness_analysis_association_rules.py
+        Compute fairness metrics on the value-level rules produced by Step 4.
+        Metrics include disparate impact ratio (4/5 rule), statistical parity
+        difference, confidence/support/lift parity, and intersectional analysis
+        for every sensitive attribute (default: SEX, RAC1P).
+        When the original dataset CSVs are available (auto-discovered from the
+        data directory, or supplied explicitly via --fairness-datasets), also
+        computes population-level DIR and positive rates directly from the data.
+        Outputs: fairness_report.txt, per-metric CSVs, and plots under
+        results/{region}/fairness_analysis/.
+
 Design principles
 -----------------
 - All step modules are loaded at runtime via importlib.util so that this
@@ -41,14 +52,17 @@ CLI usage (quick reference)
   # Full pipeline, default regions (NE + South):
   python main.py
 
-  # All four regions:
+  # All five regions:
   python main.py --regions northeast south usa
 
   # USA only, skip dataset download (CSV already present):
-  python main.py --regions usa --steps 2 3 4
+  python main.py --regions usa --steps 2 3 4 5
 
   # Only value-level ARM (Step 4), after Steps 1-3 already ran:
   python main.py --steps 4
+
+  # Only fairness analysis (Step 5), after Steps 1-4 already ran:
+  python main.py --steps 5
 
   # Force re-run all steps even if outputs exist:
   python main.py --force
@@ -67,6 +81,15 @@ CLI usage (quick reference)
 
   # Exclude nothing from feature matrix:
   python main.py --metadata-cols
+
+  # Fairness analysis with custom sensitive attributes and privileged groups:
+  python main.py --steps 5 --fairness-sensitive-attrs SEX RAC1P \\
+      --fairness-privileged SEX=Male RAC1P=White-Alone
+
+  # Fairness analysis with explicit dataset CSVs (overrides auto-discovery):
+  python main.py --steps 5 \\
+      --fairness-datasets data/acs_income_northeast_2024.csv \\
+                          data/acs_income_south_2024.csv
 """
 
 import argparse
@@ -92,6 +115,7 @@ _SRC = {
     2: _HERE / 'feature_importance.py',
     3: _HERE / 'macroscopic_experiment_association_rules.py',
     4: _HERE / 'microscopic_experiment_association_rules_values.py',
+    5: _HERE / 'fairness_analysis_association_rules.py',
 }
 
 # Human-readable step names used in the banner and summary output.
@@ -100,6 +124,7 @@ _STEP_NAMES = {
     2: 'Feature Importance (CategoricalBoCSoR)',
     3: 'Association Rules — label level (FP-Growth)',
     4: 'Association Rules — value level (FP-Growth)',
+    5: 'Fairness Analysis — disparate impact, parity, intersectional',
 }
 
 # ---------------------------------------------------------------------------
@@ -592,8 +617,194 @@ def run_step4(args: argparse.Namespace) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# CLI argument parser
+# Step 5 helpers and runner
 # ---------------------------------------------------------------------------
+
+def _outputs_step5_exist(regions: list[str]) -> bool:
+    """
+    Return True if a fairness_report.txt already exists for every region.
+
+    The sentinel file is fairness_report.txt inside
+    results/<region>/fairness_analysis/.  If it is present the step is
+    considered complete (unless --force is set).
+    """
+    results_dir = _HERE.parent / 'results'
+    for region in regions:
+        p = results_dir / region / 'fairness_analysis' / 'fairness_report.txt'
+        if not p.exists():
+            return False
+    return True
+
+
+def _inputs_step5_exist(regions: list[str]) -> bool:
+    """
+    Verify that Step 5 has at least one value-level rules.csv for each region.
+
+    Step 5 requires the output of Step 4 (association_rules_values/ subtree).
+    A WARNING is printed for missing regions; the step is blocked only when NO
+    rules.csv is found at all for a given region.
+    """
+    results_dir = _HERE.parent / 'results'
+    ok = True
+    for region in regions:
+        ar_base = results_dir / region / 'association_rules_values'
+        if ar_base.exists() and any(ar_base.rglob('rules.csv')):
+            print(f'  [INFO] {region}: value-level rules.csv found for Step 5.')
+        else:
+            print(
+                f'  [ERROR] {region}: no value-level rules.csv found under '
+                f'{ar_base}. Run Step 4 first.'
+            )
+            ok = False
+    return ok
+
+
+def _resolve_fairness_datasets(args: argparse.Namespace) -> list[Path]:
+    """
+    Return the list of dataset CSV paths to pass to the fairness module.
+
+    Resolution order:
+    1. ``--fairness-datasets`` explicit paths (absolute or relative to CWD).
+       Each path must exist; a WARNING is printed for any that do not.
+    2. Auto-discovery: every CSV matching ``acs_income_{region}_{year}.csv``
+       in ``args.output_dir`` for the requested regions and survey year.
+    3. Fallback: all CSVs in ``args.output_dir`` whose name starts with
+       ``acs_income_``, regardless of region or year.
+
+    Returns an empty list when nothing is found so the fairness module can
+    still run on rules alone (population-level metrics will simply be skipped).
+    """
+    # ── Explicit paths ────────────────────────────────────────────────────
+    if getattr(args, 'fairness_datasets', None):
+        paths: list[Path] = []
+        for raw in args.fairness_datasets:
+            p = Path(raw)
+            if not p.is_absolute():
+                p = Path.cwd() / p
+            if p.exists():
+                paths.append(p)
+            else:
+                print(f'  [WARNING] --fairness-datasets: file not found: {p}')
+        return paths
+
+    # ── Auto-discovery: region + year specific ────────────────────────────
+    data_dir    = Path(args.output_dir)
+    survey_year = args.survey_year
+    paths = [
+        data_dir / f'acs_income_{region}_{survey_year}.csv'
+        for region in args.regions
+    ]
+    found = [p for p in paths if p.exists()]
+    if found:
+        return found
+
+    # ── Fallback: any acs_income_*.csv in data_dir ────────────────────────
+    fallback = sorted(data_dir.glob('acs_income_*.csv'))
+    if fallback:
+        print(
+            f'  [INFO] No region-specific dataset CSVs found for year '
+            f'{survey_year}; using all acs_income_*.csv files in {data_dir}:'
+        )
+        for p in fallback:
+            print(f'    {p}')
+    return fallback
+
+
+def run_step5(args: argparse.Namespace) -> bool:
+    """
+    Run fairness_analysis_association_rules.py — demographic fairness metrics.
+
+    Prerequisites:
+      - Step 4 output (value-level rules.csv files) must exist for at least
+        one (region, k) pair.
+      - Original dataset CSVs are optional: if present (auto-discovered from
+        args.output_dir or supplied via --fairness-datasets), population-level
+        DIR and positive rates are also computed.
+
+    Skip condition: fairness_report.txt already exists for all regions and
+    --force is not set.
+
+    Parameters
+    ----------
+    args : parsed CLI namespace.
+
+    Returns True on success, False on failure.
+    """
+    _banner(f'STEP 5 — {_STEP_NAMES[5]}')
+
+    if not _inputs_step5_exist(args.regions):
+        print('  [ERROR] Required inputs are missing — run Step 4 first.')
+        return False
+
+    if not args.force and _outputs_step5_exist(args.regions):
+        print(
+            '  > Fairness report already present for all regions. '
+            'Use --force to overwrite.'
+        )
+        return True
+
+    # ── Resolve sensitive-attribute configuration ─────────────────────────
+    sensitive_attrs: list[str] = args.fairness_sensitive_attrs
+
+    # Parse ATTR=VALUE pairs from --fairness-privileged into a dict.
+    privileged_values: dict[str, str] = {}
+    for token in getattr(args, 'fairness_privileged', []):
+        if '=' in token:
+            attr, val = token.split('=', 1)
+            privileged_values[attr.strip()] = val.strip()
+        else:
+            print(
+                f'  [WARNING] --fairness-privileged: ignored token '
+                f'"{token}" (expected format ATTR=VALUE).'
+            )
+
+    # Fall back to module defaults when the user supplied nothing.
+    if not privileged_values:
+        privileged_values = None   # let the module use its own defaults
+
+    # ── Resolve dataset paths ─────────────────────────────────────────────
+    dataset_paths = _resolve_fairness_datasets(args)
+    if dataset_paths:
+        print('  [INFO] Dataset CSVs for population-level fairness:')
+        for p in dataset_paths:
+            print(f'    {p}')
+    else:
+        print(
+            '  [INFO] No dataset CSVs found — population-level metrics will '
+            'be skipped (rule-level metrics still computed).'
+        )
+
+    mod = _load_module(_SRC[5], 'fairness_analysis_association_rules')
+    t0  = time.perf_counter()
+    try:
+        mod.main(
+            regions           = args.regions,
+            k_values          = args.k_values,
+            base_dir          = _HERE.parent,
+            sensitive_attrs   = sensitive_attrs if sensitive_attrs else None,
+            privileged_values = privileged_values,
+            outcome_label     = args.fairness_outcome_label,
+            positive_outcome  = args.fairness_positive_outcome,
+            # Grid params — accepted for signature parity, not used by Step 5.
+            auto_calibrate           = args.auto_calibrate,
+            sup_min                  = args.sup_min,
+            sup_max                  = args.sup_max,
+            sup_delta                = args.sup_delta,
+            conf_min                 = args.conf_min,
+            conf_max                 = args.conf_max,
+            conf_delta               = args.conf_delta,
+            lift_min                 = args.lift_min,
+            lift_max                 = args.lift_max,
+            lift_delta               = args.lift_delta,
+            lift_neutral_half_window = args.lift_neutral_half_window,
+        )
+    except Exception:
+        print('\n  [ERROR] Step 5 failed:')
+        traceback.print_exc()
+        return False
+
+    print(f'\n  > Step 5 completed in {time.perf_counter() - t0:.1f}s')
+    return True
 
 def _parse_args() -> argparse.Namespace:
     """
@@ -607,16 +818,16 @@ def _parse_args() -> argparse.Namespace:
         prog            = 'main.py',
         description     = (
             'Pipeline orchestrator: '
-            'create_dataset → feature_importance → association_rules'
+            'create_dataset → feature_importance → association_rules → fairness_analysis'
         ),
         formatter_class = argparse.RawDescriptionHelpFormatter,
     )
 
     # ── Global options ─────────────────────────────────────────────────
     parser.add_argument(
-        '--steps', nargs='+', type=int, choices=[1, 2, 3, 4],
-        default=[1, 2, 3, 4], metavar='{1,2,3,4}',
-        help='Steps to run (default: all four).',
+        '--steps', nargs='+', type=int, choices=[1, 2, 3, 4, 5],
+        default=[1, 2, 3, 4, 5], metavar='{1,2,3,4,5}',
+        help='Steps to run (default: all five).',
     )
     parser.add_argument(
         '--force', action='store_true',
@@ -737,6 +948,58 @@ def _parse_args() -> argparse.Namespace:
                         '(default: 0.25 → window [0.75, 1.25]).'
                     ))
 
+    # ── Step 5: fairness analysis parameters ───────────────────────────
+    g5 = parser.add_argument_group(
+        'Step 5: fairness analysis',
+        'Parameters for the demographic fairness analysis step.',
+    )
+    g5.add_argument(
+        '--fairness-sensitive-attrs', nargs='+',
+        default=['SEX', 'RAC1P'], metavar='ATTR',
+        help=(
+            'Sensitive attribute names to analyse (default: SEX RAC1P). '
+            'Must match LABEL names used in the LABEL=value items of the rules.'
+        ),
+    )
+    g5.add_argument(
+        '--fairness-privileged', nargs='+', default=[], metavar='ATTR=VALUE',
+        help=(
+            'Privileged group for each sensitive attribute, as ATTR=VALUE pairs '
+            '(default: SEX=Male RAC1P=White-Alone). '
+            'The disparate impact ratio is computed relative to these groups. '
+            'Example: --fairness-privileged SEX=Male RAC1P=White-Alone'
+        ),
+    )
+    g5.add_argument(
+        '--fairness-outcome-label', default='INCOME_ABOVE_THRESHOLD',
+        help=(
+            'Feature name of the binary outcome in LABEL=value items '
+            '(default: INCOME_ABOVE_THRESHOLD).  Also used as the column name '
+            'when reading the original dataset CSVs for population-level metrics.'
+        ),
+    )
+    g5.add_argument(
+        '--fairness-positive-outcome', default='1',
+        help=(
+            'String value that represents the positive outcome '
+            '(default: "1").  Must match the encoding in both the rules and '
+            'the original dataset CSV.'
+        ),
+    )
+    g5.add_argument(
+        '--fairness-datasets', nargs='+', default=[], metavar='PATH',
+        help=(
+            'Explicit paths to one or more original dataset CSVs used for '
+            'population-level fairness metrics (DIR, SPD, positive rates). '
+            'Paths may be absolute or relative to the current working directory. '
+            'When omitted, dataset CSVs are auto-discovered from --output-dir '
+            'by matching acs_income_{region}_{survey-year}.csv; if none are '
+            'found there, all acs_income_*.csv files in that directory are used '
+            'as a fallback.  Pass an empty list to suppress auto-discovery and '
+            'run rule-level metrics only.'
+        ),
+    )
+
     return parser.parse_args()
 
 # ---------------------------------------------------------------------------
@@ -747,9 +1010,9 @@ def main() -> None:
     """
     Parse arguments, print the configuration banner, and run the selected steps.
 
-    Each step runner (run_step1, run_step2, run_step3, run_step4) returns True
-    on success and False on failure.  The pipeline halts at the first failed
-    step to prevent downstream steps from running on incomplete inputs.
+    Each step runner (run_step1 … run_step5) returns True on success and False
+    on failure.  The pipeline halts at the first failed step to prevent
+    downstream steps from running on incomplete inputs.
 
     Exit codes:
         0  — all selected steps completed successfully
@@ -786,6 +1049,13 @@ def main() -> None:
         print(f'  Support grid                 : [{args.sup_min}, {args.sup_max}] step={args.sup_delta}')
         print(f'  Confidence grid              : [{args.conf_min}, {args.conf_max}] step={args.conf_delta}')
         print(f'  Lift grid                    : [{args.lift_min}, {args.lift_max}] step={args.lift_delta} window=±{args.lift_neutral_half_window}')
+    if 5 in args.steps:
+        print(f'  Fairness sensitive attrs     : {args.fairness_sensitive_attrs}')
+        priv_str = ' '.join(args.fairness_privileged) if args.fairness_privileged else '(module defaults)'
+        print(f'  Fairness privileged groups   : {priv_str}')
+        print(f'  Fairness outcome label       : {args.fairness_outcome_label}={args.fairness_positive_outcome}')
+        ds_str = ' '.join(args.fairness_datasets) if args.fairness_datasets else '(auto-discovered)'
+        print(f'  Fairness dataset CSVs        : {ds_str}')
     print(f'  Force re-run                 : {args.force}')
     print(f'  Dry-run                      : {args.dry_run}')
     print(f'  Script directory (src/)      : {_HERE}')
@@ -806,7 +1076,7 @@ def main() -> None:
         sys.exit(1)
 
     # ── Execute selected steps in order ───────────────────────────────
-    _RUNNERS = {1: run_step1, 2: run_step2, 3: run_step3, 4: run_step4}
+    _RUNNERS = {1: run_step1, 2: run_step2, 3: run_step3, 4: run_step4, 5: run_step5}
     total_t0  = time.perf_counter()
     results   = {}
 
