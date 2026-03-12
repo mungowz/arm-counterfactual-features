@@ -42,9 +42,13 @@ Five independent parallelism layers are exploited:
 1. CatBoost thread_count = N_PHYSICAL_CORES (all 20 cores for training —
    work-stealing pool, no E-core straggler risk).
 
-2. _get_boundary_state() — BallTree queries for the two classes run in
-   parallel via ThreadPoolExecutor(2).  BallTree.query() releases the GIL,
-   so threads run truly concurrently on separate P-cores.
+2. _get_boundary_state() — two-level parallel BallTree query:
+   - Outer: one thread per class (ThreadPoolExecutor(n_classes)).
+   - Inner: each class thread chunks its N_class query points into
+     N_PHYSICAL_CORES // n_classes slices and queries them in parallel.
+     BallTree.query() releases the GIL, so all chunk threads run on
+     separate P-cores.  Total: n_classes × inner_workers = N_PHYSICAL_CORES
+     threads, saturating all cores during the boundary distance scan.
 
 3. explain() — class loops run in parallel via ThreadPoolExecutor(2).
    Each class thread drives its own NumPy/CatBoost workload independently;
@@ -291,8 +295,10 @@ class CategoricalBoCSoR:
 
     Parallel design (M1 Ultra)
     --------------------------
-    - _get_boundary_state(): BallTree queries for both classes run in a
-      ThreadPoolExecutor(2) — BallTree.query() releases the GIL.
+    - _get_boundary_state(): two-level parallel BallTree query.  Outer:
+      one thread per class; inner: each class thread chunks its query
+      points into N_PHYSICAL_CORES // n_classes slices queried in parallel.
+      Total threads = N_PHYSICAL_CORES, saturating all P-cores.
     - explain(): both class workloads run in a ThreadPoolExecutor(2) —
       NumPy and CatBoost both release the GIL during heavy computation.
     - The boundary-state cache is protected by a threading.Lock so that
@@ -552,9 +558,26 @@ class CategoricalBoCSoR:
             all_classes = np.unique(y_enc)
 
             # ── Parallel BallTree queries for both classes ────────────────
-            # Each class queries its own BallTree for k=1 (nearest opposite
-            # neighbour distance).  BallTree.query() releases the GIL, so
-            # both queries run concurrently on separate P-cores.
+            # Two-level parallelism:
+            #   Outer: one thread per class (ThreadPoolExecutor(n_classes)).
+            #   Inner: each class thread splits its N_class query points into
+            #          N_PHYSICAL_CORES // n_classes chunks and queries them in
+            #          parallel.  BallTree.query() releases the GIL, so all
+            #          chunk threads run truly concurrently on separate P-cores.
+            #
+            # Why chunk?  sklearn's BallTree.query() is single-threaded
+            # internally: it processes query points sequentially in C.  On
+            # large datasets (South: ~130 K samples/class) the single-threaded
+            # query dominates wall-clock time.  Chunking distributes the work
+            # across N_PHYSICAL_CORES threads without changing the results.
+            #
+            # Inner pool size per class: N_PHYSICAL_CORES // n_classes so the
+            # two class threads together saturate all physical cores:
+            #   2 classes × (N_PHYSICAL_CORES // 2) inner threads
+            #   = N_PHYSICAL_CORES threads total.
+            n_classes     = len(all_classes)
+            inner_workers = max(1, N_PHYSICAL_CORES // n_classes)
+
             def _query_class(label):
                 pos_idx = np.where(y_enc == label)[0]
                 if len(pos_idx) == 0:
@@ -565,10 +588,23 @@ class CategoricalBoCSoR:
                 if tree is None:
                     return int(label), None
 
-                # Boundary distance filter
-                min_dist, _ = tree.query(X_enc[pos_idx], k=1)
-                min_dist    = min_dist.ravel()
-                threshold   = np.percentile(min_dist, self.perc_threshold)
+                # ── Chunked parallel BallTree query ───────────────────────
+                n_query    = len(pos_idx)
+                chunk_size = max(1, n_query // inner_workers)
+                chunks     = [
+                    pos_idx[i : i + chunk_size]
+                    for i in range(0, n_query, chunk_size)
+                ]
+
+                def _query_chunk(idx_chunk):
+                    dist, _ = tree.query(X_enc[idx_chunk], k=1)
+                    return dist.ravel()
+
+                with ThreadPoolExecutor(max_workers=len(chunks)) as inner_pool:
+                    dist_parts = list(inner_pool.map(_query_chunk, chunks))
+
+                min_dist      = np.concatenate(dist_parts)
+                threshold     = np.percentile(min_dist, self.perc_threshold)
                 candidate_idx = pos_idx[min_dist <= threshold]
 
                 return int(label), {
@@ -578,7 +614,7 @@ class CategoricalBoCSoR:
                 }
 
             state: dict = {}
-            with ThreadPoolExecutor(max_workers=len(all_classes)) as pool:
+            with ThreadPoolExecutor(max_workers=n_classes) as pool:
                 for label, partial_state in pool.map(_query_class, all_classes):
                     state[label] = partial_state
 
