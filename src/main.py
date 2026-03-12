@@ -22,7 +22,7 @@ Pipeline
         Produces value-level rules + heatmaps under association_rules_values/.
         Requires Step 3 outputs (rules.csv files) to derive the active labels.
 
-    Step 5: fairness_analysis_association_rules.py
+    Step 5: fairness_analysis.py
         Compute fairness metrics on the value-level rules produced by Step 4.
         Metrics include disparate impact ratio (4/5 rule), statistical parity
         difference, confidence/support/lift parity, and intersectional analysis
@@ -115,7 +115,7 @@ _SRC = {
     2: _HERE / 'feature_importance.py',
     3: _HERE / 'macroscopic_experiment_association_rules.py',
     4: _HERE / 'microscopic_experiment_association_rules_values.py',
-    5: _HERE / 'fairness_analysis_association_rules.py',
+    5: _HERE / 'fairness_analysis.py',
 }
 
 # Human-readable step names used in the banner and summary output.
@@ -161,16 +161,26 @@ def _load_module(path: Path, name: str):
     return module
 
 
-def _check_source_files() -> bool:
+def _check_source_files(selected_steps: list[int] | None = None) -> bool:
     """
-    Verify that all step source files exist on disk.
+    Verify that the source files for the selected steps exist on disk.
 
-    Returns True if all files are present, False otherwise.
+    Only the steps that will actually be executed are checked: there is no
+    reason to abort because an unrelated script is missing.  If
+    *selected_steps* is None, all entries in _SRC are checked (used only
+    in tests / dry-run contexts where the step list is not yet known).
+
+    Returns True if all relevant files are present, False otherwise.
     Prints an error message for each missing file so the user knows
     exactly which script is absent.
     """
+    steps_to_check = (
+        {s: _SRC[s] for s in selected_steps if s in _SRC}
+        if selected_steps is not None
+        else _SRC
+    )
     ok = True
-    for step, path in _SRC.items():
+    for step, path in steps_to_check.items():
         if not path.exists():
             print(f'  [ERROR] Source for Step {step} not found: {path}')
             ok = False
@@ -712,7 +722,7 @@ def _resolve_fairness_datasets(args: argparse.Namespace) -> list[Path]:
 
 def run_step5(args: argparse.Namespace) -> bool:
     """
-    Run fairness_analysis_association_rules.py — demographic fairness metrics.
+    Run fairness_analysis.py — demographic fairness metrics.
 
     Prerequisites:
       - Step 4 output (value-level rules.csv files) must exist for at least
@@ -774,7 +784,7 @@ def run_step5(args: argparse.Namespace) -> bool:
             'be skipped (rule-level metrics still computed).'
         )
 
-    mod = _load_module(_SRC[5], 'fairness_analysis_association_rules')
+    mod = _load_module(_SRC[5], 'fairness_analysis')
     t0  = time.perf_counter()
     try:
         mod.main(
@@ -1071,7 +1081,7 @@ def main() -> None:
         return
 
     # Verify all source files exist before doing any work.
-    if not _check_source_files():
+    if not _check_source_files(selected_steps=args.steps):
         print('\n  [ERROR] One or more source files are missing. Aborting.')
         sys.exit(1)
 
