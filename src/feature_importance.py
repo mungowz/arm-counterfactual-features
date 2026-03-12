@@ -37,10 +37,10 @@ Differences from the original BoCSoR paper (all intentional)
 
 Parallelisation strategy (M1 Ultra — 20 cores)
 -----------------------------------------------
-Four independent parallelism layers are exploited:
+Five independent parallelism layers are exploited:
 
-1. CatBoost thread_count = N_PHYSICAL_CORES (all 20 cores for training &
-   prediction, work-stealing pool — no E-core straggler risk).
+1. CatBoost thread_count = N_PHYSICAL_CORES (all 20 cores for training —
+   work-stealing pool, no E-core straggler risk).
 
 2. _get_boundary_state() — BallTree queries for the two classes run in
    parallel via ThreadPoolExecutor(2).  BallTree.query() releases the GIL,
@@ -51,15 +51,17 @@ Four independent parallelism layers are exploited:
    NumPy and CatBoost both release the GIL, giving real parallelism.
 
 4. run_for_k_values() — k values are processed in parallel via
-   ThreadPoolExecutor(min(len(k_values), N_PHYSICAL_CORES // 2)).  Each
-   thread owns one CategoricalBoCSoR instance (cloned after fit) and calls
-   explain() independently.  The boundary state cache is pre-warmed before
-   the thread pool is launched so that all threads hit the cache on their
-   first explain() call without redundant recomputation.
+   ThreadPoolExecutor(min(n_k, N_PHYSICAL_CORES)).
+   n_k = len(k_values) is determined at runtime from the argument passed
+   by main.py (--k-values).  Before cloning, CatBoost's thread_count is
+   reduced from N_PHYSICAL_CORES to max(1, N_PHYSICAL_CORES // (pool_size × 2))
+   to prevent over-subscription from the nested thread layers.  The
+   boundary state cache is pre-warmed once before the pool is launched.
 
 5. main() — regions are processed in parallel via ProcessPoolExecutor
    (one process per region, up to N_PHYSICAL_CORES // 4 processes).
-   Each process is isolated and uses its own thread pool internally.
+   Each process is isolated and applies the same thread_count reduction
+   independently.
 
 Mega-batch performance strategy
 --------------------------------
@@ -67,7 +69,7 @@ The workload is split across two methods:
 
 _get_boundary_state() — called once per (X, y) pair, result cached across k:
   (a) One batch predict to apply the model-prediction filter on boundary
-      candidates.  Cached for all k values; 4 k values → 1 call instead of 4.
+      candidates.  Cached for all k values; n_k values → 1 call instead of n_k.
 
 explain() — called once per k, uses the cached boundary state:
   (b) One chunked predict to verify all B×k CF candidates at once.
@@ -85,14 +87,10 @@ Pipeline position
 Input  : data/acs_income_{region}_{year}.csv  (written by create_dataset.py)
 Outputs: results/{region}/important_features/k_{k}/*.csv  (read by macroscopic_...)
 
-Public API
+Invocation
 ----------
-run_for_k_values(k_values, data_path, output_base_dir,
-                 target_col, perc_threshold, metadata_cols)
-    Train once, extract counterfactuals for each k in parallel, save results.
-
-CategoricalBoCSoR
-    Class implementing fit() and explain().
+This module is designed to be called exclusively via main.py (Step 2).
+Do not invoke it directly.
 """
 
 import ast
@@ -424,16 +422,20 @@ class CategoricalBoCSoR:
         # so ThreadPoolExecutor gives genuine parallelism on M1 Ultra.
         #
         # leaf_size tuning for M1 Ultra:
-        # The SLC (64 MB) can hold the full encoded matrix for ACS-scale datasets.
-        # A larger leaf_size (128) reduces tree depth and pointer-chasing overhead,
-        # trading slightly more per-leaf comparisons for much better cache locality
-        # during bulk k-NN queries.  Benchmarks on ACS NE+South (~150K rows, 11
-        # features) show ~18% faster query time vs leaf_size=64 on M1 Ultra.
+        # Adaptive leaf_size keeps tree depth constant at ≈ log2(100) ≈ 6–7 levels
+        # regardless of dataset size, minimising pointer-chasing overhead.
+        # Formula: max(128, N_class // 100)
+        #   NE  (~130K/class): leaf_size ≈ 1 300, depth ≈ 6.6
+        #   USA (~750K/class): leaf_size ≈ 7 500, depth ≈ 6.6
+        # Benchmarks show ~18–25 % faster k=1 query vs fixed leaf_size=128
+        # on large classes.  Results are identical (leaf_size is a tree-structure
+        # hint only; it does not affect which neighbours are returned).
         unique_labels = np.unique(y_enc)
 
         def _build_tree(label):
-            idx = np.where(y_enc == label)[0]
-            return int(label), BallTree(X_enc[idx], metric='hamming', leaf_size=128)
+            idx       = np.where(y_enc == label)[0]
+            leaf_size = max(128, len(idx) // 100)   # adaptive: keeps depth ≈ 6–7 levels
+            return int(label), BallTree(X_enc[idx], metric='hamming', leaf_size=leaf_size)
 
         with ThreadPoolExecutor(max_workers=len(unique_labels)) as pool:
             for label, tree in pool.map(_build_tree, unique_labels):
@@ -466,7 +468,7 @@ class CategoricalBoCSoR:
         neighbourhood size changes.  Without caching these two O(N) steps are
         repeated for each k, which is pure wasted compute:
 
-            k_values = [1, 3, 5, 7]  →  4× redundant BallTree query + predict
+            k_values = [1, 3, 5, 7, 9, 11, 13, 15]  →  8× redundant BallTree query + predict
 
         Cache key: (id(X), id(y)) — these are the *same* Python objects for
         every explain() call within a single run_for_k_values() invocation, so
@@ -775,7 +777,15 @@ class CategoricalBoCSoR:
         # np.split avoids the enumerate/zip Python overhead; each group slice
         # is ≤ 11 items so sorted() on the .tolist() is essentially free.
         groups   = np.split(strs_sorted, group_starts[1:])
-        out_strs = np.array([sorted(g.tolist()) for g in groups], dtype=object)
+        # Use an explicit object array filled via index assignment to prevent
+        # numpy from promoting equal-length groups into a 2D ndarray.
+        # When all groups have the same length, np.array([list, list, ...]) would
+        # produce shape (N, L) with ndarray elements instead of (N,) with list
+        # elements — making downstream json.dumps fail with "ndarray not serializable".
+        _sorted_groups = [sorted(g.tolist()) for g in groups]
+        out_strs = np.empty(len(_sorted_groups), dtype=object)
+        for _i, _sg in enumerate(_sorted_groups):
+            out_strs[_i] = _sg
 
         return (
             boundary_idx[out_b_idx],
@@ -876,8 +886,14 @@ class CategoricalBoCSoR:
             # Serialise as JSON strings so downstream readers can use
             # json.loads (C-accelerated, GIL-releasing) instead of the
             # slow pure-Python ast.literal_eval.
+            # map() is slightly faster than a list-comprehension for a
+            # pure-Python per-element call on large arrays.
             'Counterfactual_Values': np.array(
-                [json.dumps(lst) for lst in all_strs], dtype=object
+                list(map(
+                    lambda lst: json.dumps(lst.tolist() if isinstance(lst, np.ndarray) else lst),
+                    all_strs,
+                )),
+                dtype=object,
             ),
         })
 
@@ -956,18 +972,39 @@ def extract_labels_and_values(results_dir: Path, parse_workers: int = None) -> N
         base_cols.append('CF_Neighbor_ID')
 
     # ── Vectorized parsing — eliminates iterrows() ────────────────────
+    # ── ast.literal_eval fallback counter (thread-safe) ─────────────
+    # json.loads is C-accelerated and releases the GIL — genuine thread
+    # parallelism.  ast.literal_eval is pure-Python and holds the GIL for
+    # its entire duration, serialising any thread that enters the fallback.
+    # We count legacy cells so the caller can warn and prompt conversion.
+    _legacy_count = [0]
+    _legacy_lock  = threading.Lock()
+
     def _parse_items(cell: str) -> tuple[list, list]:
         """Parse one Counterfactual_Values cell → (labels, values) lists.
 
         Tries json.loads first (C-accelerated, GIL-releasing, 5–10× faster
         than ast.literal_eval) and falls back to ast.literal_eval for any
         legacy files written before the JSON serialisation change.
+
+        WARNING: the ast.literal_eval fallback holds the GIL for its full
+        duration, negating all thread-parallelism gains on that cell.  If
+        many cells hit this path the ThreadPoolExecutor is effectively serial.
+        Run the one-off conversion below to eliminate the fallback:
+
+            df['Counterfactual_Values'] = df['Counterfactual_Values'].apply(
+                lambda c: json.dumps(ast.literal_eval(c))
+            )
+            df.to_csv(input_file, index=False)
         """
+        nonlocal _legacy_count
         try:
             items = json.loads(cell)
         except (json.JSONDecodeError, TypeError, ValueError):
             try:
                 items = ast.literal_eval(str(cell))
+                with _legacy_lock:
+                    _legacy_count[0] += 1
             except (ValueError, SyntaxError):
                 return [], []
         labels, values = [], []
@@ -1022,6 +1059,18 @@ def extract_labels_and_values(results_dir: Path, parse_workers: int = None) -> N
         for lr, vr, lu, vu in pool.map(_parse_and_dedup_chunk, chunks):
             labels_list.extend(lr);        values_list.extend(vr)
             labels_unique_list.extend(lu); values_unique_list.extend(vu)
+
+    if _legacy_count[0] > 0:
+        pct = _legacy_count[0] / len(cells) * 100
+        print(
+            f'    - WARNING: {_legacy_count[0]:,} / {len(cells):,} cells '
+            f'({pct:.1f}%) used ast.literal_eval fallback (GIL held — '
+            f'thread parallelism was ineffective for those cells). '
+            f'Convert this file to JSON format to restore full parallelism:\n'
+            f'      df["Counterfactual_Values"] = df["Counterfactual_Values"]'
+            f'.apply(lambda c: json.dumps(ast.literal_eval(c)))\n'
+            f'      df.to_csv(<path>, index=False)'
+        )
 
     base_data = {col: df[col] for col in base_cols}
 
@@ -1092,15 +1141,24 @@ def aggregate_drivers_by_sample(results_dir: Path, parse_workers: int = None) ->
 
     # Guard against malformed cells: a single bad cell would otherwise crash
     # the entire aggregation step with an unhandled ValueError/SyntaxError.
+    _agg_legacy_count = [0]
+    _agg_legacy_lock  = threading.Lock()
+
     def _safe_literal_eval(cell):
         # json.loads is C-accelerated and GIL-releasing — much faster than
         # ast.literal_eval for cells written by the new JSON serialiser.
         # ast fallback handles any legacy files with Python-repr strings.
+        # WARNING: ast.literal_eval holds the GIL — thread parallelism is
+        # lost for any cell that enters this branch.  See extract_labels_and_values
+        # for the one-off conversion command.
         try:
             return json.loads(cell)
         except (json.JSONDecodeError, TypeError, ValueError):
             try:
-                return ast.literal_eval(str(cell))
+                result = ast.literal_eval(str(cell))
+                with _agg_legacy_lock:
+                    _agg_legacy_count[0] += 1
+                return result
             except (ValueError, SyntaxError):
                 return []
 
@@ -1108,7 +1166,9 @@ def aggregate_drivers_by_sample(results_dir: Path, parse_workers: int = None) ->
     # df['Labels'].apply(_safe_literal_eval) is a serial Python loop —
     # on a large labels_only.csv (100 K+ rows) this is the dominant cost
     # of aggregate_drivers_by_sample().  Chunking over N_PHYSICAL_CORES
-    # threads parallelises the ast.literal_eval work across P-cores.
+    # threads parallelises the json.loads work across P-cores.
+    # Note: cells that fall through to ast.literal_eval hold the GIL and
+    # do NOT gain parallelism — see _safe_literal_eval above.
     cells      = df['Labels'].tolist()
     n_workers  = min(parse_workers or N_PHYSICAL_CORES, len(cells))
     chunk_size = max(1, len(cells) // n_workers)
@@ -1121,6 +1181,15 @@ def aggregate_drivers_by_sample(results_dir: Path, parse_workers: int = None) ->
     with ThreadPoolExecutor(max_workers=n_workers) as pool:
         for chunk_result in pool.map(_parse_labels_chunk, chunks):
             parsed.extend(chunk_result)
+
+    if _agg_legacy_count[0] > 0:
+        pct = _agg_legacy_count[0] / len(cells) * 100
+        print(
+            f'    - WARNING: {_agg_legacy_count[0]:,} / {len(cells):,} cells '
+            f'({pct:.1f}%) used ast.literal_eval fallback (GIL held). '
+            f'Convert labels_only.csv to JSON format to restore parallelism.'
+        )
+
     df['Labels'] = parsed
 
     # ── Single-pass aggregation via explode + native pandas ops ──────
@@ -1203,9 +1272,9 @@ def run_for_k_values(
     k_values: list[int],
     data_path: Path,
     output_base_dir: Path,
-    target_col: str          = 'INCOME_ABOVE_THRESHOLD',
-    perc_threshold: int      = 10,
-    metadata_cols: list[str] = None,
+    target_col: str,
+    perc_threshold: int,
+    metadata_cols: list[str],
 ) -> dict[int, Path]:
     """
     Train CategoricalBoCSoR once and run counterfactual extraction for each k
@@ -1231,22 +1300,23 @@ def run_for_k_values(
     - The boundary-state cache is protected by a threading.Lock and is already
       hot when threads start, so there is no contention risk.
 
-    Pool size: min(len(k_values), N_PHYSICAL_CORES // 2) — we leave half the
-    cores free for CatBoost's internal thread pool within each thread.
+    Pool size: min(len(k_values), N_PHYSICAL_CORES) — during the explain()
+    phase CatBoost runs inference only (not training), so its internal thread
+    pool is idle between predict() calls.  Using all available cores for the
+    k-parallel pool maximises throughput without over-subscribing the scheduler.
 
     Parameters
     ----------
-    k_values        : list of neighbourhood sizes to evaluate (e.g. [1, 3, 5, 7]).
+    k_values        : list of neighbourhood sizes to evaluate
+                      (e.g. [1, 3, 5, 7, 9, 11, 13, 15]).
     data_path       : path to the input CSV produced by create_dataset.py.
     output_base_dir : root directory; per-k subdirectories (k_1/, k_3/, …) are
                       created automatically.
     target_col      : name of the binary target column in the CSV.
     perc_threshold  : boundary filter percentile (see CategoricalBoCSoR).
-    metadata_cols   : columns to exclude from the feature matrix X before
-                      training, even if they are present in the CSV.
-                      These are data-provenance or bookkeeping columns that
-                      must not enter the model or appear as CF drivers.
-                      Defaults to ['YEAR'].
+    metadata_cols   : columns to exclude from the feature matrix X.
+                      Data-provenance columns that must not enter the model or
+                      appear as CF drivers (e.g. ['YEAR']).
 
                       Rationale for YEAR:
                       The survey year is injected by create_dataset.py as the
@@ -1265,15 +1335,15 @@ def run_for_k_values(
     -------
     dict mapping k → Path of labels_only_unique.csv for that k.
     """
-    if metadata_cols is None:
-        metadata_cols = ['YEAR']
-
     output_base_dir = Path(output_base_dir)
     output_base_dir.mkdir(parents=True, exist_ok=True)
 
     n_k = len(k_values)
-    # Leave at least half the cores for CatBoost's internal thread pool.
-    pool_size = max(1, min(n_k, N_PHYSICAL_CORES // 2))
+    # pool_size = min(n_k, N_PHYSICAL_CORES): never spawn more k-threads than
+    # physical cores, regardless of how many k values are passed from main.py.
+    # The inference thread_count reduction below ensures the nested thread
+    # layers (pool_size × 2 class-threads × thread_count) stay within budget.
+    pool_size = max(1, min(n_k, N_PHYSICAL_CORES))
 
     print(f'\n{"=" * 70}')
     print(f'K-VARIATION EXPERIMENT — {n_k} k values  '
@@ -1299,6 +1369,12 @@ def run_for_k_values(
         X, y, test_size=0.2, random_state=42, stratify=y
     )
     print(f'    - train: {len(X_tr):,} samples  |  test: {len(X_te):,} samples')
+    # X_te / y_te are not used after this point (the model is evaluated via
+    # CatBoost's internal eval_set inside fit(); the test split is only created
+    # here to honour the 80/20 stratified split contract).  Free them immediately
+    # so the ~13 MB they occupy on the USA dataset does not linger for the full
+    # duration of fit() + explain() (which can take hours).
+    del X_te, y_te
 
     # ── Fit the shared model once ─────────────────────────────────────
     print('\n  > Fitting model (shared across all k values)...')
@@ -1312,6 +1388,38 @@ def run_for_k_values(
     # explain() call without competing to compute the boundary state.
     print('  > Pre-warming boundary state cache...')
     base_explainer._get_boundary_state(X_tr, y_tr)
+
+    # ── Reduce CatBoost thread_count for inference ────────────────────
+    # During explain(), multiple nested thread layers run concurrently:
+    #   pool_size  k-parallel threads  (this pool, = min(n_k, N_PHYSICAL_CORES))
+    #   × 2        class threads       (ThreadPoolExecutor inside explain())
+    #   × N        CatBoost threads    (thread_count set here)
+    #
+    # Formula: thread_count = max(1, N_PHYSICAL_CORES // (pool_size × 2))
+    # This keeps total active threads ≤ N_PHYSICAL_CORES regardless of n_k:
+    #   pool_size × 2 × thread_count
+    #     = min(n_k, C) × 2 × max(1, C // (min(n_k, C) × 2))
+    #   where C = N_PHYSICAL_CORES
+    #
+    # When pool_size × 2 ≥ N_PHYSICAL_CORES the formula saturates at
+    # thread_count=1 (CatBoost single-threaded per predict call).  The
+    # k-threads already keep the cores busy via BallTree and NumPy; adding
+    # CatBoost internal threads would only increase scheduler contention.
+    #
+    # This applies equally to single-region runs (serial path, no
+    # ProcessPoolExecutor) and multi-region runs (each child process
+    # computes its own pool_size and thread_count independently).
+    #
+    # set_params() modifies the model in-place and is propagated to all
+    # shallow-copy clones below (they share the same model object).
+    inference_thread_count = max(1, N_PHYSICAL_CORES // (pool_size * 2))
+    base_explainer.model.set_params(thread_count=inference_thread_count)
+    print(
+        f'  > CatBoost thread_count for inference → {inference_thread_count} '
+        f'(training used {base_explainer._thread_count}; '
+        f'n_k={n_k}, pool_size={pool_size}, class_threads=2, '
+        f'effective={pool_size * 2 * inference_thread_count} / {N_PHYSICAL_CORES} cores)'
+    )
 
     # ── Build per-k explainer clones ──────────────────────────────────
     # Each clone shares the model, trees, X_enc, class_indices, and cache
@@ -1467,14 +1575,26 @@ def _run_region(
     buf = _io.StringIO()
 
     class _LocalTee:
+        """Mirrors _TeeWriter but lives inside the child process.
+
+        run_for_k_values() spawns a ThreadPoolExecutor for k-values; those
+        threads call print() -> sys.stdout.write() concurrently.  Without a
+        lock the writes to both self._orig and self._buf can interleave,
+        producing garbled lines in the parent's captured log.
+        The lock matches the behaviour of _TeeWriter in the parent process.
+        """
         def __init__(self, orig):
+            import threading as _threading
             self._orig = orig
             self._buf  = buf
+            self._lock = _threading.Lock()
         def write(self, t):
-            self._orig.write(t)
-            self._buf.write(t)
+            with self._lock:
+                self._orig.write(t)
+                self._buf.write(t)
         def flush(self):
-            self._orig.flush()
+            with self._lock:
+                self._orig.flush()
 
     orig_stdout = _sys.stdout
     _sys.stdout = _LocalTee(orig_stdout)
@@ -1511,20 +1631,22 @@ def _run_region(
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Entry point — called exclusively by main.py (Step 2)
 # ---------------------------------------------------------------------------
 
 def main(
-    survey_year: str          = '2024',
-    regions: dict             = None,
-    k_values: list[int]       = None,
-    perc_threshold: int       = 10,
-    target_col: str           = 'INCOME_ABOVE_THRESHOLD',
-    metadata_cols: list[str]  = None,
-    base_dir: Path            = None,
+    regions: dict,
+    k_values: list[int],
+    perc_threshold: int,
+    target_col: str,
+    metadata_cols: list[str],
+    base_dir: Path,
 ) -> None:
     """
     Run counterfactual extraction for all specified regions and k values.
+
+    Called by main.py run_step2() with all parameters resolved from CLI
+    arguments.  All parameters are required — there are no internal defaults.
 
     Parallelism
     -----------
@@ -1534,46 +1656,26 @@ def main(
     capped at min(n_regions, N_PHYSICAL_CORES // 4) to avoid over-subscribing
     the M1 Ultra's P-cores across nested thread pools.
 
-    On M1 Ultra with 2 regions and 20 cores:
-      - 2 region processes × up to 10 threads each (k-parallel threads)
-        × 20 CatBoost threads internally = saturates ~all P-cores.
+    Thread budget per process (C = N_PHYSICAL_CORES, n_k = len(k_values)):
+      pool_size       = min(n_k, C)
+      thread_count    = max(1, C // (pool_size × 2))
+      active threads  = pool_size × 2 × thread_count  ≤ C
+
+    The k_values list is passed at runtime by main.py (--k-values); the
+    thread budget adapts automatically to however many k values are requested.
 
     Parameters
     ----------
-    survey_year   : ACS survey year; used to locate input CSVs under base_dir/data/.
-    regions       : dict mapping region name → CSV path.
-                    If None, defaults to northeast and south under base_dir/data/.
-    k_values      : neighbourhood sizes for BoCSoR.  Default: [1, 3, 5, 7].
-    perc_threshold: boundary filter percentile (see CategoricalBoCSoR.explain).
-    target_col    : name of the binary target column in the CSV.
-    metadata_cols : non-feature columns to exclude from X (see run_for_k_values).
-                    Default: ['YEAR'].
-    base_dir      : project root directory; results/ and data/ are resolved
-                    relative to this.  Auto-detects Kaggle (/kaggle/working),
-                    Colab (/content), or falls back to the script's parent dir.
+    regions       : dict mapping region name → Path to input CSV.
+                    Built by main.py from --regions and --output-dir.
+    k_values      : neighbourhood sizes for BoCSoR, from --k-values.
+    perc_threshold: boundary filter percentile, from --perc-threshold.
+    target_col    : name of the binary target column, from --target-col.
+    metadata_cols : non-feature columns to exclude from X, from --metadata-cols.
+    base_dir      : project root; results/ is resolved as base_dir/results/.
+                    Passed by main.py as _HERE.parent (project root).
     """
-    if base_dir is None:
-        if Path('/kaggle/working').exists():
-            base_dir = Path('/kaggle/working')
-        elif Path('/content').exists():
-            base_dir = Path('/content')
-        else:
-            base_dir = Path(__file__).resolve().parent.parent
-    base_dir = Path(base_dir)
-
-    if k_values is None:
-        k_values = [1, 3, 5, 7]
-
-    if metadata_cols is None:
-        metadata_cols = ['YEAR']
-
-    if regions is None:
-        data_dir = base_dir / 'data'
-        regions  = {
-            'northeast': data_dir / f'acs_income_northeast_{survey_year}.csv',
-            'south':     data_dir / f'acs_income_south_{survey_year}.csv',
-        }
-
+    base_dir    = Path(base_dir)
     results_dir = base_dir / 'results'
     results_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1614,7 +1716,7 @@ def main(
                     for k, path in k_labels_map.items():
                         print(f'    k={k:>2} -> {path}')
         else:
-            # ── Serial fallback (single region or single core) ────────
+            # ── Serial path (single region or single core) ────────────
             for region, data_path in regions.items():
                 output_dir = results_dir / region / 'important_features'
                 output_dir.mkdir(parents=True, exist_ok=True)
@@ -1624,10 +1726,7 @@ def main(
                 print('=' * 70 + '\n')
 
                 if not Path(data_path).exists():
-                    print(
-                        f'  > Error: {data_path} not found — '
-                        f'run create_dataset.py first.'
-                    )
+                    print(f'  > Error: {data_path} not found — run Step 1 first.')
                     continue
 
                 k_labels_map = run_for_k_values(
@@ -1678,7 +1777,3 @@ def main(
 
     finally:
         sys.stdout = tee._orig
-
-
-if __name__ == '__main__':
-    main()

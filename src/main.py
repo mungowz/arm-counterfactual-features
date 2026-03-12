@@ -499,13 +499,12 @@ def run_step2(args: argparse.Namespace) -> bool:
     t0 = time.perf_counter()
     try:
         mod.main(
-            survey_year    = args.survey_year,
             regions        = regions,
             k_values       = args.k_values,
             perc_threshold = args.perc_threshold,
             target_col     = args.target_col,
             metadata_cols  = args.metadata_cols if args.metadata_cols is not None else [],
-            base_dir       = _HERE.parent,                # results/ and data/ resolved under _HERE.parent (project root)
+            base_dir       = _HERE.parent,
         )
     except Exception:
         print('\n  [ERROR] Step 2 failed:')
@@ -907,8 +906,9 @@ def _parse_args() -> argparse.Namespace:
     # ── Step 2: feature importance parameters ──────────────────────────
     g2 = parser.add_argument_group('Step 2: feature importance')
     g2.add_argument(
-        '--k-values', nargs='+', type=int, default=[1, 3, 5, 7],
-        help='CF neighbourhood sizes (default: 1 3 5 7).',
+        '--k-values', nargs='+', type=int,
+        default=[1, 3, 5, 7, 9, 11, 13, 15],
+        help='CF neighbourhood sizes (default: 1 3 5 7 9 11 13 15).',
     )
     g2.add_argument(
         '--perc-threshold', type=int, default=10,
