@@ -21,12 +21,15 @@ across all sup_*/conf_*/rules.csv files produced by Step 3, this script:
 
 1. Derives active_labels_r = labels(antecedents_r) ∪ labels(consequents_r).
    This is the *minimal* label set for rule r.
-2. From transactions_values.csv keeps only items whose label prefix is in
-   active_labels_r.  Support is then computed over this filtered set:
-       denominator = samples with ≥1 CF-change in an active label
+2. From transactions_values.csv keeps only **rows** (sample/CF pairs) that
+   contain at least one item whose label prefix is in active_labels_r.
+   All items in the kept rows are retained for mining — including items whose
+   label is NOT in active_labels_r.  Support is computed over this filtered
+   set: denominator = samples with ≥1 CF-change in an active label.
    NOT the total number of samples in the region.  This is intentional —
    we characterise patterns within the population that is sensitive to the
-   specific features named in the parent macroscopic rule.
+   specific features named in the parent macroscopic rule, while allowing
+   the value-level ARM to discover associations with any co-occurring feature.
 3. Builds two transaction formats:
        aggregated_values_by_sample.csv   — one row per sample (union of all
            CF-neighbour items, deduplicated)
@@ -286,9 +289,13 @@ def collect_unique_macro_rules(
             continue
         if df.empty:
             continue
-        for _, row in df.iterrows():
-            ant  = str(row.get('antecedents', '')).strip()
-            cons = str(row.get('consequents', '')).strip()
+        # itertuples is ~100× faster than iterrows for tight inner loops;
+        # fillna ensures missing cells become empty strings, not float NaN.
+        df = df.fillna('')
+        for row in df[['antecedents', 'consequents',
+                        'support_pct', 'confidence_pct', 'lift']].itertuples(index=False):
+            ant  = str(row.antecedents).strip()
+            cons = str(row.consequents).strip()
             if not ant or not cons:
                 continue
             key = (ant, cons)
@@ -301,9 +308,9 @@ def collect_unique_macro_rules(
                         _parse_labels_from_cell(cons)
                     ),
                     'source_paths':      [str(p)],
-                    'macro_support_pct': float(row.get('support_pct',   0.0)),
-                    'macro_conf_pct':    float(row.get('confidence_pct', 0.0)),
-                    'macro_lift':        float(row.get('lift',           0.0)),
+                    'macro_support_pct': float(row.support_pct)   if row.support_pct   != '' else 0.0,
+                    'macro_conf_pct':    float(row.confidence_pct) if row.confidence_pct != '' else 0.0,
+                    'macro_lift':        float(row.lift)            if row.lift           != '' else 0.0,
                 }
             else:
                 seen[key]['source_paths'].append(str(p))
@@ -327,18 +334,29 @@ def build_value_transactions(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Read transactions_values.csv and build aggregated and pair-level
-    transaction DataFrames, keeping only items whose label prefix belongs to
-    *active_labels*.
+    transaction DataFrames.
 
-    The support denominator is the number of samples that have at least one
-    CF-change in an active label (not the total population).  This is
-    intentional: we characterise patterns within samples sensitive to the
+    Row-selection logic (matches the spec)
+    --------------------------------------
+    A row (= one original-instance / CF-neighbour pair) is KEPT if it
+    contains at least one item whose label prefix belongs to *active_labels*.
+    ALL items in a kept row are retained for mining — including items whose
+    label is NOT in active_labels.  This is intentional: the macroscopic rule
+    tells us *which samples* to focus on (those that change at least one of
+    the rule's features), but the value-level ARM is then free to discover
+    associations among any features present in those samples.
+
+    Support denominator
+    -------------------
+    Support is computed over the set of samples that have at least one
+    CF-change in an active label — not the full region population.  This
+    characterises patterns within the sub-population sensitive to the
     features named in the parent macroscopic rule.
 
     Returns
     -------
     agg_df : pd.DataFrame
-        One row per Sample_ID.
+        One row per Sample_ID (union of all CF-neighbour items, deduplicated).
         Columns: Sample_ID, Values (str repr of sorted list),
                  Num_Values, Num_CF_Neighbors.
         Passed to encode_transactions() for FP-Growth.
@@ -362,34 +380,41 @@ def build_value_transactions(
         f'{df["Sample_ID"].nunique():,} unique samples'
     )
 
-    def _filter_items(raw: str) -> list:
+    def _parse_all_items(raw: str) -> list:
+        """Parse all label=value items from a cell, regardless of label."""
         try:
             items = ast.literal_eval(raw)
         except (ValueError, SyntaxError):
             return []
-        return [
-            item for item in items
-            if '=' in str(item)
-            and str(item).split('=', 1)[0] in active_labels
-        ]
+        return [item for item in items if '=' in str(item)]
+
+    def _has_active_label(items: list) -> bool:
+        """True if at least one item's label prefix is in active_labels."""
+        return any(str(item).split('=', 1)[0] in active_labels for item in items)
 
     df          = df.copy()
-    df['_filt'] = df['Counterfactual_Values'].apply(_filter_items)
-    df          = df[df['_filt'].map(len) > 0].reset_index(drop=True)
+    df['_all']  = df['Counterfactual_Values'].apply(_parse_all_items)
+
+    # Row selection: keep rows that contain ≥1 item from active_labels.
+    # Items from other labels are preserved — they may form meaningful
+    # associations with the active-label items in the value-level ARM.
+    df = df[df['_all'].apply(_has_active_label)].reset_index(drop=True)
 
     # ── Pair-level DataFrame ──────────────────────────────────────────
     pair_df = (
-        df[['Sample_ID', 'CF_Neighbor_ID', '_filt']]
-        .rename(columns={'_filt': 'Values'})
+        df[['Sample_ID', 'CF_Neighbor_ID', '_all']]
+        .rename(columns={'_all': 'Values'})
         .assign(Values=lambda d: d['Values'].apply(str))
         .reset_index(drop=True)
     )
 
     # ── Aggregated DataFrame ──────────────────────────────────────────
+    # One row per Sample_ID: union of all items across every CF-neighbour,
+    # deduplicated and sorted.  All items are included, not just active ones.
     agg_df = (
         df.groupby('Sample_ID', sort=False)
         .agg(
-            _items=('_filt',
+            _items=('_all',
                     lambda x: sorted({item for sub in x for item in sub})),
             Num_CF_Neighbors=('CF_Neighbor_ID', 'nunique'),
         )
@@ -400,7 +425,7 @@ def build_value_transactions(
     agg_df = agg_df[['Sample_ID', 'Values', 'Num_Values', 'Num_CF_Neighbors']]
 
     print(
-        f'    After filtering to {sorted(active_labels)}: '
+        f'    Rows with ≥1 active-label item ({sorted(active_labels)}): '
         f'{len(agg_df):,} samples, {len(pair_df):,} (sample, CF) pairs'
     )
     return agg_df, pair_df
@@ -414,10 +439,14 @@ def encode_transactions(values_col: pd.Series) -> pd.DataFrame:
     """
     One-hot-encode a Series of stringified Python lists into a Boolean
     DataFrame suitable for mlxtend's fpgrowth().
+
+    sparse=False is mandatory: on some pandas/scipy combinations the default
+    SparseDtype uses fill_value=True instead of False, which makes
+    DataFrame.mean() return 1.0 for every column and breaks calibrate_parameters().
     """
     itemsets = values_col.apply(ast.literal_eval)
     te       = TransactionEncoder()
-    te_ary   = te.fit(itemsets).transform(itemsets)
+    te_ary   = te.fit(itemsets).transform(itemsets, sparse=False)
     enc_df   = pd.DataFrame(te_ary, columns=te.columns_)
     print(
         f'    Encoded: {len(enc_df):,} transactions × '
@@ -434,6 +463,10 @@ def cleanup_empty_folders(output_dir: Path) -> tuple[int, int]:
     """
     Remove conf_* subdirs with no valid rules.csv, then remove empty sup_* dirs.
 
+    Uses stat().st_size instead of pd.read_csv to avoid loading every file
+    into memory during a hot cleanup loop. A rules.csv with at least one data
+    row is always > 120 bytes; a header-only file is < 120 bytes.
+
     Returns (n_conf_removed, n_sup_removed).
     """
     removed_conf = 0
@@ -448,8 +481,8 @@ def cleanup_empty_folders(output_dir: Path) -> tuple[int, int]:
             should_remove = not rules_csv.exists()
             if not should_remove:
                 try:
-                    should_remove = pd.read_csv(rules_csv).empty
-                except Exception:
+                    should_remove = rules_csv.stat().st_size < 120
+                except OSError:
                     should_remove = True
             if should_remove:
                 shutil.rmtree(conf_dir)
@@ -611,11 +644,16 @@ def calibrate_parameters(
     sup_min  — product of the two rarest item supports, snapped up to the
                nearest sup_delta; floored at sup_delta.
     sup_max  — support at which 2-itemsets stop appearing, plus 4 decay
-               steps; capped at 0.50.
+               steps; capped at 0.50.  Found via binary search O(log N)
+               instead of a linear scan — identical result, far fewer
+               FP-Growth calls.
     lift_max — 1 / support(rarest item), rounded up to nearest 0.5; capped
                at 10.0.
     conf_min — minimum confidence in a probe run at sup_min, snapped down
                to the nearest conf_delta; floored at conf_min_floor.
+
+    All calibration FP-Growth calls use max_len=2 — we only need to detect
+    presence/absence of 2-itemsets, so mining longer itemsets here is waste.
 
     Returns None if no 2-itemsets can be formed.
     """
@@ -635,7 +673,11 @@ def calibrate_parameters(
         round(np.floor(raw_sup_min / sup_delta) * sup_delta, 4), sup_delta
     )
 
-    _DECAY_STEPS            = 4
+    # ── Binary search for the natural 2-itemset ceiling ─────────────────
+    # FP-Growth is monotone: raising min_support can only remove itemsets.
+    # Binary search finds the highest threshold with ≥1 2-itemset in
+    # O(log(range/step)) calls rather than O(range/step).
+    # max_len=2: calibration only needs pairwise presence/absence detection.
     scan_grid               = np.round(
         np.arange(sup_min, freq_2 + sup_delta / 2, sup_delta), 4
     )
@@ -643,19 +685,37 @@ def calibrate_parameters(
     prev_had_2itemsets      = False
     fi_first_with_2itemsets = None
 
-    for t in scan_grid:
-        fi = fpgrowth(encoded_df, min_support=t, use_colnames=True)
-        if fi.empty:
-            break
-        has_2 = (fi['itemsets'].apply(len) >= 2).any()
-        if has_2:
-            if fi_first_with_2itemsets is None:
-                fi_first_with_2itemsets = fi
-            natural_sup_max    = t
-            prev_had_2itemsets = True
-        elif prev_had_2itemsets:
-            break
+    # Phase A: verify at least one 2-itemset exists at sup_min.
+    fi_lo = fpgrowth(encoded_df, min_support=float(scan_grid[0]),
+                     use_colnames=True, max_len=2)
+    if not fi_lo.empty and (fi_lo['itemsets'].apply(len) >= 2).any():
+        fi_first_with_2itemsets = fi_lo
+        prev_had_2itemsets      = True
 
+        if len(scan_grid) == 1:
+            natural_sup_max = scan_grid[0]
+        else:
+            # Phase B: binary search for the last grid index with 2-itemsets.
+            lo_idx, hi_idx = 0, len(scan_grid) - 1
+            while lo_idx < hi_idx:
+                mid_idx = (lo_idx + hi_idx + 1) // 2
+                fi_mid  = fpgrowth(
+                    encoded_df,
+                    min_support=float(scan_grid[mid_idx]),
+                    use_colnames=True,
+                    max_len=2,
+                )
+                has_2 = (
+                    not fi_mid.empty
+                    and (fi_mid['itemsets'].apply(len) >= 2).any()
+                )
+                if has_2:
+                    lo_idx = mid_idx
+                else:
+                    hi_idx = mid_idx - 1
+            natural_sup_max = scan_grid[lo_idx]
+
+    _DECAY_STEPS = 4
     sup_max = min(
         round(natural_sup_max + _DECAY_STEPS * sup_delta, 4), 0.50
     )
@@ -940,7 +1000,11 @@ def _process_one_support(
     _cross_label_mask = [
         a.isdisjoint(c) for a, c in zip(_ant_labels, _cons_labels)
     ]
-    n_same_label = len(all_rules) - sum(_cross_label_mask)
+    # Capture the count before same-label filtering so summary.txt can report
+    # the exact number excluded (avoids the fragile len(all_rules)+n_same_label
+    # reconstruction that breaks if all_rules were ever mutated between steps).
+    n_after_lift_window = len(all_rules)
+    n_same_label        = n_after_lift_window - sum(_cross_label_mask)
     all_rules = all_rules[_cross_label_mask].reset_index(drop=True)
 
     if len(all_rules) == 0:
@@ -1054,7 +1118,7 @@ def _process_one_support(
             )
             f.write('Results:\n')
             f.write(f'  Frequent Itemsets              : {n_fi}\n')
-            f.write(f'  After lift-window filter       : {len(all_rules) + n_same_label}\n')
+            f.write(f'  After lift-window filter       : {n_after_lift_window}\n')
             f.write(f'  Same-label rules excluded      : {n_same_label}\n')
             f.write(f'  After same-label filter        : {len(all_rules)}\n')
             f.write(f'  After confidence filter (final): {len(rules)}\n\n')
@@ -1152,11 +1216,13 @@ def _process_one_rule(
     Steps
     -----
     A. Create rule_dir, write macro_rule_origin files.
-    B. Filter transactions to the rule's active_labels.
+    B. Select rows from transactions_values.csv that contain ≥1 item whose
+       label prefix is in active_labels.  All items in kept rows are
+       retained for mining (not just the active-label items).
     C. Persist aggregated and pair-level CSVs.
     D. One-hot-encode the aggregated transactions.
     E. Calibrate grid parameters (auto) or use manual bounds.
-    F. Run full grid search via explore_association_rules_values().
+    F. Run full support × confidence × lift grid search via _explore_rule().
 
     Returns
     -------
@@ -1948,5 +2014,3 @@ def main(
     print('=' * 70 + '\n')
 
 
-if __name__ == '__main__':
-    main()

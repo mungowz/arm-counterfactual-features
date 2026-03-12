@@ -312,9 +312,9 @@ def grid_search_fpgrowth_delta(
 
     for min_sup in support_grid:
         # FP-Growth: mine all frequent itemsets at this support threshold.
-        # max_len=4 prunes the search space: association rules with antecedent +
-        # consequent length > 4 are rarely actionable and exponentially costly.
-        frequent_itemsets = fpgrowth(df, min_support=min_sup, use_colnames=True, max_len=4)
+        # No max_len cap: all frequent itemsets are retained regardless of length.
+        # FP-Growth's own min_support pruning keeps the search tractable.
+        frequent_itemsets = fpgrowth(df, min_support=min_sup, use_colnames=True)
         if len(frequent_itemsets) == 0:
             continue
 
@@ -589,11 +589,9 @@ def _process_one_support(
     print('    > running FP-Growth...')
 
     # Run FP-Growth to mine all frequent itemsets at this support level.
-    # Each itemset is a frozenset of feature names that co-occur in at least
-    # min_sup fraction of transactions.
-    # max_len=4 prunes the search space: rules with antecedent + consequent
-    # length > 4 are rarely actionable and exponentially expensive to mine.
-    frequent_itemsets = fpgrowth(df, min_support=min_sup, use_colnames=True, max_len=4)
+    # No max_len cap: all frequent itemsets are retained regardless of length.
+    # FP-Growth's own min_support pruning keeps the search tractable.
+    frequent_itemsets = fpgrowth(df, min_support=min_sup, use_colnames=True)
     print(f'    > {len(frequent_itemsets)} frequent itemsets found')
 
     if len(frequent_itemsets) == 0:
@@ -1849,5 +1847,3 @@ def main(
     print('=' * 70 + '\n')
 
 
-if __name__ == '__main__':
-    main()
