@@ -559,9 +559,17 @@ def run_step3(args: argparse.Namespace) -> bool:
             lift_neutral_half_window = args.lift_neutral_half_window,
             base_dir                 = _HERE.parent,   # results/ and data/ resolved under _HERE.parent (project root)
         )
-    except Exception:
+    except Exception as exc:
         print('\n  [ERROR] Step 3 failed:')
-        traceback.print_exc()
+        import traceback as _tb
+        _tb.print_exc()
+        cause = getattr(exc, '__cause__', None)
+        depth = 0
+        while cause is not None and depth < 6:
+            depth += 1
+            print(f'\n  [Cause #{depth}] {type(cause).__name__}: {cause}')
+            _tb.print_exception(type(cause), cause, cause.__traceback__)
+            cause = getattr(cause, '__cause__', None)
         return False
 
     print(f'\n  > Step 3 completed in {time.perf_counter() - t0:.1f}s')
@@ -617,9 +625,20 @@ def run_step4(args: argparse.Namespace) -> bool:
             lift_neutral_half_window = args.lift_neutral_half_window,
             base_dir                 = _HERE.parent,
         )
-    except Exception:
+    except Exception as exc:
         print('\n  [ERROR] Step 4 failed:')
-        traceback.print_exc()
+        # joblib wraps worker exceptions in a RemoteTraceback chain.
+        # traceback.print_exc() only shows the outer wrapper.
+        # Walk the full __cause__ chain to expose the original error.
+        import traceback as _tb
+        _tb.print_exc()
+        cause = getattr(exc, '__cause__', None)
+        depth = 0
+        while cause is not None and depth < 6:
+            depth += 1
+            print(f'\n  [Cause #{depth}] {type(cause).__name__}: {cause}')
+            _tb.print_exception(type(cause), cause, cause.__traceback__)
+            cause = getattr(cause, '__cause__', None)
         return False
 
     print(f'\n  > Step 4 completed in {time.perf_counter() - t0:.1f}s')

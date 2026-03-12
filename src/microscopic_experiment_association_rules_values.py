@@ -33,6 +33,11 @@ across all sup_*/conf_*/rules.csv files produced by Step 3, this script:
        values_only_unique.csv            — one row per (sample, CF_neighbor)
 4. Runs the same support × confidence × lift grid search as Step 3,
    with auto-calibration derived from the filtered item frequencies.
+   Two additional filters are applied before writing any rules:
+     a. Neutral lift window [1-w, 1+w] excluded (default w=0.25).
+     b. Same-label rules excluded: rules where antecedents and consequents
+        share at least one label prefix are dropped
+        (e.g. ST=NJ → ST=MA is excluded because both sides belong to ST).
 5. Writes all artefacts under a dedicated rule subdirectory:
        results/{region}/association_rules_values/{exp_label}/k_{k}/
            rule_{i:03d}__{ant}___{cons}/
@@ -910,13 +915,37 @@ def _process_one_support(
     except ValueError:
         return local_summary_rows
 
-    if len(all_rules) == 0:
+    if len(all_rules) == 0 or 'lift' not in all_rules.columns:
         return local_summary_rows
 
     all_rules = all_rules[
         (all_rules['lift'] < lift_window_lo) |
         (all_rules['lift'] > lift_window_hi)
     ]
+
+    if len(all_rules) == 0:
+        return local_summary_rows
+
+    # Exclude rules whose antecedents and consequents share at least one label.
+    # E.g. ST=NJ → ST=MA is meaningless at the value level because both sides
+    # belong to the same feature (ST); a macroscopic rule would never pair a
+    # feature with itself, so such micro-rules have no interpretive value.
+    # The label of an item is the prefix before the first '=' character.
+    _ant_labels  = all_rules['antecedents'].apply(
+        lambda x: frozenset(i.split('=')[0] for i in x if '=' in i)
+    )
+    _cons_labels = all_rules['consequents'].apply(
+        lambda x: frozenset(i.split('=')[0] for i in x if '=' in i)
+    )
+    _cross_label_mask = [
+        a.isdisjoint(c) for a, c in zip(_ant_labels, _cons_labels)
+    ]
+    n_same_label = len(all_rules) - sum(_cross_label_mask)
+    all_rules = all_rules[_cross_label_mask].reset_index(drop=True)
+
+    if len(all_rules) == 0:
+        return local_summary_rows
+
     all_rules = all_rules.sort_values(
         'lift', ascending=False
     ).reset_index(drop=True)
@@ -936,8 +965,11 @@ def _process_one_support(
         conviction_vals = rules['conviction'].replace([np.inf, -np.inf], np.nan)
 
         # ── Compact output (rules.csv) ────────────────────────────────
-        fmt = pd.DataFrame()
-        # Provenance columns first — always present for easy filtering
+        # Initialise with rules.index so scalar assignments broadcast to all
+        # rows instead of creating a single-row DataFrame that mis-aligns with
+        # the Series columns added afterwards (which would leave all macro_*
+        # columns NaN except the first row).
+        fmt = pd.DataFrame(index=rules.index)
         fmt['macro_rule_index']  = m_idx
         fmt['macro_antecedents'] = m_ant
         fmt['macro_consequents'] = m_cons
@@ -956,7 +988,7 @@ def _process_one_support(
         fmt['conviction']        = conviction_vals.round(4)
 
         # ── Detailed output (rules_detailed.csv) ─────────────────────
-        det = pd.DataFrame()
+        det = pd.DataFrame(index=rules.index)
         det['macro_rule_index']       = m_idx
         det['macro_antecedents']      = m_ant
         det['macro_consequents']      = m_cons
@@ -1014,11 +1046,18 @@ def _process_one_support(
             f.write(f'  Min Confidence : {min_conf}\n')
             f.write(
                 f'  Neutral Lift Window (excluded): '
-                f'[{lift_window_lo}, {lift_window_hi}]\n\n'
+                f'[{lift_window_lo}, {lift_window_hi}]\n'
+            )
+            f.write(
+                f'  Same-label rules excluded    : yes '
+                f'(antecedents ∩ consequents labels must be empty)\n\n'
             )
             f.write('Results:\n')
-            f.write(f'  Frequent Itemsets : {n_fi}\n')
-            f.write(f'  Association Rules : {len(rules)}\n\n')
+            f.write(f'  Frequent Itemsets              : {n_fi}\n')
+            f.write(f'  After lift-window filter       : {len(all_rules) + n_same_label}\n')
+            f.write(f'  Same-label rules excluded      : {n_same_label}\n')
+            f.write(f'  After same-label filter        : {len(all_rules)}\n')
+            f.write(f'  After confidence filter (final): {len(rules)}\n\n')
             f.write('Statistics:\n')
             f.write(
                 f'  Avg Support    : {rules["support"].mean() * 100:.2f}%\n'
@@ -1078,10 +1117,11 @@ def _process_one_support(
                 'Avg_Support':    round(filtered['support'].mean(), 4)    if n > 0 else 0.0,
                 'Avg_Rule_Length':  round(rl.mean(), 4) if n > 0 else 0.0,
                 'Max_Rule_Length':  int(rl.max())        if n > 0 else 0,
-                'Num_Frequent_Itemsets': n_fi,
-                'Num_FI_length_1':       itemsets_by_len.get(1, 0),
-                'Num_FI_length_2':       itemsets_by_len.get(2, 0),
-                'Num_FI_length_3plus':   sum(
+                'Num_Frequent_Itemsets':      n_fi,
+                'Num_Same_Label_Excluded':    n_same_label,
+                'Num_FI_length_1':            itemsets_by_len.get(1, 0),
+                'Num_FI_length_2':            itemsets_by_len.get(2, 0),
+                'Num_FI_length_3plus':        sum(
                     v for k2, v in itemsets_by_len.items() if k2 >= 3
                 ),
             })
@@ -1381,6 +1421,25 @@ def _explore_rule(
             f'  Lift       : {len(lift_grid_used)} values '
             f'(neutral window [{lift_window_lo}, {lift_window_hi}] excluded, '
             f'step={lift_delta})\n\n'
+        )
+        # Aggregate same-label exclusions across all support thresholds.
+        # n_same_label is constant within each support level (computed before
+        # the confidence loop), so we take the first value per support threshold.
+        _total_sl_excl = 0
+        if (
+            not summary_df.empty
+            and 'Num_Same_Label_Excluded' in summary_df.columns
+            and 'Support' in summary_df.columns
+        ):
+            _total_sl_excl = int(
+                summary_df.groupby('Support')['Num_Same_Label_Excluded']
+                .first().sum()
+            )
+        f.write('Active Filters:\n')
+        f.write(f'  Neutral lift window : [{lift_window_lo}, {lift_window_hi}] excluded\n')
+        f.write(
+            f'  Same-label rules    : {_total_sl_excl} excluded across all support thresholds '
+            f'(antecedents \u2229 consequents label set must be empty)\n\n'
         )
         f.write('Results:\n')
         f.write(f'  Total combinations : {total_combos:,}\n')

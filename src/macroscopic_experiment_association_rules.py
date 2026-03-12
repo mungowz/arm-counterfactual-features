@@ -333,7 +333,8 @@ def grid_search_fpgrowth_delta(
             # (e.g. single-item transactions only).
             continue
 
-        if len(all_rules) == 0:
+        # mlxtend >= 0.23 returns a column-less DataFrame when only 1-itemsets exist.
+        if len(all_rules) == 0 or 'lift' not in all_rules.columns:
             continue
 
         # Remove rules in the neutral window; keep negative correlations (lift < lo).
@@ -638,7 +639,8 @@ def _process_one_support(
     except ValueError:
         return local_summary_rows
 
-    if len(all_rules) == 0:
+    # mlxtend >= 0.23 returns a column-less DataFrame when only 1-itemsets exist.
+    if len(all_rules) == 0 or 'lift' not in all_rules.columns:
         return local_summary_rows
 
     # Exclude neutral window; preserve negative correlations (lift < lo).
@@ -667,35 +669,37 @@ def _process_one_support(
         conviction_vals = rules['conviction'].replace([np.inf, -np.inf], np.nan)
 
         # Compact output.
-        fmt = pd.DataFrame()
+        # Initialise with rules.index so scalar column assignments broadcast
+        # correctly to all rows (same pattern as microscopic script).
+        fmt = pd.DataFrame(index=rules.index)
         fmt['antecedents']    = rules['antecedents'].apply(lambda x: ', '.join(sorted(x)))
         fmt['consequents']    = rules['consequents'].apply(lambda x: ', '.join(sorted(x)))
-        fmt['support_raw']    = [f'{v:.4f}' for v in rules['support']]
+        fmt['support_raw']    = rules['support'].map('{:.4f}'.format)
         fmt['support_pct']    = (rules['support']    * 100).round(2)
-        fmt['confidence_raw'] = [f'{v:.4f}' for v in rules['confidence']]
+        fmt['confidence_raw'] = rules['confidence'].map('{:.4f}'.format)
         fmt['confidence_pct'] = (rules['confidence'] * 100).round(2)
         fmt['lift']           = rules['lift'].round(4)
         fmt['leverage']       = rules['leverage'].round(6)
         fmt['conviction']     = conviction_vals.round(4)
 
         # Detailed output.
-        det = pd.DataFrame()
-        det['antecedents']            = rules['antecedents'].apply(lambda x: ', '.join(sorted(x)))
-        det['consequents']            = rules['consequents'].apply(lambda x: ', '.join(sorted(x)))
+        det = pd.DataFrame(index=rules.index)
+        det['antecedents']            = fmt['antecedents']
+        det['consequents']            = fmt['consequents']
         det['antecedent_length']      = rules['antecedents'].apply(len)
         det['consequent_length']      = rules['consequents'].apply(len)
         det['rule_length']            = det['antecedent_length'] + det['consequent_length']
-        det['antecedent_support_raw'] = [f'{v:.4f}' for v in rules['antecedent support']]
+        det['antecedent_support_raw'] = rules['antecedent support'].map('{:.4f}'.format)
         det['antecedent_support_pct'] = (rules['antecedent support'] * 100).round(2)
-        det['consequent_support_raw'] = [f'{v:.4f}' for v in rules['consequent support']]
+        det['consequent_support_raw'] = rules['consequent support'].map('{:.4f}'.format)
         det['consequent_support_pct'] = (rules['consequent support'] * 100).round(2)
-        det['support_raw']            = [f'{v:.4f}' for v in rules['support']]
-        det['support_pct']            = (rules['support']    * 100).round(2)
-        det['confidence_raw']         = [f'{v:.4f}' for v in rules['confidence']]
-        det['confidence_pct']         = (rules['confidence'] * 100).round(2)
-        det['lift']                   = rules['lift'].round(4)
-        det['leverage']               = rules['leverage'].round(6)
-        det['conviction']             = conviction_vals.round(4)
+        det['support_raw']            = fmt['support_raw']
+        det['support_pct']            = fmt['support_pct']
+        det['confidence_raw']         = fmt['confidence_raw']
+        det['confidence_pct']         = fmt['confidence_pct']
+        det['lift']                   = fmt['lift']
+        det['leverage']               = fmt['leverage']
+        det['conviction']             = fmt['conviction']
 
         conf_dir.mkdir(parents=True, exist_ok=True)
         fmt.to_csv(conf_dir / 'rules.csv',          index=False)
