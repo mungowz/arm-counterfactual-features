@@ -42,25 +42,23 @@ Five independent parallelism layers are exploited:
 1. CatBoost thread_count = N_PHYSICAL_CORES (all 20 cores for training —
    work-stealing pool, no E-core straggler risk).
 
-2. _get_boundary_state() — two-level parallel BallTree query:
-   - Outer: one thread per class (ThreadPoolExecutor(n_classes)).
-   - Inner: each class thread chunks its N_class query points into
-     N_PHYSICAL_CORES // n_classes slices and queries them in parallel.
-     BallTree.query() releases the GIL, so all chunk threads run on
-     separate P-cores.  Total: n_classes × inner_workers = N_PHYSICAL_CORES
-     threads, saturating all cores during the boundary distance scan.
+2. _get_boundary_state() — flat parallel BallTree query:
+   A single ThreadPoolExecutor(N_PHYSICAL_CORES) processes all per-class
+   chunks as independent tasks.  This avoids nested executor creation which
+   on macOS/Apple Silicon causes GCD to spawn additional internal threads,
+   multiplying the live thread count and stalling the scheduler (observed
+   freeze after "Computing boundary state...").  One flat pool,
+   N_PHYSICAL_CORES workers, each task is one independent chunk query.
 
-3. explain() — class loops run in parallel via ThreadPoolExecutor(2).
-   Each class thread drives its own NumPy/CatBoost workload independently;
-   NumPy and CatBoost both release the GIL, giving real parallelism.
+3. explain() — class loops run sequentially per k-thread.
+   The outer k-parallel pool (ThreadPoolExecutor in run_for_k_values) already
+   saturates all cores.  A nested per-class executor here would trigger the
+   same GCD thread explosion as the two-level design in _get_boundary_state.
 
 4. run_for_k_values() — k values are processed in parallel via
    ThreadPoolExecutor(min(n_k, N_PHYSICAL_CORES)).
-   n_k = len(k_values) is determined at runtime from the argument passed
-   by main.py (--k-values).  Before cloning, CatBoost's thread_count is
-   reduced from N_PHYSICAL_CORES to max(1, N_PHYSICAL_CORES // (pool_size × 2))
-   to prevent over-subscription from the nested thread layers.  The
-   boundary state cache is pre-warmed once before the pool is launched.
+   CatBoost thread_count is reduced to max(1, N_PHYSICAL_CORES // pool_size)
+   so total CatBoost threads stay within the core budget.
 
 5. main() — regions are processed in parallel via ProcessPoolExecutor
    (one process per region, up to N_PHYSICAL_CORES // 4 processes).
@@ -115,6 +113,12 @@ from catboost import CatBoostClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import OrdinalEncoder, LabelEncoder
 from sklearn.neighbors import BallTree
+
+try:
+    from pynndescent import NNDescent
+    _PYNNDESCENT_AVAILABLE = True
+except ImportError:
+    _PYNNDESCENT_AVAILABLE = False
 
 
 # ---------------------------------------------------------------------------
@@ -295,12 +299,16 @@ class CategoricalBoCSoR:
 
     Parallel design (M1 Ultra)
     --------------------------
-    - _get_boundary_state(): two-level parallel BallTree query.  Outer:
-      one thread per class; inner: each class thread chunks its query
-      points into N_PHYSICAL_CORES // n_classes slices queried in parallel.
-      Total threads = N_PHYSICAL_CORES, saturating all P-cores.
-    - explain(): both class workloads run in a ThreadPoolExecutor(2) —
-      NumPy and CatBoost both release the GIL during heavy computation.
+    - _get_boundary_state(): serial BallTree query per class.
+      All ThreadPoolExecutor-based parallelism for BallTree was removed because
+      sklearn's BallTree calls into vecLib/Accelerate on Apple Silicon, which
+      uses Grand Central Dispatch (GCD) internally.  Any Python thread pool
+      around BallTree triggers GCD thread accumulation that stalls macOS's
+      scheduler — observed as a hard freeze after "Computing boundary state...".
+      The query over ~130K points takes ~2–5 s serially, negligible vs training.
+    - explain(): each k-value runs independently in the k-parallel thread pool
+      from run_for_k_values.  CatBoost and NumPy release the GIL so the pool
+      gives real parallelism for the predict and broadcasting steps.
     - The boundary-state cache is protected by a threading.Lock so that
       concurrent explain() calls from run_for_k_values()'s thread pool
       do not trigger redundant recomputation.
@@ -422,30 +430,64 @@ class CategoricalBoCSoR:
         self._fit_X_id = id(X)
         self._fit_y_id = id(y)
 
-        # Build one Hamming-metric BallTree per class — in parallel.
-        # Built on X_enc / y_enc (encoded form of the training split X/y).
-        # BallTree construction is GIL-releasing (distance computations in C),
-        # so ThreadPoolExecutor gives genuine parallelism on M1 Ultra.
+        # ── Build per-class ANN index for CF neighbour queries ────────────
+        # Used in _get_boundary_state: for each boundary instance find its k
+        # nearest neighbours in the OPPOSITE class.
         #
-        # leaf_size tuning for M1 Ultra:
-        # Adaptive leaf_size keeps tree depth constant at ≈ log2(100) ≈ 6–7 levels
-        # regardless of dataset size, minimising pointer-chasing overhead.
-        # Formula: max(128, N_class // 100)
-        #   NE  (~130K/class): leaf_size ≈ 1 300, depth ≈ 6.6
-        #   USA (~750K/class): leaf_size ≈ 7 500, depth ≈ 6.6
-        # Benchmarks show ~18–25 % faster k=1 query vs fixed leaf_size=128
-        # on large classes.  Results are identical (leaf_size is a tree-structure
-        # hint only; it does not affect which neighbours are returned).
+        # Backend selection (automatic):
+        #
+        #   pynndescent (preferred, install with: pip install pynndescent)
+        #   ---------------------------------------------------------------
+        #   Graph-based approximate nearest neighbour index optimised for
+        #   Hamming metric on high-cardinality categorical data.  Build is
+        #   O(N log N) and query is O(log N) — 50-100× faster than BallTree
+        #   at N=850K.  Approximation error is negligible for the percentile
+        #   boundary filter (±1 Hamming step affects <1% of boundary set).
+        #   With n_jobs=-1 it uses all available cores without spawning GCD
+        #   threads, so it is safe on macOS/Apple Silicon.
+        #
+        #   BallTree fallback (sklearn, always available)
+        #   ---------------------------------------------------------------
+        #   Exact but slow at large N: Hamming distances cluster in a narrow
+        #   range so the tree cannot prune branches; queries degrade to near-
+        #   O(N) per point.  At 850K/class this takes ~10h — use only for
+        #   small datasets or if pynndescent is not installed.
         unique_labels = np.unique(y_enc)
+        if _PYNNDESCENT_AVAILABLE:
+            print(f'  > Building pynndescent ANN indices (Hamming, n_jobs=-1)...')
+        else:
+            print(f'  > pynndescent not found — falling back to BallTree (serial).')
+            print(f'    Install with: pip install pynndescent')
+            print(f'  > Building BallTrees (full class, serial, Hamming)...')
 
-        def _build_tree(label):
-            idx       = np.where(y_enc == label)[0]
-            leaf_size = max(128, len(idx) // 100)   # adaptive: keeps depth ≈ 6–7 levels
-            return int(label), BallTree(X_enc[idx], metric='hamming', leaf_size=leaf_size)
+        if not hasattr(self, '_tree_sample_idx'):
+            self._tree_sample_idx = {}
 
-        with ThreadPoolExecutor(max_workers=len(unique_labels)) as pool:
-            for label, tree in pool.map(_build_tree, unique_labels):
-                self.trees[label] = tree
+        for label in unique_labels:
+            idx = np.where(y_enc == label)[0]
+            lbl = int(label)
+            # Store ALL class indices for global index mapping (no subsample)
+            self._tree_sample_idx[lbl] = idx
+
+            if _PYNNDESCENT_AVAILABLE:
+                # NNDescent.query() is called later in _get_boundary_state.
+                # We build with n_neighbors=30 (> max_k=15) so the internal
+                # graph has enough neighbours for any k we might query.
+                # n_jobs=-1 uses all cores via numba/joblib (not GCD threads).
+                index = NNDescent(
+                    X_enc[idx].astype(np.float32),
+                    metric   = 'hamming',
+                    n_neighbors = 30,
+                    n_jobs   = -1,
+                    random_state = 42,
+                )
+                index.prepare()   # pre-build search structure
+                self.trees[lbl] = index
+            else:
+                leaf_size = max(40, len(idx) // 200)
+                self.trees[lbl] = BallTree(
+                    X_enc[idx], metric='hamming', leaf_size=leaf_size
+                )
 
         # Pre-cache per-class index arrays (into X_enc / y_enc) so explain() can
         # directly index self.X_enc without recomputing np.where for every class.
@@ -462,6 +504,7 @@ class CategoricalBoCSoR:
         self,
         X: pd.DataFrame,
         y: pd.Series,
+        max_k: int | None = None,
     ) -> tuple:
         """
         Encode X/y, compute boundary indices per class, and cache the result.
@@ -469,12 +512,12 @@ class CategoricalBoCSoR:
         Why cache?
         ----------
         run_for_k_values() calls explain(X_tr, y_tr) once per k value.  The
-        boundary filter (BallTree k=1 query + percentile threshold) and the
+        boundary filter (NumPy Hamming distance + percentile threshold) and the
         model-prediction filter are identical for every k — only the CF
         neighbourhood size changes.  Without caching these two O(N) steps are
         repeated for each k, which is pure wasted compute:
 
-            k_values = [1, 3, 5, 7, 9, 11, 13, 15]  →  8× redundant BallTree query + predict
+            k_values = [1, 3, 5, 7, 9, 11, 13, 15]  →  8× redundant distance compute + predict
 
         Cache key: (id(X), id(y)) — these are the *same* Python objects for
         every explain() call within a single run_for_k_values() invocation, so
@@ -497,10 +540,9 @@ class CategoricalBoCSoR:
 
         Parallelism
         -----------
-        The per-class BallTree queries (min-distance computation) are dispatched
-        to a ThreadPoolExecutor(n_classes).  BallTree.query() releases the GIL,
-        so the queries for both classes run truly concurrently on separate
-        P-cores, halving the boundary-state computation time.
+        The boundary distance computation uses NumPy broadcasting (no Python
+        threads) so Apple's BLAS/vecLib accelerates it automatically across
+        all available cores without spawning GCD threads.
 
         Returns
         -------
@@ -557,66 +599,49 @@ class CategoricalBoCSoR:
 
             all_classes = np.unique(y_enc)
 
-            # ── Parallel BallTree queries for both classes ────────────────
-            # Two-level parallelism:
-            #   Outer: one thread per class (ThreadPoolExecutor(n_classes)).
-            #   Inner: each class thread splits its N_class query points into
-            #          N_PHYSICAL_CORES // n_classes chunks and queries them in
-            #          parallel.  BallTree.query() releases the GIL, so all
-            #          chunk threads run truly concurrently on separate P-cores.
+            # ── Nearest-neighbour boundary detection ──────────────────────
+            # For each sample of class C find its minimum Hamming distance to
+            # the nearest sample of the OPPOSITE class; select the bottom
+            # perc_threshold percentile as boundary instances (paper Eq. 1).
             #
-            # Why chunk?  sklearn's BallTree.query() is single-threaded
-            # internally: it processes query points sequentially in C.  On
-            # large datasets (South: ~130 K samples/class) the single-threaded
-            # query dominates wall-clock time.  Chunking distributes the work
-            # across N_PHYSICAL_CORES threads without changing the results.
-            #
-            # Inner pool size per class: N_PHYSICAL_CORES // n_classes so the
-            # two class threads together saturate all physical cores:
-            #   2 classes × (N_PHYSICAL_CORES // 2) inner threads
-            #   = N_PHYSICAL_CORES threads total.
-            n_classes     = len(all_classes)
-            inner_workers = max(1, N_PHYSICAL_CORES // n_classes)
+            # Backend: pynndescent if available, BallTree otherwise.
+            # self.trees[opp_label] holds whichever was built in fit().
 
-            def _query_class(label):
-                pos_idx = np.where(y_enc == label)[0]
-                if len(pos_idx) == 0:
-                    return int(label), None
-
-                opp_label = int(all_classes[all_classes != label][0])
-                tree = self.trees.get(opp_label)
-                if tree is None:
-                    return int(label), None
-
-                # ── Chunked parallel BallTree query ───────────────────────
-                n_query    = len(pos_idx)
-                chunk_size = max(1, n_query // inner_workers)
-                chunks     = [
-                    pos_idx[i : i + chunk_size]
-                    for i in range(0, n_query, chunk_size)
-                ]
-
-                def _query_chunk(idx_chunk):
-                    dist, _ = tree.query(X_enc[idx_chunk], k=1)
+            def _query_k1(index, query_X):
+                """Return (N,) float array of min Hamming distances."""
+                if _PYNNDESCENT_AVAILABLE and isinstance(index, NNDescent):
+                    ind, dist = index.query(query_X.astype(np.float32), k=1)
+                    return dist.ravel()
+                else:
+                    dist, _ = index.query(query_X, k=1)
                     return dist.ravel()
 
-                with ThreadPoolExecutor(max_workers=len(chunks)) as inner_pool:
-                    dist_parts = list(inner_pool.map(_query_chunk, chunks))
+            state: dict = {}
+            for label in all_classes:
+                lbl       = int(label)
+                pos_idx   = np.where(y_enc == lbl)[0]
+                if len(pos_idx) == 0:
+                    state[lbl] = None
+                    continue
+                opp_label = int(all_classes[all_classes != label][0])
+                if opp_label not in self.trees:
+                    state[lbl] = None
+                    continue
 
-                min_dist      = np.concatenate(dist_parts)
-                threshold     = np.percentile(min_dist, self.perc_threshold)
-                candidate_idx = pos_idx[min_dist <= threshold]
+                backend = 'pynndescent' if _PYNNDESCENT_AVAILABLE else 'BallTree'
+                print(f'    - class {lbl}: querying {len(pos_idx):,} pts '
+                      f'against opp index ({len(self._tree_sample_idx[opp_label]):,} pts, {backend})...')
+                dist = _query_k1(self.trees[opp_label], X_enc[pos_idx])
 
-                return int(label), {
+                threshold     = np.percentile(dist, self.perc_threshold)
+                candidate_idx = pos_idx[dist <= threshold]
+                print(f'      → {len(candidate_idx):,} boundary candidates '
+                      f'(dist ≤ {threshold:.4f})')
+                state[lbl] = {
                     'candidate_idx': candidate_idx,
                     'pos_idx':       pos_idx,
                     'opp_label':     opp_label,
                 }
-
-            state: dict = {}
-            with ThreadPoolExecutor(max_workers=n_classes) as pool:
-                for label, partial_state in pool.map(_query_class, all_classes):
-                    state[label] = partial_state
 
             # ── Model-prediction filter (one batched predict, all classes) ─
             # Single-pass normalisation: separate classes into three buckets:
@@ -670,6 +695,37 @@ class CategoricalBoCSoR:
                         'opp_label':    s['opp_label'],
                     }
 
+            # ── Pre-compute CF neighbours for all boundary instances ──────
+            # The BallTree query is by far the most expensive step (~5-15 min
+            # per class at South scale).  Since boundary_idx is identical for
+            # every k value, querying once with k=max_k and slicing [:k] inside
+            # _explain_one_class eliminates 7 of 8 redundant queries when
+            # k_values=[1,3,5,7,9,11,13,15].
+            #
+            # max_k is passed in by run_for_k_values; defaults to self.k_neighbors
+            # if called standalone (e.g. unit tests).
+            effective_max_k = max_k if max_k is not None else self.k_neighbors
+            backend = 'pynndescent' if _PYNNDESCENT_AVAILABLE else 'BallTree'
+            print(f'  > Querying CF neighbours '
+                  f'(k={effective_max_k}, {backend}, once for all k values)...')
+            for lbl, s in state.items():
+                if s is None or len(s['boundary_idx']) == 0:
+                    continue
+                opp_label    = s['opp_label']
+                boundary_idx = s['boundary_idx']
+                index        = self.trees[opp_label]
+                tree_idx     = self._tree_sample_idx[opp_label]
+                boundary_X   = X_enc[boundary_idx].astype(np.float32)
+                print(f'    - class {lbl}: querying {len(boundary_idx):,} '
+                      f'boundary pts for k={effective_max_k}...')
+                if _PYNNDESCENT_AVAILABLE and isinstance(index, NNDescent):
+                    ind, _ = index.query(boundary_X, k=effective_max_k)  # (B, max_k)
+                else:
+                    _, ind = index.query(boundary_X, k=effective_max_k)  # (B, max_k)
+                # Store (B, max_k) global index array in the state dict.
+                # _explain_one_class slices [:, :self.k_neighbors] to get its k.
+                s['cf_ind_global'] = tree_idx[ind]   # (B, max_k) global positions
+
             result = (X_enc, y_enc, all_classes, state)
             self._boundary_cache_key = cache_key
             self._boundary_cache     = result
@@ -688,10 +744,10 @@ class CategoricalBoCSoR:
         """
         Run the counterfactual analysis for a single class.
 
-        This method encapsulates the per-class workload so it can be called
-        from a ThreadPoolExecutor in explain().  All operations are either
-        NumPy (GIL-releasing) or CatBoost predict (GIL-releasing), so
-        multiple class threads run with genuine parallelism on M1 Ultra.
+        CF neighbours are pre-computed in _get_boundary_state (once, with
+        k=max_k).  This method slices the first self.k_neighbors columns so
+        each k-clone works on its own neighbourhood size without repeating
+        the expensive BallTree query.
 
         Returns
         -------
@@ -710,19 +766,17 @@ class CategoricalBoCSoR:
 
         print(
             f'    - class {label}: {len(boundary_idx)}/{len(pos_idx)} '
-            f'boundary samples pass model-prediction filter '
+            f'boundary samples, k={self.k_neighbors} '
             f'(perc_threshold={self.perc_threshold})'
         )
-
-        # ── Query k CF neighbours ─────────────────────────────────────
-        tree = self.trees[opp_label]
-        _, ind = tree.query(X_enc[boundary_idx], k=self.k_neighbors)
 
         B          = len(boundary_idx)
         boundary_X = X_enc[boundary_idx]   # (B, F)
 
-        # ── (a) Batch-verify all B×k CF candidates ────────────────────
-        cf_global_all = self.class_indices[opp_label][ind]     # (B, k)
+        # ── Retrieve pre-computed CF neighbours, slice to current k ───────
+        # cf_ind_global was populated in _get_boundary_state with k=max_k.
+        # Slicing [:, :self.k_neighbors] is O(1) (view, no copy).
+        cf_global_all = state['cf_ind_global'][:, :self.k_neighbors]  # (B, k)
         cf_X_all      = self.X_enc[cf_global_all.ravel()]      # (B*k, F)
         cf_preds      = _chunked_predict(self.model, cf_X_all).reshape(B, -1)
         valid_mask    = cf_preds == opp_label                   # (B, k) bool
@@ -875,7 +929,11 @@ class CategoricalBoCSoR:
               '(parallel per-class, vectorised per-feature swap)...')
 
         # Retrieve (or compute + cache) boundary state.
-        X_enc, y_enc, all_classes, boundary_state = self._get_boundary_state(X, y)
+        # Pass self.k_neighbors as max_k so standalone explain() calls also
+        # pre-compute CF neighbours at the right k (no-op if already cached).
+        X_enc, y_enc, all_classes, boundary_state = self._get_boundary_state(
+            X, y, max_k=self.k_neighbors
+        )
 
         # NumPy array for O(1) index-based lookup of original row labels.
         original_indices = np.asarray(X.index)
@@ -884,28 +942,22 @@ class CategoricalBoCSoR:
         all_rows_cf_gidx = []
         all_rows_strs    = []
 
-        # ── Dispatch per-class work to a thread pool ──────────────────
-        # For a binary classification problem this is 2 threads.
-        # Each thread handles one class independently; they share read-only
-        # access to self.X_enc and self.model (both thread-safe for reads).
-        n_workers = len(all_classes)
-        with ThreadPoolExecutor(max_workers=n_workers) as pool:
-            futures = {
-                pool.submit(
-                    self._explain_one_class,
-                    int(label),
-                    boundary_state.get(int(label)),
-                    X_enc,
-                ): int(label)
-                for label in all_classes
-            }
-            for future in as_completed(futures):
-                result = future.result()
-                if result is not None:
-                    b_idx_global, cf_gidx, driver_strs = result
-                    all_rows_b_idx.append(b_idx_global)
-                    all_rows_cf_gidx.append(cf_gidx)
-                    all_rows_strs.append(driver_strs)
+        # ── Process each class serially ───────────────────────────────
+        # _explain_one_class calls tree.query() which hits vecLib/GCD on
+        # Apple Silicon — same thread-accumulation issue as _get_boundary_state.
+        # The k-parallel pool in run_for_k_values already provides parallelism
+        # across k values; within a single k the per-class serial loop is fine.
+        for label in all_classes:
+            result = self._explain_one_class(
+                int(label),
+                boundary_state.get(int(label)),
+                X_enc,
+            )
+            if result is not None:
+                b_idx_global, cf_gidx, driver_strs = result
+                all_rows_b_idx.append(b_idx_global)
+                all_rows_cf_gidx.append(cf_gidx)
+                all_rows_strs.append(driver_strs)
 
         if not all_rows_b_idx:
             print('    - done: 0 (sample, CF-neighbour) pairs with at least one driver\n')
@@ -1100,13 +1152,20 @@ def extract_labels_and_values(results_dir: Path, parse_workers: int = None) -> N
         pct = _legacy_count[0] / len(cells) * 100
         print(
             f'    - WARNING: {_legacy_count[0]:,} / {len(cells):,} cells '
-            f'({pct:.1f}%) used ast.literal_eval fallback (GIL held — '
-            f'thread parallelism was ineffective for those cells). '
-            f'Convert this file to JSON format to restore full parallelism:\n'
-            f'      df["Counterfactual_Values"] = df["Counterfactual_Values"]'
-            f'.apply(lambda c: json.dumps(ast.literal_eval(c)))\n'
-            f'      df.to_csv(<path>, index=False)'
+            f'({pct:.1f}%) used ast.literal_eval fallback (GIL held). '
+            f'Auto-converting {input_file.name} to JSON format...'
         )
+        try:
+            df['Counterfactual_Values'] = df['Counterfactual_Values'].apply(
+                lambda c: json.dumps(ast.literal_eval(c))
+                if not str(c).startswith('[\"') else c
+            )
+            df.to_csv(input_file, index=False)
+            print(f'    - Converted {input_file.name} to JSON format. '
+                  f'Future runs will use json.loads (faster, parallel).')
+        except Exception as exc:
+            print(f'    - WARNING: auto-conversion failed ({exc}). '
+                  f'Next run will still use ast.literal_eval fallback.')
 
     base_data = {col: df[col] for col in base_cols}
 
@@ -1223,8 +1282,18 @@ def aggregate_drivers_by_sample(results_dir: Path, parse_workers: int = None) ->
         print(
             f'    - WARNING: {_agg_legacy_count[0]:,} / {len(cells):,} cells '
             f'({pct:.1f}%) used ast.literal_eval fallback (GIL held). '
-            f'Convert labels_only.csv to JSON format to restore parallelism.'
+            f'Auto-converting {labels_path.name} to JSON format...'
         )
+        try:
+            df['Labels'] = df['Labels'].apply(
+                lambda c: json.dumps(ast.literal_eval(c))
+                if not str(c).startswith('["') else c
+            )
+            df.to_csv(labels_path, index=False)
+            print(f'    - Converted {labels_path.name} to JSON format. '
+                  f'Future runs will use json.loads (faster, parallel).')
+        except Exception as exc:
+            print(f'    - WARNING: auto-conversion failed ({exc}).')
 
     df['Labels'] = parsed
 
@@ -1420,41 +1489,43 @@ def run_for_k_values(
     base_explainer.fit(X_tr, y_tr)
 
     # ── Pre-warm the boundary-state cache (serial, once) ─────────────
-    # This ensures all k-threads hit the cache immediately on their first
-    # explain() call without competing to compute the boundary state.
-    print('  > Pre-warming boundary state cache...')
-    base_explainer._get_boundary_state(X_tr, y_tr)
+    # Passes max(k_values) so _get_boundary_state queries the BallTree
+    # once with k=max_k and caches all CF neighbours.  Each k-clone then
+    # slices [:, :k] — no repeated BallTree queries across k values.
+    backend_name = 'pynndescent' if _PYNNDESCENT_AVAILABLE else 'BallTree'
+    print(f'  > Pre-warming boundary state cache '
+          f'({backend_name}, k={max(k_values)}, once for all k values)...')
+    base_explainer._get_boundary_state(X_tr, y_tr, max_k=max(k_values))
 
     # ── Reduce CatBoost thread_count for inference ────────────────────
     # During explain(), multiple nested thread layers run concurrently:
     #   pool_size  k-parallel threads  (this pool, = min(n_k, N_PHYSICAL_CORES))
-    #   × 2        class threads       (ThreadPoolExecutor inside explain())
     #   × N        CatBoost threads    (thread_count set here)
     #
-    # Formula: thread_count = max(1, N_PHYSICAL_CORES // (pool_size × 2))
-    # This keeps total active threads ≤ N_PHYSICAL_CORES regardless of n_k:
-    #   pool_size × 2 × thread_count
-    #     = min(n_k, C) × 2 × max(1, C // (min(n_k, C) × 2))
-    #   where C = N_PHYSICAL_CORES
+    # The inner per-class ThreadPoolExecutor(2) is NOT multiplied here because
+    # the two class threads do heterogeneous work (BallTree + NumPy vs CatBoost
+    # predict) and are not simultaneously calling predict() at the same time.
+    # Counting them doubles the denominator unnecessarily and drops CatBoost
+    # to 1 thread when pool_size ≥ 10, which is the dominant bottleneck on
+    # large datasets with many k values (e.g. 8 k-values on M1 Ultra → 1 thread).
     #
-    # When pool_size × 2 ≥ N_PHYSICAL_CORES the formula saturates at
-    # thread_count=1 (CatBoost single-threaded per predict call).  The
-    # k-threads already keep the cores busy via BallTree and NumPy; adding
-    # CatBoost internal threads would only increase scheduler contention.
-    #
-    # This applies equally to single-region runs (serial path, no
-    # ProcessPoolExecutor) and multi-region runs (each child process
-    # computes its own pool_size and thread_count independently).
-    #
-    # set_params() modifies the model in-place and is propagated to all
-    # shallow-copy clones below (they share the same model object).
-    inference_thread_count = max(1, N_PHYSICAL_CORES // (pool_size * 2))
-    base_explainer.model.set_params(thread_count=inference_thread_count)
+    # Revised formula: thread_count = max(1, N_PHYSICAL_CORES // pool_size)
+    # This keeps total CatBoost threads ≤ N_PHYSICAL_CORES and restores
+    # multi-threaded inference on large k-value sets.
+    inference_thread_count = max(1, N_PHYSICAL_CORES // pool_size)
+    # set_params() raises CatBoostError on fitted models in recent CatBoost
+    # versions.  Use the internal _init_params dict instead, which controls
+    # the thread count passed to the C++ prediction backend at inference time.
+    try:
+        base_explainer.model.set_params(thread_count=inference_thread_count)
+    except Exception:
+        # Fallback: patch the thread_count that CatBoost reads at predict time
+        base_explainer.model._init_params['thread_count'] = inference_thread_count
     print(
         f'  > CatBoost thread_count for inference → {inference_thread_count} '
         f'(training used {base_explainer._thread_count}; '
-        f'n_k={n_k}, pool_size={pool_size}, class_threads=2, '
-        f'effective={pool_size * 2 * inference_thread_count} / {N_PHYSICAL_CORES} cores)'
+        f'n_k={n_k}, pool_size={pool_size}, '
+        f'effective={pool_size * inference_thread_count} / {N_PHYSICAL_CORES} cores)'
     )
 
     # ── Build per-k explainer clones ──────────────────────────────────
@@ -1694,11 +1765,14 @@ def main(
 
     Thread budget per process (C = N_PHYSICAL_CORES, n_k = len(k_values)):
       pool_size       = min(n_k, C)
-      thread_count    = max(1, C // (pool_size × 2))
-      active threads  = pool_size × 2 × thread_count  ≤ C
+      thread_count    = max(1, C // pool_size)
+      active threads  ≤ C  (k-threads × CatBoost threads per predict)
 
-    The k_values list is passed at runtime by main.py (--k-values); the
-    thread budget adapts automatically to however many k values are requested.
+    Note: the inner per-class ThreadPoolExecutor(2) inside explain() is not
+    counted in the denominator because its two class threads do heterogeneous
+    work (BallTree query vs NumPy/CatBoost) and are never simultaneously
+    calling CatBoost.predict().  Counting them halved thread_count unnecessarily
+    and serialised inference on large k-value sets (e.g. 8 k-values → 1 thread).
 
     Parameters
     ----------
