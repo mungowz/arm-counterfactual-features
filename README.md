@@ -8,7 +8,10 @@ library.
 The pipeline predicts whether an individual's annual personal income (`PINCP`)
 exceeds a configurable threshold.  All categorical features are decoded from
 numeric ACS codes to human-readable string labels, and continuous features are
-discretized into meaningful bands.
+discretized into meaningful bands.  Occupation codes (`OCCP`) are aggregated
+into the 23 major groups defined by the
+[BLS Occupational Employment and Wage Statistics (OEWS)](https://www.bls.gov/oes/2023/may/oes_stru.htm)
+program.
 
 ---
 
@@ -18,7 +21,7 @@ discretized into meaningful bands.
 project/
 ├── src/
 │   ├── __init__.py
-│   ├── constants.py       # State groups, feature set, bin configs, code maps
+│   ├── constants.py       # State groups, feature set, bin configs, code maps, OCCP ranges
 │   ├── create_dataset.py  # Core pipeline logic (download → encode → split → save)
 │   └── main.py            # CLI entry point
 └── data/
@@ -180,7 +183,7 @@ classification.
 | `COW` | Class of worker | 9 categories (e.g. `Employee-Private-For-Profit`, `Self-Employed-Incorporated`). |
 | `SCHL` | Educational attainment | 24 levels from `No-Schooling-Completed` to `Doctorate-Degree`. |
 | `MAR` | Marital status | 5 categories (e.g. `Married`, `Divorced`, `Never-Married-Or-Under-15`). |
-| `OCCP` | Occupation | SOC-based codes mapped to ~80 readable labels; unmapped codes → `Other-Occupation`. |
+| `OCCP` | Occupation | Mapped to the **23 BLS OEWS major groups** (e.g. `Management`, `Computer-And-Mathematical`). See [OCCP major groups](#occp-major-groups) below. |
 | `POBP` | Place of birth | U.S. state FIPS codes and country codes mapped to readable names; unmapped → `Other-NEC`. |
 | `RELP` | Relationship to household reference person | Unified map covering both the pre-2019 RELP scheme (codes 0–17) and the 2019+ RELSHIPP scheme (codes 20–38). |
 | `WKHP` | Usual hours worked per week | Binned into six bands: `Part-Time-Low`, `Part-Time`, `Near-Full-Time`, `Full-Time`, `Over-Full-Time`, `Extended-Hours`. |
@@ -189,6 +192,49 @@ classification.
 
 The binary **target column** is always appended regardless of `--columns`:
 `income_over_<threshold>` (e.g. `income_over_100000`).
+
+---
+
+## OCCP major groups
+
+ACS PUMS occupation codes (`OCCP`) are derived from the Census Bureau's
+occupation classification system, which is based on the Standard Occupational
+Classification (SOC).  Rather than retaining hundreds of individual occupation
+codes, this pipeline aggregates them into the **23 major groups** defined by
+the BLS Occupational Employment and Wage Statistics (OEWS) program
+([source](https://www.bls.gov/oes/2023/may/oes_stru.htm)).
+
+The mapping is implemented as a set of **contiguous numeric ranges**: ACS PUMS
+codes are allocated in blocks that correspond directly to SOC major groups, so
+no external crosswalk file is required.  Every valid OCCP code is classified;
+no code falls through to a generic catch-all.
+
+| OCCP column value | BLS SOC major group |
+|---|---|
+| `Management` | 11-0000 Management Occupations |
+| `Business-And-Financial-Operations` | 13-0000 Business and Financial Operations Occupations |
+| `Computer-And-Mathematical` | 15-0000 Computer and Mathematical Occupations |
+| `Architecture-And-Engineering` | 17-0000 Architecture and Engineering Occupations |
+| `Life-Physical-And-Social-Science` | 19-0000 Life, Physical, and Social Science Occupations |
+| `Community-And-Social-Service` | 21-0000 Community and Social Service Occupations |
+| `Legal` | 23-0000 Legal Occupations |
+| `Educational-Instruction-And-Library` | 25-0000 Educational Instruction and Library Occupations |
+| `Arts-Design-Entertainment-Sports-And-Media` | 27-0000 Arts, Design, Entertainment, Sports, and Media Occupations |
+| `Healthcare-Practitioners-And-Technical` | 29-0000 Healthcare Practitioners and Technical Occupations |
+| `Healthcare-Support` | 31-0000 Healthcare Support Occupations |
+| `Protective-Service` | 33-0000 Protective Service Occupations |
+| `Food-Preparation-And-Serving` | 35-0000 Food Preparation and Serving Related Occupations |
+| `Building-And-Grounds-Cleaning-And-Maintenance` | 37-0000 Building and Grounds Cleaning and Maintenance Occupations |
+| `Personal-Care-And-Service` | 39-0000 Personal Care and Service Occupations |
+| `Sales-And-Related` | 41-0000 Sales and Related Occupations |
+| `Office-And-Administrative-Support` | 43-0000 Office and Administrative Support Occupations |
+| `Farming-Fishing-And-Forestry` | 45-0000 Farming, Fishing, and Forestry Occupations |
+| `Construction-And-Extraction` | 47-0000 Construction and Extraction Occupations |
+| `Installation-Maintenance-And-Repair` | 49-0000 Installation, Maintenance, and Repair Occupations |
+| `Production` | 51-0000 Production Occupations |
+| `Transportation-And-Material-Moving` | 53-0000 Transportation and Material Moving Occupations |
+| `Military-Specific` | 55-0000 Military Specific Occupations |
+| `Not-In-Labor-Force-Or-Unclassified` | Code 0 (not in labor force / never worked) and any unmapped code |
 
 ---
 
@@ -203,6 +249,17 @@ does not rename the column automatically.  This pipeline calls
 `normalize_raw_columns()` before `df_to_pandas()`, which renames
 `RELSHIPP → RELP` on the raw DataFrame when necessary, making the pipeline
 transparent across all supported years.
+
+### OCCP range-based classification
+
+The `OCCP` column is categorized using a range-based lookup
+(`OCCP_MAJOR_GROUP_RANGES` in `constants.py`) rather than a flat dictionary.
+ACS PUMS codes are contiguous integer blocks aligned with SOC major groups, so
+a list of `(lower, upper, label)` tuples is both more concise and more complete
+than enumerating every individual code.  The result is stored as a
+`pd.Categorical` with all 24 possible categories declared explicitly, ensuring
+a consistent dtype across all years and state subsets even when some categories
+are absent from a given sample.
 
 ### Parallelization
 

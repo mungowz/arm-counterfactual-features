@@ -291,66 +291,109 @@ POBP_MAP: dict[str, str] = {
     "820": "Other-Africa",    "900": "Canada",            "999": "Other-NEC",
 }
 
-# OCCP — Occupation (SOC-based codes, ~80 most common entries)
-# Codes not present in this map fall back to COLUMN_FALLBACKS["OCCP"].
-OCCP_MAP: dict[str, str] = {
-    "0":    "Not-In-Labor-Force-Or-Under-16",
-    "10":   "Chief-Executives",
-    "20":   "General-Operations-Managers",         "120":  "Financial-Managers",
-    "136":  "HR-Managers",                          "220":  "Advertising-And-Marketing-Managers",
-    "300":  "Purchasing-Managers",                  "310":  "Transportation-Managers",
-    "330":  "Food-Service-Managers",                "410":  "Medical-And-Health-Services-Managers",
-    "430":  "Construction-Managers",                "440":  "Other-Managers",
-    "500":  "Agents-Of-Performing-Arts",            "510":  "Compliance-Officers",
-    "520":  "Cost-Estimators",                      "530":  "Human-Resources-Workers",
-    "540":  "Training-And-Development-Specialists", "565":  "Logisticians",
-    "600":  "Accountants-And-Auditors",             "630":  "Budget-Analysts",
-    "640":  "Credit-Analysts",                      "650":  "Financial-Analysts",
-    "700":  "Management-Analysts",                  "726":  "Market-Research-Analysts",
-    "740":  "Business-Operations-Specialists",      "800":  "Buyers-And-Purchasing-Agents",
-    "840":  "Claims-Adjusters",
-    "1005": "Computer-And-Info-Research-Scientists","1006": "Computer-Systems-Analysts",
-    "1007": "Information-Security-Analysts",        "1010": "Computer-Programmers",
-    "1021": "Software-Developers",                  "1022": "Software-Quality-Assurance",
-    "1031": "Web-Developers",                       "1032": "Web-And-Digital-Interface-Designers",
-    "1050": "Database-Administrators",              "1065": "Network-And-Computer-Systems-Admins",
-    "1100": "Computer-Support-Specialists",         "1200": "Actuaries",
-    "1220": "Operations-Research-Analysts",         "1230": "Statisticians",
-    "1240": "Data-Scientists",
-    "2100": "Lawyers",           "2105": "Judicial-Law-Clerks",    "2110": "Judges-And-Magistrates",
-    "2310": "Elementary-School-Teachers",  "2320": "Middle-School-Teachers",
-    "2330": "Secondary-School-Teachers",   "2540": "Special-Education-Teachers",
-    "2550": "Other-Teachers",              "2560": "Tutors-And-Instructors",
-    "2630": "Postsecondary-Teachers",      "2640": "Preschool-And-Kindergarten-Teachers",
-    "2720": "Art-Directors",     "2740": "Graphic-Designers",      "2750": "Interior-Designers",
-    "3010": "Chiropractors",     "3050": "Dietitians-And-Nutritionists",
-    "3090": "Emergency-Medical-Technicians","3100": "Exercise-Physiologists",
-    "3130": "Pharmacists",       "3160": "Physical-Therapists",    "3230": "Physicians-And-Surgeons",
-    "3250": "Registered-Nurses", "3255": "Nurse-Practitioners",    "3260": "Occupational-Therapists",
-    "3300": "Dentists",          "3420": "Dental-Assistants",      "3500": "Licensed-Practical-Nurses",
-    "3600": "Medical-Assistants",
-    "4000": "Cooks-Restaurant",        "4020": "Food-Preparation-Workers",  "4040": "Bartenders",
-    "4055": "Fast-Food-Workers",       "4110": "Waiters-And-Waitresses",    "4120": "Dining-Room-Attendants",
-    "4140": "Dishwashers",             "4220": "Janitors-And-Cleaners",     "4230": "Maids-And-Housekeeping",
-    "4700": "First-Line-Retail-Supervisors","4720": "Cashiers",
-    "4740": "Counter-And-Rental-Clerks",   "4760": "Retail-Salespersons",
-    "4800": "Insurance-Sales-Agents",      "4810": "Securities-And-Financial-Sales",
-    "4820": "Real-Estate-Brokers-And-Agents","4840": "Telemarketers",
-    "4850": "Sales-Representatives",
-    "5000": "First-Line-Office-Supervisors","5110": "Receptionists",
-    "5120": "Information-Clerks",           "5160": "Customer-Service-Representatives",
-    "5230": "Payroll-And-Timekeeping-Clerks","5240": "Human-Resources-Assistants",
-    "5260": "Eligibility-Interviewers",     "5420": "Postal-Service-Workers",
-    "5600": "Production-Planning-Clerks",   "5700": "Secretaries-And-Admin-Assistants",
-    "5820": "Data-Entry-Keyers",
-    "9600": "Cleaners-Of-Vehicles-And-Equipment",  "9620": "Laborers-And-Material-Movers",
-    "9800": "Military-Officer-Special-Operations", "9810": "Military-First-Line-Supervisors",
-    "9820": "Military-Enlisted-Tactical-Operations","9830": "Military-Rank-Not-Specified",
-}
+# ─────────────────────────────────────────────────────────────
+# OCCP — Occupation major-group classification
+#
+# ACS PUMS OCCP codes are 4-digit integers derived from the Census
+# Bureau's occupation classification, which is itself based on the
+# Standard Occupational Classification (SOC) system.  The first two
+# digits of each SOC code identify its major group, and the ACS PUMS
+# numeric codes are allocated in contiguous ranges that correspond
+# directly to those major groups.
+#
+# Source: BLS Occupational Employment and Wage Statistics (OEWS)
+# structure — https://www.bls.gov/oes/2023/may/oes_stru.htm
+# 23 major groups (SOC codes 11-0000 through 55-0000).
+#
+# Mapping strategy:
+#   Each entry is (inclusive_lower, inclusive_upper, label).
+#   occp_to_major_group() iterates these ranges in order and returns
+#   the label of the first matching range.  Codes outside every range
+#   fall back to "Not-In-Labor-Force-Or-Unclassified".
+#   The ranges are derived from the 2018 Census Occupation Code List
+#   crosswalk to the 2018 SOC (used by ACS 2018 onward).
+# ─────────────────────────────────────────────────────────────
+
+# Each tuple: (lower_bound, upper_bound, BLS_major_group_label)
+# Bounds are inclusive on both ends.
+OCCP_MAJOR_GROUP_RANGES: list[tuple[int, int, str]] = [
+    # SOC 11-0000 — Management Occupations
+    (10,   440,  "Management"),
+    # SOC 13-0000 — Business and Financial Operations Occupations
+    (500,  960,  "Business-And-Financial-Operations"),
+    # SOC 15-0000 — Computer and Mathematical Occupations
+    (1005, 1240, "Computer-And-Mathematical"),
+    # SOC 17-0000 — Architecture and Engineering Occupations
+    (1300, 1560, "Architecture-And-Engineering"),
+    # SOC 19-0000 — Life, Physical, and Social Science Occupations
+    (1600, 1980, "Life-Physical-And-Social-Science"),
+    # SOC 21-0000 — Community and Social Service Occupations
+    (2000, 2060, "Community-And-Social-Service"),
+    # SOC 23-0000 — Legal Occupations
+    (2100, 2160, "Legal"),
+    # SOC 25-0000 — Educational Instruction and Library Occupations
+    (2200, 2550, "Educational-Instruction-And-Library"),
+    # SOC 27-0000 — Arts, Design, Entertainment, Sports, and Media Occupations
+    (2600, 2960, "Arts-Design-Entertainment-Sports-And-Media"),
+    # SOC 29-0000 — Healthcare Practitioners and Technical Occupations
+    (3000, 3540, "Healthcare-Practitioners-And-Technical"),
+    # SOC 31-0000 — Healthcare Support Occupations
+    (3600, 3655, "Healthcare-Support"),
+    # SOC 33-0000 — Protective Service Occupations
+    (3700, 3960, "Protective-Service"),
+    # SOC 35-0000 — Food Preparation and Serving Related Occupations
+    (4000, 4160, "Food-Preparation-And-Serving"),
+    # SOC 37-0000 — Building and Grounds Cleaning and Maintenance Occupations
+    (4200, 4255, "Building-And-Grounds-Cleaning-And-Maintenance"),
+    # SOC 39-0000 — Personal Care and Service Occupations
+    (4330, 4650, "Personal-Care-And-Service"),
+    # SOC 41-0000 — Sales and Related Occupations
+    (4700, 4965, "Sales-And-Related"),
+    # SOC 43-0000 — Office and Administrative Support Occupations
+    (5000, 5940, "Office-And-Administrative-Support"),
+    # SOC 45-0000 — Farming, Fishing, and Forestry Occupations
+    (6005, 6130, "Farming-Fishing-And-Forestry"),
+    # SOC 47-0000 — Construction and Extraction Occupations
+    (6200, 6765, "Construction-And-Extraction"),
+    # SOC 49-0000 — Installation, Maintenance, and Repair Occupations
+    (6800, 7630, "Installation-Maintenance-And-Repair"),
+    # SOC 51-0000 — Production Occupations
+    (7700, 8990, "Production"),
+    # SOC 53-0000 — Transportation and Material Moving Occupations
+    (9005, 9760, "Transportation-And-Material-Moving"),
+    # SOC 55-0000 — Military Specific Occupations
+    (9800, 9830, "Military-Specific"),
+]
+
+# Label applied to code 0 (not in labor force / never worked) and to
+# any code that does not fall within the ranges above.
+OCCP_FALLBACK = "Not-In-Labor-Force-Or-Unclassified"
+
+
+def occp_to_major_group(code: int) -> str:
+    """
+    Map a single integer ACS PUMS OCCP code to its BLS OEWS major-group label.
+
+    Parameters
+    ----------
+    code : Integer occupation code from the ACS PUMS OCCP field.
+
+    Returns
+    -------
+    str
+        BLS major-group label (e.g. "Management", "Healthcare-Practitioners-
+        And-Technical"), or OCCP_FALLBACK for code 0 and unmapped codes.
+    """
+    if code <= 0:
+        return OCCP_FALLBACK
+    for lower, upper, label in OCCP_MAJOR_GROUP_RANGES:
+        if lower <= code <= upper:
+            return label
+    return OCCP_FALLBACK
+
 
 # Fallback labels for codes not present in the respective maps above.
 COLUMN_FALLBACKS: dict[str, str] = {
-    "OCCP": "Other-Occupation",
     "POBP": "Other-NEC",
     "RELP": "Unknown",
 }

@@ -54,11 +54,14 @@ from sklearn.model_selection import train_test_split
 from src.constants import (
     AGEP_BINS, AGEP_LABELS,
     WKHP_BINS, WKHP_LABELS,
-    COW_MAP, SCHL_MAP, MAR_MAP, OCCP_MAP,
+    COW_MAP, SCHL_MAP, MAR_MAP,
     POBP_MAP, RELP_MAP, SEX_MAP, RAC1P_MAP,
     COLUMN_FALLBACKS,
     INCOME_FEATURES,
     DEFAULT_COLUMNS,
+    occp_to_major_group,
+    OCCP_FALLBACK,
+    OCCP_MAJOR_GROUP_RANGES,
 )
 
 logger = logging.getLogger(__name__)
@@ -264,6 +267,27 @@ def _map_column(
     return pd.Categorical(decoded, categories=categories)
 
 
+def _categorize_occp(series: pd.Series) -> pd.Categorical:
+    """
+    Map ACS PUMS OCCP codes to BLS OEWS major-group labels.
+
+    Uses range-based lookup via occp_to_major_group() rather than a
+    dictionary map, because OCCP codes are contiguous numeric ranges
+    rather than a sparse set of individual keys.
+
+    Parameters
+    ----------
+    series : Integer or float Series of raw OCCP codes.
+
+    Returns
+    -------
+    pd.Categorical with the 23 BLS major-group labels as categories.
+    """
+    labels = series.astype(int).map(occp_to_major_group)
+    all_categories = sorted({label for *_, label in OCCP_MAJOR_GROUP_RANGES} | {OCCP_FALLBACK})
+    return pd.Categorical(labels, categories=all_categories)
+
+
 def _build_column_transforms() -> list[tuple[str, Callable[[pd.Series], pd.Series]]]:
     """Return the ordered list of (column_name, transform_function) pairs."""
     return [
@@ -272,7 +296,7 @@ def _build_column_transforms() -> list[tuple[str, Callable[[pd.Series], pd.Serie
         ("COW",   lambda s: _map_column(s, COW_MAP,   "Unknown")),
         ("SCHL",  lambda s: _map_column(s, SCHL_MAP,  "Unknown")),
         ("MAR",   lambda s: _map_column(s, MAR_MAP,   "Unknown")),
-        ("OCCP",  lambda s: _map_column(s, OCCP_MAP,  COLUMN_FALLBACKS["OCCP"])),
+        ("OCCP",  _categorize_occp),                                  # range-based BLS major groups
         ("POBP",  lambda s: _map_column(s, POBP_MAP,  COLUMN_FALLBACKS["POBP"])),
         ("RELP",  lambda s: _map_column(s, RELP_MAP,  COLUMN_FALLBACKS["RELP"])),
         ("SEX",   lambda s: _map_column(s, SEX_MAP,   "Unknown")),
