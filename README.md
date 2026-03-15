@@ -71,10 +71,38 @@ python -m src.main --states northeast --test-size 0.2
 
 ## Output files
 
-| `--test-size` | Files produced |
-|---|---|
-| `0.0` (default) | `data/dataset_<year>_<states>_thr<threshold>.csv` |
-| `> 0.0` | `data/train_<year>_<states>_thr<threshold>.csv` + `data/test_<year>_<states>_thr<threshold>.csv` |
+Output file names encode every parameter that affects the dataset content,
+so runs with different configurations are always written to distinct files
+and never overwrite each other.
+
+### Naming pattern
+
+```
+{prefix}_{year}_{states}_{horizon}_{survey}_thr{threshold}_cols{columns}.csv
+```
+
+| Segment | Example | Meaning |
+|---|---|---|
+| `{prefix}` | `dataset` / `train` / `test` | Single file vs. split |
+| `{year}` | `2024` | ACS survey year |
+| `{states}` | `CA_NY` / `northeast` / `ALL` | States or group name |
+| `{horizon}` | `1Y` / `5Y` | Survey horizon (1-Year → `1Y`) |
+| `{survey}` | `person` | Survey unit |
+| `thr{threshold}` | `thr100000` | Income threshold in dollars |
+| `cols{columns}` | `colsCOW-SCHL-WKHP` / `colsALL` | Feature columns retained |
+
+### Examples
+
+```
+dataset_2024_ALL_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv
+dataset_2024_CA_NY_TX_1Y_person_thr75000_colsALL.csv
+train_2022_northeast_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv
+test_2022_northeast_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv
+```
+
+If a file with the same name already exists (e.g. when re-running the
+exact same command), a numeric suffix is appended automatically:
+`dataset_..._2.csv`, `dataset_..._3.csv`, and so on.
 
 The train/test split is **stratified** on the binary target column, preserving
 the positive-class proportion across both sets.

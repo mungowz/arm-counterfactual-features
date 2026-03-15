@@ -486,17 +486,53 @@ def create_dataset(
     logger.info("Train: %d  |  Test: %d", len(X_train), len(X_test))
 
     # ── Step 8: Write output CSV files ───────────────────────
-    states_tag = "_".join(sorted(states)) if states else "ALL"
-    stem       = f"{survey_year}_{states_tag}_thr{int(threshold)}"
+    # File name encodes every parameter that affects the dataset content,
+    # so runs with different configurations never overwrite each other.
+    #
+    # Pattern:
+    #   {prefix}_{year}_{states}_{horizon}_{survey}_thr{threshold}_cols{cols}.csv
+    #
+    # Examples:
+    #   dataset_2024_CA_NY_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv
+    #   dataset_2024_ALL_1Y_person_thr75000_colsALL.csv
+    #   train_2024_northeast_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv
+    #   test_2024_northeast_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv
+
+    states_tag  = "_".join(sorted(states)) if states else "ALL"
+    horizon_tag = horizon.replace("-", "").replace("Year", "Y")   # "1-Year" → "1Y"
+    cols_tag    = (
+        "-".join(keep_columns) if keep_columns else "ALL"
+    )
+    stem = (
+        f"{survey_year}_{states_tag}"
+        f"_{horizon_tag}_{survey}"
+        f"_thr{int(threshold)}"
+        f"_cols{cols_tag}"
+    )
 
     train_df             = X_train.copy()
     train_df[col_target] = y_train.values
     test_df              = X_test.copy()
     test_df[col_target]  = y_test.values
 
+    def _safe_path(directory: Path, name: str) -> Path:
+        """
+        Return a path that does not already exist.
+        If <name>.csv is taken, append _2, _3, … until a free slot is found.
+        """
+        candidate = directory / f"{name}.csv"
+        if not candidate.exists():
+            return candidate
+        counter = 2
+        while True:
+            candidate = directory / f"{name}_{counter}.csv"
+            if not candidate.exists():
+                return candidate
+            counter += 1
+
     if test_size > 0.0:
-        train_path = data_dir / f"train_{stem}.csv"
-        test_path  = data_dir / f"test_{stem}.csv"
+        train_path = _safe_path(data_dir, f"train_{stem}")
+        test_path  = _safe_path(data_dir, f"test_{stem}")
 
         # Write both files concurrently.
         with ThreadPoolExecutor(max_workers=2) as executor:
@@ -508,7 +544,7 @@ def create_dataset(
         logger.info("✓ Train   → %s", train_path)
         logger.info("✓ Test    → %s", test_path)
     else:
-        dataset_path = data_dir / f"dataset_{stem}.csv"
+        dataset_path = _safe_path(data_dir, f"dataset_{stem}")
         train_df.to_csv(dataset_path, index=False)
         logger.info("✓ Dataset → %s", dataset_path)
 
