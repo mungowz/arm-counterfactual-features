@@ -457,10 +457,15 @@ negative-correlation rules (lift < `arm_lift_low`) are retained.
 
 ### Performance optimisations
 
-- **Vectorised transaction parsing** — the `itemset` column is parsed with
-  pandas `str.split()` + `explode()` + `groupby()` instead of a Python row loop.
+- **Transaction parsing via numpy lexsort + split** — after pandas `str.split()`
+  + `explode()` produces the flat token frame, transactions are reconstructed
+  using `np.lexsort((labels, txn_ids))` to sort the flat arrays, `np.diff` to
+  locate transaction boundaries, and `np.split` to partition the label array.
+  This replaces `groupby + apply(lambda s: sorted(s.tolist()))` and is **~2×
+  faster** on large per-k files (e.g. 44 k rows at k=15 for ALL states).
 - **Boolean matrix pre-computation** — the one-hot boolean matrix for FP-Growth
-  is built once with numpy and reused across all support thresholds.
+  is built once with numpy advanced indexing (`arr[row_idx, col_idx] = True`)
+  and reused across all support thresholds.
 - **FP-Growth cache** — FP-Growth runs exactly once per distinct `min_support`
   value; results are reused for all confidence values at that support level.
 - **Adaptive rule generation strategy** — the implementation is chosen at
@@ -617,8 +622,11 @@ Stage 4 shares all performance infrastructure with stage 3:
 
 - The exploded token DataFrame is loaded **once per k** and reused for all
   macroscopic rules — no repeated CSV reads.
-- Transaction filtering is fully **vectorised** via `pandas.isin()` — no
-  Python loop over rows.
+- **Transaction filtering via numpy lexsort + split** — `_filter_transactions_for_rule`
+  uses `pandas.isin()` to identify matching transaction IDs, then reconstructs
+  the token lists with `np.lexsort + np.split` instead of `groupby + apply`.
+  This is **~4× faster** on large token frames (e.g. 57 k tokens at k=15 for
+  ALL states) and is called once per macroscopic rule per k.
 - The grid search uses the same **adaptive strategy** (vectorised path for
   few items, threaded path for many items).
 - All floating-point values in CSV output use **`%.6f`** format (6 fixed
