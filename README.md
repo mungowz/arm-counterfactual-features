@@ -1,10 +1,9 @@
 # ACS Income Dataset Pipeline
 
-A two-stage command-line pipeline for building binary-classification datasets
+A three-stage command-line pipeline for building binary-classification datasets
 from the U.S. Census Bureau's American Community Survey (ACS) Public Use
-Microdata Sample (PUMS), using the
-[folktables](https://github.com/socialfoundations/folktables) library, and
-computing global feature importance via the **BoCSoR** algorithm.
+Microdata Sample (PUMS), computing global feature importance via the **BoCSoR**
+algorithm, and mining macroscopic association rules via **FP-Growth**.
 
 The pipeline predicts whether an individual's annual personal income (`PINCP`)
 exceeds a configurable threshold.  All categorical features are decoded from
@@ -22,13 +21,14 @@ program.
 project/
 ├── src/
 │   ├── __init__.py
-│   ├── constants.py           # State groups, feature set, bin configs, code maps, OCCP ranges
-│   ├── create_dataset.py      # Stage 1: download → encode → split → save
-│   ├── feature_importance.py  # Stage 2: BoCSoR XAI (rank encoding, CatBoost, itemsets)
-│   └── main.py                # CLI entry point — orchestrates both stages
+│   ├── constants.py                # State groups, feature set, bin configs, code maps, OCCP ranges
+│   ├── create_dataset.py           # Stage 1: download → encode → split → save
+│   ├── feature_importance.py       # Stage 2: BoCSoR XAI (rank encoding, CatBoost, itemsets)
+│   ├── macroscopic_data_mining.py  # Stage 3: FP-Growth ARM on macroscopic feature labels
+│   └── main.py                     # CLI entry point — orchestrates all three stages
 └── data/
-    ├── raw/                   # Cached raw PUMS files (auto-created)
-    └── *.csv                  # Processed output datasets
+    ├── raw/                        # Cached raw PUMS files (auto-created)
+    └── *.csv                       # Processed output datasets
 ```
 
 ---
@@ -41,12 +41,15 @@ pandas
 numpy
 scikit-learn
 catboost
+mlxtend
+matplotlib
+seaborn
 ```
 
 Install with:
 
 ```bash
-pip install folktables pandas numpy scikit-learn catboost
+pip install folktables pandas numpy scikit-learn catboost mlxtend matplotlib seaborn
 ```
 
 ---
@@ -79,12 +82,14 @@ re-download or re-encoding.
 
 ## Pipeline behaviour
 
-The pipeline always runs both stages. Re-runs are safe:
+The pipeline always runs all three stages. Re-runs are safe:
 
 - **Stage 1** is skipped if the expected `train_*.csv` / `test_*.csv` files
   already exist in `--data-dir`.
 - **Stage 2** skips any class whose `feature_importance[_classN].csv` already
   exists in the output directory.
+- **Stage 3** skips any class whose `arm_rules[_classN].csv` already exists
+  in the output directory.
 
 ---
 
@@ -153,6 +158,8 @@ sub-directory inside the cols/pct folder: `results/ALL/2021-2024/colsCOW-SCHL-WK
 | `feature_importance_itemsets.csv` | All k values merged. Columns: `k_value`, `instance_index`, `features`, `itemset`. One row per boundary instance per k. |
 | `feature_importance_itemsets_k<N>.csv` | Same format, one file per k value (e.g. `_k1.csv`, `_k3.csv`, …). |
 | `bocsor_summary.md` | Human-readable run summary with importance tables, stability notes, and timing. |
+| `arm_rules.csv` | All unique association rules surviving the grid search (support, confidence, lift, lift filter). |
+| `arm_grid_summary.csv` | Grid search summary: one row per `(min_support, min_confidence)` cell with the rule count. |
 
 #### Itemset format
 
@@ -192,7 +199,13 @@ directly.  If any one of the three is missing the full pipeline reruns.
 `--original-class 0 1` is used) already exists in `--output-dir`, that class
 is skipped.  Classes whose output is missing are still processed normally.
 
-In both cases the skip is logged at INFO level so it is always visible.
+**Stage 3** (`macroscopic_data_mining.py`): if `association_rules/all_k/arm[suffix]_all_k_rules.csv`
+already exists in the output directory, that class is skipped entirely.  Individual
+per-k runs (`association_rules/k<N>/`) are also skipped if their output already exists.
+k values that were processed but yielded zero rules leave a sentinel file
+(`.arm[suffix]_done`) so they are not re-executed on subsequent runs.
+
+In all cases the skip is logged at INFO level so it is always visible.
 
 > To force a re-run, delete the relevant output files first.
 
@@ -278,11 +291,155 @@ further cuts the number of boundary instances to process.
 |---|---|---|---|
 | `--workers` | int | auto-detected | Worker processes for stage-1 multi-year parallelism and stage-2 BoCSoR boundary processing.  Auto-detected as `max(1, min(14, cpu_count - 2))`.  Can be overridden manually. |
 
+### ARM hyperparameters *(stage 3)*
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `--arm-min-support` | float | `0.05` | Minimum support threshold for FP-Growth (lower bound of the grid). |
+| `--arm-max-support` | float | `1.00` | Maximum support upper-bound filter (discards rules above this). |
+| `--arm-support-step` | float | auto | Step size for the support grid. Auto-computed: targets ~40 levels, rounded to nearest human-readable value (0.005, 0.01, 0.02, 0.025, 0.04, 0.05, 0.1). Override with an explicit value if needed. |
+| `--arm-min-confidence` | float | `0.50` | Minimum confidence threshold for rule generation. |
+| `--arm-max-confidence` | float | `1.00` | Maximum confidence upper-bound filter. |
+| `--arm-confidence-step` | float | auto | Step size for the confidence grid. Same auto-detection algorithm as `--arm-support-step`. |
+| `--arm-lift-low` | float | `0.75` | Lower boundary of the lift independence interval. Rules with lift ≥ this AND ≤ `--arm-lift-high` are discarded. |
+| `--arm-lift-high` | float | `1.25` | Upper boundary of the lift independence interval. |
+| `--arm-k` | int | `None` | If set, process only that k value (`feature_importance_itemsets_k<K>.csv`). Default: process all k values found automatically. |
+| `--arm-workers` | int | auto-detected | Thread-pool size for the parallel confidence-axis sweep. Auto-detected as `max(1, min(16, cpu_count - 2))`. |
+
 ### Logging
 
 | Option | Values | Default | Description |
 |---|---|---|---|
 | `--log-level` | `DEBUG` `INFO` `WARNING` `ERROR` | `INFO` | Logging verbosity. |
+
+---
+
+## Stage 3 — Macroscopic Association Rule Mining
+
+Stage 3 implements a **macroscopic** view of the feature co-occurrence patterns
+discovered by BoCSoR in stage 2.
+
+### Macroscopic analysis
+
+The itemset files produced by stage 2 contain tokens of the form
+`FEATURE=value` (e.g. `SCHL=Bachelors-Degree WKHP=Full-Time`).  Stage 3
+discards the *values* and retains only the **feature labels**, so each boundary
+instance becomes a transaction over the set of feature *names* that were
+relevant for it (e.g. `{SCHL, WKHP}`).
+
+This collapses the fine-grained value-level itemsets into a coarser, more
+interpretable signal: which *features* tend to co-occur as relevant at the
+decision boundary, independent of the specific value combinations.
+
+### Output directory structure
+
+All stage-3 outputs are written under two sub-folders of the stage-2 output
+directory:
+
+```
+<output_dir>/
+├── feature_importance/          ← stage-2 files live here
+└── association_rules/
+    ├── k<N>/                    ← one sub-folder per k value
+    │   ├── arm[suffix]_rules.csv
+    │   ├── arm[suffix]_grid_summary.csv
+    │   └── heatmaps/
+    │       ├── heatmap_support_confidence[suffix].png
+    │       ├── heatmap_support_lift[suffix].png
+    │       └── heatmap_confidence_lift[suffix].png
+    └── all_k/                   ← rules aggregated across all k values
+        ├── arm[suffix]_all_k_rules.csv
+        ├── arm[suffix]_all_k_grid_summary.csv
+        └── heatmaps/
+            ├── heatmap_support_confidence[suffix].png
+            ├── heatmap_support_lift[suffix].png
+            └── heatmap_confidence_lift[suffix].png
+```
+
+When `--original-class 0 1` is used all files carry a `_class0` / `_class1`
+suffix, mirroring the stage-2 naming convention.
+
+### FP-Growth
+
+Frequent itemsets are mined from the label-level transactions using the
+FP-Growth algorithm (`mlxtend`).  Association rules are then generated and
+evaluated with three metrics:
+
+| Metric | Description | Filter |
+|---|---|---|
+| **support** | Fraction of transactions containing both antecedent and consequent. | `[min_support, max_support]` |
+| **confidence** | P(consequent \| antecedent). | `[min_confidence, max_confidence]` |
+| **lift** | Ratio of observed to expected co-occurrence under independence. | Keep: lift < `arm_lift_low` (contrast) OR lift > `arm_lift_high` (positive correlation). **Discard**: lift ∈ [`arm_lift_low`, `arm_lift_high`] (near-independence). |
+
+### Grid search
+
+A grid search over all `(min_support, min_confidence)` pairs is run per k value.
+The confidence axis is swept in parallel across a thread pool.  FP-Growth is
+executed once per distinct support threshold and the result is cached across
+all confidence values at that support level.
+
+### Per-k runs and combined output
+
+Stage 3 automatically discovers all per-k itemset files
+(`feature_importance_itemsets_k<N>.csv`) produced by stage 2 and runs the full
+grid search independently for each k.  Results are written to
+`association_rules/k<N>/`.  After all k runs complete, the rules are aggregated
+(with deduplication) into `association_rules/all_k/`.
+
+Use `--arm-k K` to restrict processing to a single k value.
+
+### Heatmaps
+
+Three heatmaps are generated for each k value **and** for the aggregated all-k
+run.  All heatmaps use a blue colour scale where **darker = more rules**.
+
+| Heatmap | Rows | Columns | Notes |
+|---|---|---|---|
+| Support × Confidence | min_support values | min_confidence values | Counts from the grid-search summary. |
+| Support × Lift | min_support values | lift bins | Counts of surviving rules per bin. |
+| Confidence × Lift | min_confidence values | lift bins | Counts of surviving rules per bin. |
+
+On the lift-based heatmaps the **lift independence window**
+(`[arm_lift_low, arm_lift_high]`) is annotated with a red hatched band, making
+it immediately visible that no rules are generated in that region — only
+positive-correlation rules (lift > `arm_lift_high`) and contrast /
+negative-correlation rules (lift < `arm_lift_low`) are retained.
+
+### Performance optimisations
+
+The following optimisations are applied in stage 3:
+
+- **Vectorised transaction parsing** — the `itemset` column is parsed with
+  pandas `str.split()` + `explode()` + `groupby()` instead of a Python row loop.
+- **Boolean matrix pre-computation** — the one-hot boolean matrix for FP-Growth
+  is built once with numpy and reused across all support thresholds.
+- **FP-Growth cache** — FP-Growth runs exactly once per distinct `min_support`
+  value; results are reused for all confidence values at that support level.
+- **Adaptive rule generation strategy** — the implementation is chosen at
+  runtime by probing the actual rule count at the lowest support threshold:
+  with few columns (e.g. 3) `association_rules()` is called once per support
+  level and per-cell filtering is a vectorised numpy mask (thread overhead
+  would dominate); with many columns (e.g. `--columns ALL`) rule generation
+  is expensive and a `ThreadPoolExecutor` evaluates grid cells concurrently.
+  The crossover threshold is 500 rules per support level.
+- **Vectorised deduplication** — rules are deduplicated via serialised frozenset
+  keys and `drop_duplicates()`, replacing row-level loops.
+- **Single-pass filter** — support, confidence and lift filters are combined
+  into one boolean mask with no intermediate DataFrame materialisation.
+
+### Output files
+
+| File | Description |
+|---|---|
+| `association_rules/k<N>/arm[suffix]_rules.csv` | Unique rules for k=N surviving all filters. Columns: `k_value`, `antecedents`, `consequents`, `support`, `confidence`, `lift`, `leverage`, `conviction`, `grid_support`, `grid_confidence`. |
+| `association_rules/k<N>/arm[suffix]_grid_summary.csv` | Grid summary for k=N: one row per `(min_support, min_confidence)` cell with `n_rules`. |
+| `association_rules/k<N>/heatmaps/*.png` | Three heatmaps (support×confidence, support×lift, confidence×lift) for k=N. |
+| `association_rules/all_k/arm[suffix]_all_k_rules.csv` | All unique rules aggregated across every k value. |
+| `association_rules/all_k/arm[suffix]_all_k_grid_summary.csv` | Aggregated grid summary (rule counts summed across k values). |
+| `association_rules/all_k/heatmaps/*.png` | Three heatmaps for the aggregated all-k dataset. |
+
+When `--original-class 0 1` is used all files carry a `_class0` / `_class1`
+suffix, mirroring the stage-2 naming convention.
 
 ---
 

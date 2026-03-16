@@ -3,7 +3,7 @@ src/main.py
 ───────────
 Command-line entry point for the ACS Income pipeline.
 
-This file orchestrates both pipeline stages:
+This file orchestrates all three pipeline stages:
 
   Stage 1 — dataset creation  (src/create_dataset.py)
     Downloads ACS PUMS data via folktables, decodes categorical features,
@@ -15,6 +15,13 @@ This file orchestrates both pipeline stages:
     Trains a CatBoost classifier on the stage-1 output and computes global
     feature importance using the BoCSoR algorithm (Alfeo et al., 2023).
     Results are saved under <output-dir>/<states_tag>/<years_tag>/.
+
+  Stage 3 — macroscopic association rule mining  (src/macroscopic_data_mining.py)
+    Consumes the itemset CSVs produced by stage 2 and mines association rules
+    using FP-Growth (mlxtend).  Only feature *labels* are used (macroscopic
+    view).  A grid search over (support, confidence) is run; rules are filtered
+    by lift to retain positive/negative correlations and discard independence.
+    Outputs: arm_rules.csv and arm_grid_summary.csv in the stage-2 output dir.
 
 Usage
 ─────
@@ -59,6 +66,10 @@ from src.constants import (       # noqa: E402
     DEFAULT_COLUMNS,
 )
 from src.create_dataset import create_dataset  # noqa: E402
+from src.macroscopic_data_mining import (      # noqa: E402
+    run_macroscopic_mining,
+    add_arm_arguments,
+)
 
 VALID_HORIZONS   = ("1-Year", "5-Year")
 VALID_SURVEYS    = ("person", "household")
@@ -567,6 +578,9 @@ Examples:
         help="Logging verbosity level.  Default: INFO.",
     )
 
+    # ── ARM hyperparameters (stage 3) ─────────────────────────────────────────
+    add_arm_arguments(parser)
+
     return parser
 
 
@@ -779,6 +793,16 @@ def main() -> None:
     logger.info("  BoCSoR pct     : %.1f%%", args.percentile)
     logger.info("  XAI output dir : %s", xai_output_dir.resolve())
     logger.info("  Random seed    : %d", args.seed)
+    logger.info("  ARM support    : [%.3f, %.3f]  step=%s",
+                args.arm_min_support, args.arm_max_support,
+                f"{args.arm_support_step:.4f}" if args.arm_support_step is not None else "auto")
+    logger.info("  ARM confidence : [%.3f, %.3f]  step=%s",
+                args.arm_min_confidence, args.arm_max_confidence,
+                f"{args.arm_confidence_step:.4f}" if args.arm_confidence_step is not None else "auto")
+    logger.info("  ARM lift zone  : (%.2f, %.2f)  discarded",
+                args.arm_lift_low, args.arm_lift_high)
+    logger.info("  ARM k filter   : %s",
+                f"k={args.arm_k} only" if args.arm_k else "auto (all k files found)")
     logger.info("═" * 62)
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -829,6 +853,22 @@ def main() -> None:
             n_workers=args.workers,
             random_seed=args.seed,
             log_level=args.log_level,
+        )
+
+        # ── Stage 3 (single year) — macroscopic ARM ───────────────────────────
+        run_macroscopic_mining(
+            output_dir=xai_output_dir,
+            original_class=args.original_class,
+            k_value=args.arm_k,
+            min_support=args.arm_min_support,
+            max_support=args.arm_max_support,
+            support_step=args.arm_support_step,
+            min_confidence=args.arm_min_confidence,
+            max_confidence=args.arm_max_confidence,
+            confidence_step=args.arm_confidence_step,
+            lift_independence_low=args.arm_lift_low,
+            lift_independence_high=args.arm_lift_high,
+            n_workers=args.arm_workers,
         )
 
     else:
@@ -903,8 +943,24 @@ def main() -> None:
                 log_level=args.log_level,
             )
 
+            # ── Stage 3 (multi-year) — macroscopic ARM ────────────────────────
+            run_macroscopic_mining(
+                output_dir=year_output_dir,
+                original_class=args.original_class,
+                k_value=args.arm_k,
+                min_support=args.arm_min_support,
+                max_support=args.arm_max_support,
+                support_step=args.arm_support_step,
+                min_confidence=args.arm_min_confidence,
+                max_confidence=args.arm_max_confidence,
+                confidence_step=args.arm_confidence_step,
+                lift_independence_low=args.arm_lift_low,
+                lift_independence_high=args.arm_lift_high,
+                n_workers=args.arm_workers,
+            )
+
     logger.info("═" * 62)
-    logger.info("  Pipeline completed successfully.")
+    logger.info("  Pipeline completed successfully.  (stages 1 · 2 · 3)")
     logger.info("═" * 62)
 
 
