@@ -678,35 +678,40 @@ def _build_output_dir(
     states: list[str] | None,
     raw_states_arg: list[str],
     years: list[int],
+    keep_columns: list[str] | None,
 ) -> Path:
     """
-    Build the stage-2 output directory path, embedding the state scope and
-    the year range so that results from different runs never mix.
+    Build the stage-2 output directory path, embedding the state scope,
+    year range, and feature columns so that results from different
+    configurations never overwrite each other.
 
     Directory structure
     -------------------
-        <base_dir>/<states_tag>/<years_tag>/
+        <base_dir>/<states_tag>/<years_tag>/cols<cols_tag>/
 
     <states_tag> rules
     ------------------
-    - If the raw --states argument was a recognised group name (e.g.
-      "northeast", "midwest") the group name is used as-is.
-    - If ALL states are requested the tag is "ALL".
-    - Otherwise the state codes are sorted and joined by "_"
-      (e.g. "CA_NY_TX").
+    - Recognised group name (e.g. "northeast") → used as-is.
+    - ALL states → "ALL".
+    - Individual codes → sorted and joined by "_" (e.g. "CA_NY_TX").
 
     <years_tag> rules
     -----------------
-    - Single year  → the year itself (e.g. "2024").
-    - Contiguous range → "<first>-<last>" (e.g. "2021-2024").
-    - Non-contiguous   → all years joined by "_" (e.g. "2021_2023").
+    - Single year       → the year itself (e.g. "2024").
+    - Contiguous range  → "<first>-<last>" (e.g. "2021-2024").
+    - Non-contiguous    → years joined by "_" (e.g. "2021_2023").
+
+    <cols_tag> rules
+    ----------------
+    - keep_columns list → columns joined by "-" (e.g. "COW-SCHL-WKHP").
+    - None (all columns) → "ALL".
 
     Examples
     --------
-        results/northeast/2024/
-        results/ALL/2021-2024/
-        results/CA_NY_TX/2024/
-        results/midwest/2021_2023/
+        results/northeast/2024/colsCOW-SCHL-WKHP/
+        results/ALL/2021-2024/colsCOW-OCCP-SCHL-WKHP/
+        results/CA_NY_TX/2024/colsALL/
+        results/midwest/2021_2023/colsCOW-SCHL-WKHP/
     """
     # ── States tag ────────────────────────────────────────────────────────────
     if raw_states_arg == ["ALL"] or states is None:
@@ -728,7 +733,10 @@ def _build_output_dir(
     else:
         years_tag = "_".join(str(y) for y in sorted_years)
 
-    return base_dir / states_tag / years_tag
+    # ── Columns tag ───────────────────────────────────────────────────────────
+    cols_tag = "-".join(sorted(keep_columns)) if keep_columns else "ALL"
+
+    return base_dir / states_tag / years_tag / f"cols{cols_tag}"
 
 
 def _resolve_states_label(raw_states_arg: list[str]) -> str | None:
@@ -854,7 +862,7 @@ def main() -> None:
     # the ACS parameters if supplied, otherwise fall back to base --output-dir.
     if need_acs_params:
         xai_output_dir = _build_output_dir(
-            args.output_dir, states, args.states, args.years,
+            args.output_dir, states, args.states, args.years, keep_columns,
         )
     else:
         # --steps 2 with explicit files and no ACS params: use base dir.

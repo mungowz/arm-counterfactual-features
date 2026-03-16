@@ -125,20 +125,25 @@ All stage-2 outputs land in a subdirectory of `--output-dir` (default
 `results/`) that encodes the **state scope** and the **year range**:
 
 ```
-<output-dir>/<states_tag>/<years_tag>/
+<output-dir>/<states_tag>/<years_tag>/cols<cols_tag>/
 ```
 
 | Scenario | Example path |
 |---|---|
-| `--states northeast --years 2024` | `results/northeast/2024/` |
-| `--states ALL --years 2021 2022 2023 2024` | `results/ALL/2021-2024/<year>/` |
-| `--states CA NY TX --years 2024` | `results/CA_NY_TX/2024/` |
-| `--states midwest --years 2021 2023` | `results/midwest/2021_2023/` |
+| `--states northeast --years 2024` | `results/northeast/2024/colsCOW-SCHL-WKHP/` |
+| `--states northeast --years 2024 --columns COW OCCP SCHL WKHP` | `results/northeast/2024/colsCOW-OCCP-SCHL-WKHP/` |
+| `--states ALL --years 2021 2022 2023 2024` | `results/ALL/2021-2024/colsCOW-SCHL-WKHP/<year>/` |
+| `--states CA NY TX --years 2024` | `results/CA_NY_TX/2024/colsCOW-SCHL-WKHP/` |
+| `--states midwest --years 2021 2023 --columns ALL` | `results/midwest/2021_2023/colsALL/` |
 
 Years tag rules: single year → the year itself; contiguous range →
 `<first>-<last>`; non-contiguous → years joined by `_`.
+Columns tag: feature columns sorted and joined by `-`, prefixed with `cols`
+(e.g. `colsCOW-SCHL-WKHP`, `colsALL` for all columns).  This ensures that
+runs with different `--columns` on the same states and year never overwrite
+each other.
 When multiple years are processed with `--steps 1 2`, each year also gets
-its own sub-directory inside the years tag folder: `results/ALL/2021-2024/2022/`.
+its own sub-directory inside the cols tag folder: `results/ALL/2021-2024/colsCOW-SCHL-WKHP/2022/`.
 
 | File | Description |
 |---|---|
