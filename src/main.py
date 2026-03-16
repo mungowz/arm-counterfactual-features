@@ -23,23 +23,15 @@ From the project root:
 
 Examples
 ────────
-    # Stage 1 only
-    python -m src.main --steps 1 --states northeast --years 2024 --test-size 0.2
+    # Both stages — dataset created if missing, BoCSoR skipped if output exists
+    python -m src.main --states northeast --years 2024 --test-size 0.2
 
-    # Both stages end-to-end
-    python -m src.main --steps 1 2 --states northeast --years 2024 --test-size 0.2
-
-    # Both stages, all feature columns, custom BoCSoR settings
-    python -m src.main --steps 1 2 --states CA NY TX --columns ALL \\
+    # Custom BoCSoR settings
+    python -m src.main --states CA NY TX --columns ALL \\
                         --test-size 0.2 --k 11 --percentile 20
 
-    # Stage 2 only on an existing dataset (paths inferred automatically)
-    python -m src.main --steps 2 --states northeast --years 2024
-
-    # Stage 2 only with explicit file paths
-    python -m src.main --steps 2 \\
-        --train data/train_2024_northeast_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv \\
-        --test  data/test_2024_northeast_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv
+    # Multiple years
+    python -m src.main --states ALL --years 2021 2022 2023 2024 --test-size 0.2
 
     python -m src.main --help
 """
@@ -205,7 +197,7 @@ def _process_year(
         format="%(asctime)s [%(levelname)s] %(name)s – %(message)s",
         datefmt="%H:%M:%S",
     )
-    train_df, test_df = create_dataset(
+    _, train_df, test_df = create_dataset(
         survey_year=year,
         horizon=horizon,
         survey=survey,
@@ -243,8 +235,7 @@ def _run_feature_importance(
     """
     Invoke stage 2 (BoCSoR feature importance) programmatically.
 
-    Called after stage 1 completes when --steps 1 2 is used, or directly
-    when --steps 2 is used with explicit --train / --test paths.
+    Called after stage 1 completes for each survey year.
 
     Parameters
     ----------
@@ -407,46 +398,25 @@ Available feature columns (--columns):
   {cols_str}
   or: ALL  (retain every feature column)
 
-Pipeline modes:
-  --steps 1         Run stage 1 only (dataset creation).  Default.
-  --steps 2         Run stage 2 only (BoCSoR).  Paths inferred from ACS
-                    parameters, or supply --train/--test explicitly.
-  --steps 1 2       Both stages end-to-end.  Requires --test-size > 0.
+The pipeline always runs both stages.  If the stage-1 CSV files already
+exist they are loaded directly (no download).  If the stage-2 output files
+already exist that class is skipped.  Re-runs are therefore always safe.
 
 Examples:
-  # Stage 1 only
-  python -m src.main --steps 1 --states northeast --years 2024 --test-size 0.2
+  # Full pipeline — dataset + BoCSoR
+  python -m src.main --states northeast --years 2024 --test-size 0.2
 
-  # Both stages end-to-end
-  python -m src.main --steps 1 2 --states northeast --years 2024 --test-size 0.2
-
-  # Both stages, all features, custom BoCSoR settings
-  python -m src.main --steps 1 2 --states CA NY TX --columns ALL \\
+  # Custom BoCSoR settings
+  python -m src.main --states CA NY TX --columns ALL \\
                       --test-size 0.2 --k 11 --percentile 20
 
-  # Stage 2 only — paths inferred automatically from ACS parameters
-  python -m src.main --steps 2 --states northeast --years 2024 --k 11
+  # Multiple years
+  python -m src.main --states ALL --years 2021 2022 2023 2024 --test-size 0.2
 
-  # Stage 2 only — explicit file paths
-  python -m src.main --steps 2 \\
-      --train data/train_2024_northeast_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv \\
-      --test  data/test_2024_northeast_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv \\
-      --k 11 --output-dir results/xai/
+  # Both classes
+  python -m src.main --states NY --years 2024 --test-size 0.2 \\
+                      --original-class 0 1
         """,
-    )
-
-    # ── Pipeline mode ─────────────────────────────────────────────────────────
-    mode = parser.add_argument_group("Pipeline mode")
-    mode.add_argument(
-        "--steps", nargs="+", type=int, choices=[1, 2], default=[1],
-        metavar="STEP",
-        help=(
-            "Pipeline step(s) to run.  "
-            "1 = dataset creation only.  "
-            "2 = BoCSoR feature importance only (requires --train and --test).  "
-            "1 2 = both stages end-to-end (requires --test-size > 0).  "
-            "Default: 1."
-        ),
     )
 
     # ── ACS parameters (stage 1) ──────────────────────────────────────────────
@@ -498,11 +468,11 @@ Examples:
     # ── Train / test split (stage 1) ──────────────────────────────────────────
     split = parser.add_argument_group("Train / test split  (stage 1)")
     split.add_argument(
-        "--test-size", type=float, default=0.0, metavar="FRACTION",
+        "--test-size", type=float, default=0.2, metavar="FRACTION",
         help=(
             "Fraction of the dataset reserved for the test split (0.0–1.0).  "
             "0.0 produces a single dataset_*.csv with no split.  "
-            "Must be > 0 when using --steps 1 2.  Default: 0.0."
+            "Must be in (0.0, 1.0).  Default: 0.2."
         ),
     )
     split.add_argument(
@@ -524,20 +494,6 @@ Examples:
         help=(
             "Output directory for stage 2 results (feature importance CSVs "
             "and itemset CSVs).  Created if absent.  Default: results/."
-        ),
-    )
-    io.add_argument(
-        "--train", type=Path, default=None, metavar="CSV",
-        help=(
-            "Path to an existing train CSV.  Required with --steps 2.  "
-            "Ignored otherwise (stage 1 infers the path automatically)."
-        ),
-    )
-    io.add_argument(
-        "--test", type=Path, default=None, metavar="CSV",
-        help=(
-            "Path to an existing test CSV.  Required with --steps 2.  "
-            "Ignored otherwise (stage 1 infers the path automatically)."
         ),
     )
 
@@ -679,6 +635,7 @@ def _build_output_dir(
     raw_states_arg: list[str],
     years: list[int],
     keep_columns: list[str] | None,
+    percentile: float,
 ) -> Path:
     """
     Build the stage-2 output directory path, embedding the state scope,
@@ -703,15 +660,18 @@ def _build_output_dir(
 
     <cols_tag> rules
     ----------------
-    - keep_columns list → columns joined by "-" (e.g. "COW-SCHL-WKHP").
+    - keep_columns list → columns sorted and joined by "-" (e.g. "COW-SCHL-WKHP").
     - None (all columns) → "ALL".
+
+    <pct_tag> rules
+    ---------------
+    - Percentile value as integer (e.g. 20 → "pct20").
 
     Examples
     --------
-        results/northeast/2024/colsCOW-SCHL-WKHP/
-        results/ALL/2021-2024/colsCOW-OCCP-SCHL-WKHP/
-        results/CA_NY_TX/2024/colsALL/
-        results/midwest/2021_2023/colsCOW-SCHL-WKHP/
+        results/northeast/2024/colsCOW-SCHL-WKHP/pct20/
+        results/ALL/2021-2024/colsCOW-OCCP-SCHL-WKHP/pct10/
+        results/CA_NY_TX/2024/colsALL/pct20/
     """
     # ── States tag ────────────────────────────────────────────────────────────
     if raw_states_arg == ["ALL"] or states is None:
@@ -736,7 +696,10 @@ def _build_output_dir(
     # ── Columns tag ───────────────────────────────────────────────────────────
     cols_tag = "-".join(sorted(keep_columns)) if keep_columns else "ALL"
 
-    return base_dir / states_tag / years_tag / f"cols{cols_tag}"
+    # ── Percentile tag ────────────────────────────────────────────────────────
+    pct_tag = f"pct{int(percentile)}"
+
+    return base_dir / states_tag / years_tag / f"cols{cols_tag}" / pct_tag
 
 
 def _resolve_states_label(raw_states_arg: list[str]) -> str | None:
@@ -771,163 +734,61 @@ def main() -> None:
         datefmt="%H:%M:%S",
     )
 
-    # ── Resolve which steps to run ──────────────────────────────────────────
-    run_stage1 = 1 in args.steps
-    run_stage2 = 2 in args.steps
+    # ── Argument validation ───────────────────────────────────────────────────
+    try:
+        states       = resolve_states(args.states, args.horizon)
+        keep_columns = resolve_columns(args.columns)
+    except ValueError as exc:
+        logger.error("%s", exc)
+        parser.print_usage()
+        sys.exit(1)
 
-    # ── Cross-option validation ───────────────────────────────────────────────
-    if run_stage1 and run_stage2 and args.test_size <= 0.0:
-        parser.error(
-            "--steps 1 2 requires a train/test split.  "
-            "Set --test-size to a value in (0, 1), e.g. --test-size 0.2."
-        )
+    states_label = _resolve_states_label(args.states)
 
-    # Resolve states and keep_columns whenever stage 1 runs OR whenever
-    # stage 2 runs without explicit --train/--test (so we can reconstruct
-    # the file paths from the ACS parameters).
-    need_acs_params = run_stage1 or (run_stage2 and args.train is None)
+    invalid_years = [y for y in args.years if not (2014 <= y <= 2024)]
+    if invalid_years:
+        logger.error("Year(s) out of supported range (2014–2024): %s", invalid_years)
+        sys.exit(1)
 
-    if need_acs_params:
-        try:
-            states       = resolve_states(args.states, args.horizon)
-            keep_columns = resolve_columns(args.columns)
-        except ValueError as exc:
-            logger.error("%s", exc)
-            parser.print_usage()
-            sys.exit(1)
+    if not (0.0 < args.test_size < 1.0):
+        logger.error("--test-size must be in the range (0.0, 1.0).")
+        sys.exit(1)
 
-        states_label = _resolve_states_label(args.states)
-
-        invalid_years = [y for y in args.years if not (2014 <= y <= 2024)]
-        if invalid_years:
-            logger.error("Year(s) out of supported range (2014–2024): %s", invalid_years)
-            sys.exit(1)
-
-        if run_stage1:
-            if not (0.0 <= args.test_size < 1.0):
-                logger.error("--test-size must be in the range [0.0, 1.0).")
-                sys.exit(1)
-            if args.threshold <= 0:
-                logger.error("--threshold must be a positive value.")
-                sys.exit(1)
-    else:
-        # --steps 2 with explicit --train/--test: ACS params not needed.
-        states       = None
-        keep_columns = None
-        states_label = None
-
-    # When --steps 2 only and explicit paths given, validate they exist.
-    if run_stage2 and not run_stage1 and args.train is not None:
-        if not args.train.exists():
-            parser.error(f"--train file not found: {args.train}")
-        if args.test is None or not args.test.exists():
-            parser.error(f"--test file not found: {args.test}")
-
+    if args.threshold <= 0:
+        logger.error("--threshold must be a positive value.")
+        sys.exit(1)
 
     # ── Configuration summary ─────────────────────────────────────────────────
+    n_states = len(states) if states else len(USA_STATES)
+    xai_output_dir = _build_output_dir(
+        args.output_dir, states, args.states, args.years,
+        keep_columns, args.percentile,
+    )
     logger.info("═" * 62)
     logger.info("  ACS INCOME PIPELINE")
     logger.info("═" * 62)
-    mode_str = " + ".join(
-        (["stage 1 (dataset)"] if run_stage1 else [])
-        + (["stage 2 (BoCSoR)"] if run_stage2 else [])
-    )
-    logger.info("  Steps          : %s  → %s", args.steps, mode_str)
-    if run_stage1:
-        n_states = len(states) if states else len(USA_STATES)
-        logger.info("  Year(s)        : %s", args.years)
-        logger.info("  Horizon        : %s", args.horizon)
-        logger.info("  Survey         : %s", args.survey)
-        logger.info("  States         : %s (%d)", states or "ALL", n_states)
-        logger.info("  Threshold      : $%.0f", args.threshold)
-        logger.info("  Output columns : %s", keep_columns or "ALL")
-        logger.info("  Test split     : %.0f%%", args.test_size * 100)
-        logger.info("  Workers        : %d (auto-detected: %d)", args.workers, _DEFAULT_WORKERS)
-        logger.info("  Data dir       : %s", args.data_dir.resolve())
-    if run_stage2:
-        if not run_stage1:
-            if args.train is not None:
-                logger.info("  Train file     : %s", args.train)
-                logger.info("  Test file      : %s", args.test)
-            else:
-                logger.info("  Train/test     : inferred from ACS parameters")
-        logger.info("  BoCSoR k       : %s", args.k)
-        logger.info("  BoCSoR pct     : %.1f%%", args.percentile)
-        logger.info("  Output dir     : %s", args.output_dir.resolve())
+    logger.info("  Year(s)        : %s", args.years)
+    logger.info("  Horizon        : %s", args.horizon)
+    logger.info("  Survey         : %s", args.survey)
+    logger.info("  States         : %s (%d)", states or "ALL", n_states)
+    logger.info("  Threshold      : $%.0f", args.threshold)
+    logger.info("  Output columns : %s", keep_columns or "ALL")
+    logger.info("  Workers        : %d (auto-detected: %d)", args.workers, _DEFAULT_WORKERS)
+    logger.info("  Data dir       : %s", args.data_dir.resolve())
+    logger.info("  BoCSoR k       : %s", args.k)
+    logger.info("  BoCSoR pct     : %.1f%%", args.percentile)
+    logger.info("  XAI output dir : %s", xai_output_dir.resolve())
     logger.info("  Random seed    : %d", args.seed)
     logger.info("═" * 62)
 
-    # Build the stage-2 output directory: results/<states>/<years>/
-    # For --steps 2 with explicit --train/--test, states/years come from
-    # the ACS parameters if supplied, otherwise fall back to base --output-dir.
-    if need_acs_params:
-        xai_output_dir = _build_output_dir(
-            args.output_dir, states, args.states, args.years, keep_columns,
-        )
-    else:
-        # --steps 2 with explicit files and no ACS params: use base dir.
-        xai_output_dir = args.output_dir
-    logger.info("  XAI output dir : %s", xai_output_dir.resolve())
-
     # ─────────────────────────────────────────────────────────────────────────
-    # --steps 2 only: skip stage 1 entirely
-    # ─────────────────────────────────────────────────────────────────────────
-    if run_stage2 and not run_stage1:
-        # Resolve train/test paths: use explicit args if given, otherwise
-        # reconstruct from ACS parameters (same logic as --steps 1 2).
-        if args.train is not None:
-            s2_train_path = args.train
-            s2_test_path  = args.test
-        else:
-            if len(args.years) != 1:
-                parser.error(
-                    "--steps 2 without --train/--test requires exactly one "
-                    "--years value so the filename can be inferred."
-                )
-            s2_train_path, s2_test_path = _infer_split_paths(
-                args.data_dir, args.years[0], states, args.threshold,
-                args.horizon, args.survey, keep_columns,
-                states_label=states_label,
-            )
-            if not s2_train_path.exists():
-                parser.error(
-                    f"Inferred train file not found: {s2_train_path}\n"
-                    "Run --steps 1 first, or pass --train/--test explicitly."
-                )
-            if not s2_test_path.exists():
-                parser.error(
-                    f"Inferred test file not found: {s2_test_path}\n"
-                    "Run --steps 1 first, or pass --train/--test explicitly."
-                )
-            logger.info("Inferred train: %s", s2_train_path)
-            logger.info("Inferred test : %s", s2_test_path)
-
-        _run_feature_importance(
-            train_path=s2_train_path,
-            test_path=s2_test_path,
-            output_dir=xai_output_dir,
-            k=args.k,
-            percentile=args.percentile,
-            cb_iterations=args.cb_iterations,
-            cb_lr=args.cb_lr,
-            cb_depth=args.cb_depth,
-            cb_verbose=args.cb_verbose,
-            cb_early_stopping=args.cb_early_stopping,
-            original_class=args.original_class,
-            n_workers=args.workers,
-            random_seed=args.seed,
-            log_level=args.log_level,
-        )
-        return
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Stage 1: dataset creation
+    # Stage 1: dataset creation (skipped automatically if output exists)
     # ─────────────────────────────────────────────────────────────────────────
     if len(args.years) == 1:
         year = args.years[0]
         logger.info("── Year %d ──────────────────────────────────────────", year)
         try:
-            train_df, test_df = create_dataset(
+            dataset_df, train_df, test_df = create_dataset(
                 survey_year=year,
                 horizon=args.horizon,
                 survey=args.survey,
@@ -948,34 +809,27 @@ def main() -> None:
             raise
 
         # ── Stage 2 (single year) ─────────────────────────────────────────────
-        if run_stage2:
-            if args.test_size <= 0.0:
-                logger.error(
-                    "Stage 2 skipped: no test split was created "
-                    "(--test-size is 0.0).  Re-run with --test-size > 0."
-                )
-                sys.exit(1)
-            train_path, test_path = _infer_split_paths(
-                args.data_dir, year, states, args.threshold,
-                args.horizon, args.survey, keep_columns,
-                states_label=states_label,
-            )
-            _run_feature_importance(
-                train_path=train_path,
-                test_path=test_path,
-                output_dir=xai_output_dir,
-                k=args.k,
-                percentile=args.percentile,
-                cb_iterations=args.cb_iterations,
-                cb_lr=args.cb_lr,
-                cb_depth=args.cb_depth,
-                cb_verbose=args.cb_verbose,
-                cb_early_stopping=args.cb_early_stopping,
-                original_class=args.original_class,
-                n_workers=args.workers,
-                random_seed=args.seed,
-                log_level=args.log_level,
-            )
+        train_path, test_path = _infer_split_paths(
+            args.data_dir, year, states, args.threshold,
+            args.horizon, args.survey, keep_columns,
+            states_label=states_label,
+        )
+        _run_feature_importance(
+            train_path=train_path,
+            test_path=test_path,
+            output_dir=xai_output_dir,
+            k=args.k,
+            percentile=args.percentile,
+            cb_iterations=args.cb_iterations,
+            cb_lr=args.cb_lr,
+            cb_depth=args.cb_depth,
+            cb_verbose=args.cb_verbose,
+            cb_early_stopping=args.cb_early_stopping,
+            original_class=args.original_class,
+            n_workers=args.workers,
+            random_seed=args.seed,
+            log_level=args.log_level,
+        )
 
     else:
         # Multiple years: one process per year (CPU-bound + independent I/O).
@@ -1024,37 +878,30 @@ def main() -> None:
             sys.exit(1)
 
         # ── Stage 2 (multi-year: one run per year, sequential) ────────────────
-        if run_stage2:
-            if args.test_size <= 0.0:
-                logger.error(
-                    "Stage 2 skipped: no test split was created "
-                    "(--test-size is 0.0).  Re-run with --test-size > 0."
-                )
-                sys.exit(1)
-            for year in sorted(completed):
-                logger.info("── Stage 2: year %d ─────────────────────────────────", year)
-                train_path, test_path = _infer_split_paths(
-                    args.data_dir, year, states, args.threshold,
-                    args.horizon, args.survey, keep_columns,
-                    states_label=states_label,
-                )
-                year_output_dir = xai_output_dir / str(year)
-                _run_feature_importance(
-                    train_path=train_path,
-                    test_path=test_path,
-                    output_dir=year_output_dir,
-                    k=args.k,
-                    percentile=args.percentile,
-                    cb_iterations=args.cb_iterations,
-                    cb_lr=args.cb_lr,
-                    cb_depth=args.cb_depth,
-                    cb_verbose=args.cb_verbose,
-                    cb_early_stopping=args.cb_early_stopping,
-                    original_class=args.original_class,
-                    n_workers=args.workers,
-                    random_seed=args.seed,
-                    log_level=args.log_level,
-                )
+        for year in sorted(completed):
+            logger.info("── Stage 2: year %d ─────────────────────────────────", year)
+            train_path, test_path = _infer_split_paths(
+                args.data_dir, year, states, args.threshold,
+                args.horizon, args.survey, keep_columns,
+                states_label=states_label,
+            )
+            year_output_dir = xai_output_dir / str(year)
+            _run_feature_importance(
+                train_path=train_path,
+                test_path=test_path,
+                output_dir=year_output_dir,
+                k=args.k,
+                percentile=args.percentile,
+                cb_iterations=args.cb_iterations,
+                cb_lr=args.cb_lr,
+                cb_depth=args.cb_depth,
+                cb_verbose=args.cb_verbose,
+                cb_early_stopping=args.cb_early_stopping,
+                original_class=args.original_class,
+                n_workers=args.workers,
+                random_seed=args.seed,
+                log_level=args.log_level,
+            )
 
     logger.info("═" * 62)
     logger.info("  Pipeline completed successfully.")

@@ -54,39 +54,37 @@ pip install folktables pandas numpy scikit-learn catboost
 ## Quick start
 
 ```bash
-# Stage 1 only — create the dataset with an 80/20 split
-python -m src.main --steps 1 --states NY --years 2024 --test-size 0.2
+# Single state, default columns (COW SCHL WKHP), default 80/20 split
+python -m src.main --states NY --years 2024
 
-# Stage 2 only — BoCSoR on an existing dataset (paths inferred automatically)
-python -m src.main --steps 2 --states NY --years 2024
+# Custom BoCSoR settings
+python -m src.main --states CA NY TX --columns ALL --k 11 --percentile 20
 
-# Stage 2 only — explicit file paths
-python -m src.main --steps 2 \
-    --train data/train_2024_NY_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv \
-    --test  data/test_2024_NY_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv
+# Explain both class 0 and class 1 boundaries
+python -m src.main --states northeast --years 2024 --original-class 0 1
 
-# Both stages end-to-end
-python -m src.main --steps 1 2 --states NY --years 2024 --test-size 0.2
+# Multiple years (each year produces its own output sub-directory)
+python -m src.main --states midwest --years 2021 2022 2023 2024
 
-# Both stages, all feature columns, custom BoCSoR settings
-python -m src.main --steps 1 2 \
-    --states CA NY TX --columns ALL --test-size 0.2 \
-    --k 11 --percentile 20 --workers 14
-
-# Four years in parallel, then BoCSoR for each year
-python -m src.main --steps 1 2 \
-    --years 2021 2022 2023 2024 --states midwest --test-size 0.2
+# All 49 states
+python -m src.main --states ALL --years 2024
 ```
+
+Each run always produces three stage-1 CSV files (`dataset_*.csv`,
+`train_*.csv`, `test_*.csv`) plus the stage-2 BoCSoR output.  If the
+files already exist from a previous run they are loaded directly — no
+re-download or re-encoding.
 
 ---
 
-## Pipeline modes (`--steps`)
+## Pipeline behaviour
 
-| Flag | Behaviour |
-|---|---|
-| `--steps 1` | **Stage 1 only** — download, encode, and save the dataset CSV(s). |
-| `--steps 2` | **Stage 2 only** — run BoCSoR on existing files. If `--train`/`--test` are not given, paths are inferred from the ACS parameters. Requires `--years` to be a single value when inferring paths. |
-| `--steps 1 2` | **Both stages** — create the dataset then immediately run BoCSoR. Requires `--test-size > 0`. |
+The pipeline always runs both stages. Re-runs are safe:
+
+- **Stage 1** is skipped if the expected `train_*.csv` / `test_*.csv` files
+  already exist in `--data-dir`.
+- **Stage 2** skips any class whose `feature_importance[_classN].csv` already
+  exists in the output directory.
 
 ---
 
@@ -97,27 +95,29 @@ python -m src.main --steps 1 2 \
 The filename encodes every parameter that affects the dataset content, so runs
 with different configurations never overwrite each other:
 
+Every run always produces all three files together:
+
 ```
+dataset_2024_NY_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv
 train_2024_NY_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv
-test_2024_northeast_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv
-train_2024_midwest_1Y_person_thr100000_colsALL.csv
-dataset_2024_ALL_1Y_person_thr100000_colsALL.csv
+test_2024_NY_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv
 ```
 
 When `--states` is a group/region/division name the group name is used
 in the filename instead of the full list of state codes
 (e.g. `northeast` instead of `CT_MA_ME_NH_NJ_NY_PA_RI_VT`).
 
-| `--test-size` | Files produced |
-|---|---|
-| `0.0` (default) | `data/dataset_<year>_<states>_<horizon>_<survey>_thr<threshold>_cols<cols>.csv` |
-| `> 0.0` | `data/train_…csv` + `data/test_…csv` |
+Filename pattern:
+```
+{prefix}_{year}_{states}_{horizon}_{survey}_thr{threshold}_cols{cols}.csv
+```
 
-- `<states>` — state codes joined by `_` and sorted, or `ALL`
-- `<horizon>` — `1Y` or `5Y`
-- `<cols>` — feature columns joined by `-` (e.g. `COW-SCHL-WKHP`), or `ALL`
+- `{prefix}` — `dataset`, `train`, or `test`
+- `{states}` — group name, sorted state codes joined by `_`, or `ALL`
+- `{horizon}` — `1Y` or `5Y`
+- `{cols}` — feature columns joined by `-` (e.g. `COW-SCHL-WKHP`), or `ALL`
 
-The train/test split is **stratified** on the binary target column.
+The train/test split is **stratified** on the binary target column (default 80/20).
 
 ### Stage 2
 
@@ -125,25 +125,27 @@ All stage-2 outputs land in a subdirectory of `--output-dir` (default
 `results/`) that encodes the **state scope** and the **year range**:
 
 ```
-<output-dir>/<states_tag>/<years_tag>/cols<cols_tag>/
+<output-dir>/<states_tag>/<years_tag>/cols<cols_tag>/pct<N>/
 ```
 
 | Scenario | Example path |
 |---|---|
-| `--states northeast --years 2024` | `results/northeast/2024/colsCOW-SCHL-WKHP/` |
-| `--states northeast --years 2024 --columns COW OCCP SCHL WKHP` | `results/northeast/2024/colsCOW-OCCP-SCHL-WKHP/` |
-| `--states ALL --years 2021 2022 2023 2024` | `results/ALL/2021-2024/colsCOW-SCHL-WKHP/<year>/` |
-| `--states CA NY TX --years 2024` | `results/CA_NY_TX/2024/colsCOW-SCHL-WKHP/` |
-| `--states midwest --years 2021 2023 --columns ALL` | `results/midwest/2021_2023/colsALL/` |
+| `--states northeast --years 2024` | `results/northeast/2024/colsCOW-SCHL-WKHP/pct20/` |
+| `--states northeast --years 2024 --columns COW OCCP SCHL WKHP` | `results/northeast/2024/colsCOW-OCCP-SCHL-WKHP/pct20/` |
+| `--states northeast --years 2024 --percentile 10` | `results/northeast/2024/colsCOW-SCHL-WKHP/pct10/` |
+| `--states ALL --years 2021 2022 2023 2024` | `results/ALL/2021-2024/colsCOW-SCHL-WKHP/pct20/<year>/` |
+| `--states midwest --years 2021 2023 --columns ALL` | `results/midwest/2021_2023/colsALL/pct20/` |
 
 Years tag rules: single year → the year itself; contiguous range →
 `<first>-<last>`; non-contiguous → years joined by `_`.
 Columns tag: feature columns sorted and joined by `-`, prefixed with `cols`
-(e.g. `colsCOW-SCHL-WKHP`, `colsALL` for all columns).  This ensures that
-runs with different `--columns` on the same states and year never overwrite
-each other.
-When multiple years are processed with `--steps 1 2`, each year also gets
-its own sub-directory inside the cols tag folder: `results/ALL/2021-2024/colsCOW-SCHL-WKHP/2022/`.
+(e.g. `colsCOW-SCHL-WKHP`, `colsALL` for all columns).
+Percentile tag: boundary selection percentile as integer, prefixed with `pct`
+(e.g. `pct20`, `pct10`).  Together these two tags ensure that runs with any
+combination of `--columns` and `--percentile` on the same states and year
+never overwrite each other.
+When multiple years are processed, each year also gets its own
+sub-directory inside the cols/pct folder: `results/ALL/2021-2024/colsCOW-SCHL-WKHP/pct20/2022/`.
 
 | File | Description |
 |---|---|
@@ -180,10 +182,10 @@ transactions = df["itemset"].str.split(" ").tolist()
 
 Both pipeline stages check for existing output files before doing any work.
 
-**Stage 1** (`create_dataset.py`): if the expected `train_*.csv` + `test_*.csv`
-(or `dataset_*.csv`) already exist in `--data-dir`, the download and encoding
-steps are skipped entirely and the existing files are loaded and returned.
-This makes re-runs after a partial failure or parameter tweak instant.
+**Stage 1** (`create_dataset.py`): if all three expected files
+(`dataset_*.csv`, `train_*.csv`, `test_*.csv`) already exist in `--data-dir`,
+the download and encoding steps are skipped entirely and the files are loaded
+directly.  If any one of the three is missing the full pipeline reruns.
 
 **Stage 2** (`feature_importance.py`): if `feature_importance.csv` (or
 `feature_importance_class0.csv` / `feature_importance_class1.csv` when
@@ -205,8 +207,8 @@ with `--k 15 --percentile 20 --workers 14`.
 |---|---|---|---|---|
 | 1 state (NY) | 108K | ~3s | ~18s | Baseline measurement |
 | Northeast (9 states) | ~650K | ~35s | ~8–10 min | Boundary selection dominates |
-| South (16 states) | ~1.8M | ~90s | ~90 min | O(N²) distance matrix |
-| All 49 states | ~10M | ~5 min | hours–days | Use `--percentile 5` to reduce boundary instances |
+| South (16 states) | ~1.8M | ~90s | ~8–12 min | BallTree scales well |
+| All 49 states (filtered) | ~1.4M | ~5 min | ~6 min | adult_filter reduces rows significantly |
 
 **Scaling note:** stage 2 boundary selection uses a BallTree with Manhattan
 distance, scaling as O(N log N) instead of the previous O(N²).
@@ -217,12 +219,6 @@ For very large datasets, reducing `--percentile` (e.g. `--percentile 5`)
 further cuts the number of boundary instances to process.
 
 ## CLI reference
-
-### Pipeline mode
-
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `--steps` | int (one or more) | `1` | Pipeline steps to run: `1` = dataset creation, `2` = BoCSoR, `1 2` = both. |
 
 ### ACS parameters *(stage 1)*
 
@@ -249,7 +245,7 @@ further cuts the number of boundary instances to process.
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `--test-size` | float | `0.0` | Fraction reserved for the test set. Must be `> 0` with `--steps 1 2`. |
+| `--test-size` | float | `0.2` | Fraction reserved for the test split (0.0–1.0). Default: 0.2. |
 | `--seed` | int | `42` | Random seed for the stratified split and CatBoost. |
 
 ### BoCSoR hyperparameters *(stage 2)*
@@ -275,8 +271,6 @@ further cuts the number of boundary instances to process.
 |---|---|---|---|
 | `--data-dir` | path | `data/` | Root directory for stage-1 output. |
 | `--output-dir` | path | `results/` | Directory for stage-2 output files. |
-| `--train` | path | — | Existing train CSV. Optional with `--steps 2` (inferred if omitted). |
-| `--test` | path | — | Existing test CSV. Optional with `--steps 2` (inferred if omitted). |
 
 ### Performance *(stage 1)*
 
