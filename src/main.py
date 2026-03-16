@@ -70,6 +70,10 @@ from src.macroscopic_data_mining import (      # noqa: E402
     run_macroscopic_mining,
     add_arm_arguments,
 )
+from src.microscopic_data_mining import (      # noqa: E402
+    run_microscopic_mining,
+    add_micro_arguments,
+)
 
 VALID_HORIZONS   = ("1-Year", "5-Year")
 VALID_SURVEYS    = ("person", "household")
@@ -581,6 +585,9 @@ Examples:
     # ── ARM hyperparameters (stage 3) ─────────────────────────────────────────
     add_arm_arguments(parser)
 
+    # ── Micro ARM hyperparameters (stage 4) ───────────────────────────────────
+    add_micro_arguments(parser)
+
     return parser
 
 
@@ -871,6 +878,22 @@ def main() -> None:
             n_workers=args.arm_workers,
         )
 
+        # ── Stage 4 (single year) — microscopic ARM ───────────────────────────
+        run_microscopic_mining(
+            output_dir=xai_output_dir,
+            original_class=args.original_class,
+            k_value=args.micro_k,
+            min_support=args.micro_min_support,
+            max_support=args.micro_max_support,
+            support_step=args.micro_support_step,
+            min_confidence=args.micro_min_confidence,
+            max_confidence=args.micro_max_confidence,
+            confidence_step=args.micro_confidence_step,
+            lift_independence_low=args.micro_lift_low,
+            lift_independence_high=args.micro_lift_high,
+            n_workers=args.micro_workers,
+        )
+
     else:
         # Multiple years: one process per year (CPU-bound + independent I/O).
         workers = min(args.workers, len(args.years))
@@ -959,8 +982,24 @@ def main() -> None:
                 n_workers=args.arm_workers,
             )
 
+            # ── Stage 4 (multi-year) — microscopic ARM ────────────────────────
+            run_microscopic_mining(
+                output_dir=year_output_dir,
+                original_class=args.original_class,
+                k_value=args.micro_k,
+                min_support=args.micro_min_support,
+                max_support=args.micro_max_support,
+                support_step=args.micro_support_step,
+                min_confidence=args.micro_min_confidence,
+                max_confidence=args.micro_max_confidence,
+                confidence_step=args.micro_confidence_step,
+                lift_independence_low=args.micro_lift_low,
+                lift_independence_high=args.micro_lift_high,
+                n_workers=args.micro_workers,
+            )
+
     logger.info("═" * 62)
-    logger.info("  Pipeline completed successfully.  (stages 1 · 2 · 3)")
+    logger.info("  Pipeline completed successfully.  (stages 1 · 2 · 3 · 4)")
     logger.info("═" * 62)
 
 

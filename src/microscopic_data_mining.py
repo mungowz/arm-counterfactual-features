@@ -1,2016 +1,1028 @@
 """
-microscopic_experiment_association_rules_values.py
-==================================================
-Runs FP-Growth association-rule mining at the **value level**, one
-macroscopic rule at a time, starting from the label-level rules produced by
-macroscopic_experiment_association_rules.py.
+src/microscopic_data_mining.py
+───────────────────────────────
+Stage 4 of the ACS Income pipeline: Microscopic Association Rule Mining (ARM).
 
-Pipeline position
------------------
-    macroscopic_experiment_association_rules.py  →  [this script]
+Relation to stage 3 (macroscopic ARM)
+──────────────────────────────────────
+Stage 3 discards feature values and works only with feature *labels*
+(e.g. the transaction {SCHL, WKHP}).  Stage 4 is the *microscopic* companion:
+it works with full "LABEL=value" tokens (e.g. {SCHL=Bachelors-Degree,
+WKHP=Full-Time}) so the rules carry specific value-level information.
 
-Idea
-----
-Step 3 (ARM on labels) identifies which *features* (OCCP, SCHL, WKHP, …)
-tend to co-occur on the decision boundary.  This script asks the finer
-question: *which specific values* of those features drive each individual
-label-level rule?
+The microscopic analysis is anchored to the macroscopic rules: for each
+macroscopic rule (antecedent_labels → consequent_labels) we select only the
+itemset rows that contain at least one item belonging to that rule (i.e. at
+least one token whose label matches a label in the antecedent or consequent).
+This keeps the microscopic analysis focused on the same feature relationships
+identified at the coarser level.
 
-For every unique macroscopic rule r = (antecedents_r, consequents_r) found
-across all sup_*/conf_*/rules.csv files produced by Step 3, this script:
+Input
+─────
+  • Stage-2 itemset CSV  (feature_importance_itemsets_k<N>[suffix].csv  or
+    the combined file) — same file used by stage 3, but now the full
+    "LABEL=value" tokens are retained instead of being reduced to labels.
+  • Stage-3 macroscopic rules CSV  (association_rules/k<N>/arm[suffix]_rules.csv
+    or the all_k equivalent) — used to derive the anchor label sets.
 
-1. Derives active_labels_r = labels(antecedents_r) ∪ labels(consequents_r).
-   This is the *minimal* label set for rule r.
-2. From transactions_values.csv keeps only **rows** (sample/CF pairs) that
-   contain at least one item whose label prefix is in active_labels_r.
-   All items in the kept rows are retained for mining — including items whose
-   label is NOT in active_labels_r.  Support is computed over this filtered
-   set: denominator = samples with ≥1 CF-change in an active label.
-   NOT the total number of samples in the region.  This is intentional —
-   we characterise patterns within the population that is sensitive to the
-   specific features named in the parent macroscopic rule, while allowing
-   the value-level ARM to discover associations with any co-occurring feature.
-3. Builds two transaction formats:
-       aggregated_values_by_sample.csv   — one row per sample (union of all
-           CF-neighbour items, deduplicated)
-       values_only_unique.csv            — one row per (sample, CF_neighbor)
-4. Runs the same support × confidence × lift grid search as Step 3,
-   with auto-calibration derived from the filtered item frequencies.
-   Two additional filters are applied before writing any rules:
-     a. Neutral lift window [1-w, 1+w] excluded (default w=0.25).
-     b. Same-label rules excluded: rules where antecedents and consequents
-        share at least one label prefix are dropped
-        (e.g. ST=NJ → ST=MA is excluded because both sides belong to ST).
-5. Writes all artefacts under a dedicated rule subdirectory:
-       results/{region}/association_rules_values/{exp_label}/k_{k}/
-           rule_{i:03d}__{ant}___{cons}/
-               macro_rule_origin.csv     ← parent macroscopic rule (machine)
-               macro_rule_origin.txt     ← parent macroscopic rule (human)
-               aggregated_values_by_sample.csv
-               values_only_unique.csv
-               calibration_log.txt
-               item_supports.csv
-               exploration_summary.txt
-               summary.csv              ← includes macro_rule_* columns
-               heatmaps/
-               sup_{x}/conf_{y}/rules.csv           ← includes macro_rule_* columns
-               sup_{x}/conf_{y}/rules_detailed.csv  ← includes macro_rule_* columns
-               sup_{x}/conf_{y}/summary.txt         ← includes parent rule header
-               sup_{x}/frequent_itemsets.csv
-               sup_{x}/frequent_itemsets_summary.txt
-           rule_index.csv               ← per-k table: rule_slug → outcome
-       results/{region}/association_rules_values/{exp_label}/k_comparison/
-           k_comparison_summary.csv
-           k_comparison_summary.txt
-           heatmap_k_support.png
-           heatmap_k_confidence.png
-           heatmap_k_lift.png
+Processing flow (per macroscopic rule, per k)
+─────────────────────────────────────────────
+  1. Parse the macroscopic rule → extract the set of feature labels that appear
+     in its antecedent and/or consequent.
+  2. Filter the itemset CSV: keep only rows whose itemset contains at least one
+     token with a matching label.
+  3. Build microscopic transactions: each retained row becomes a list of full
+     "LABEL=value" tokens (sorted, deduplicated).
+  4. Run the same adaptive FP-Growth grid search used in stage 3 on these
+     microscopic transactions.
+  5. Annotate every surviving microscopic rule with:
+       • macro_antecedents  — the macroscopic antecedent it is anchored to
+       • macro_consequents  — the macroscopic consequent it is anchored to
+       • macro_rule_id      — index of the macroscopic rule (0-based)
 
-Macro-rule deduplication
-------------------------
-Multiple sup_*/conf_*/ directories may produce the same (antecedents,
-consequents) pair.  This script deduplicates by (antecedents, consequents)
-string so each unique rule is processed exactly once per k.
+Output directory structure
+──────────────────────────
+All outputs land under the stage-3 association_rules directory:
 
-Parallelism — three levels
---------------------------
-Level 1 (outer)  : k values in parallel.
-                   outer_jobs = min(n_k, perf_cores)
-Level 2 (middle) : macroscopic rules in parallel within each k-worker.
-                   rule_jobs  = min(n_rules, max(1, perf_cores // outer_jobs))
-Level 3 (inner)  : support thresholds in parallel within each rule-worker.
-                   inner_jobs = max(1, perf_cores // (outer_jobs × rule_jobs))
-Guarantee: outer × rule × inner ≤ perf_cores at all times.
+  <output_dir>/association_rules/
+  ├── k<N>/
+  │   ├── micro/
+  │   │   ├── micro_rules[suffix].csv         ← all microscopic rules
+  │   │   ├── micro_grid_summary[suffix].csv
+  │   │   └── heatmaps/
+  │   │       ├── heatmap_support_confidence[suffix].png
+  │   │       ├── heatmap_support_lift[suffix].png
+  │   │       └── heatmap_confidence_lift[suffix].png
+  │   └── ...  (existing macroscopic outputs)
+  └── all_k/
+      ├── micro/
+      │   ├── micro_rules[suffix].csv
+      │   ├── micro_grid_summary[suffix].csv
+      │   └── heatmaps/
+      └── ...
 
-Input files (resolved relative to base_dir/results/)
------------------------------------------------------
-    {region}/important_features/k_{k}/transactions_values.csv
-        Columns: Sample_ID, CF_Neighbor_ID, Counterfactual_Values
+Column layout in micro_rules.csv
+─────────────────────────────────
+  macro_rule_id        — 0-based index of the macroscopic rule that anchored
+                         the transaction filter
+  macro_antecedents    — macroscopic antecedent label(s), e.g. "SCHL"
+  macro_consequents    — macroscopic consequent label(s), e.g. "WKHP"
+  k_value              — k value (per-k files only)
+  antecedents          — microscopic antecedent "LABEL=value" item(s)
+  consequents          — microscopic consequent "LABEL=value" item(s)
+  antecedent support   — P(antecedent)
+  consequent support   — P(consequent)
+  support              — P(antecedent ∪ consequent)
+  confidence           — P(consequent | antecedent)
+  lift                 — observed / expected co-occurrence
+  leverage             — P(A∪C) − P(A)·P(C)
+  conviction           — (1 − P(C)) / (1 − confidence)
+  lift_type            — "positive_correlation" or "negative_correlation"
+  grid_min_support     — min_support threshold that produced this rule
+  grid_min_confidence  — min_confidence threshold that produced this rule
+  filter_*             — active filter thresholds (self-documenting)
 
-    {region}/association_rules/{exp_label}/k_{k}/sup_*/conf_*/rules.csv
-        Produced by Step 3; antecedents/consequents are label names.
+Skip-if-exists behaviour
+────────────────────────
+If micro_rules[suffix].csv already exists in a k-folder the entire microscopic
+run for that k is skipped.  Delete the file to force a re-run.
 
-Public API
-----------
-main(regions, k_values, base_dir, ...)
-    Entry point — mirrors macroscopic_experiment_association_rules.main().
+Performance design
+──────────────────
+  1. Macroscopic rules CSV read once per k; label sets pre-computed into
+     frozensets for O(1) membership tests.
+  2. Itemset CSV parsed once per k with the same vectorised explode+groupby
+     pipeline used in stage 3.
+  3. Per-rule transaction filtering uses a vectorised pandas mask on the
+     exploded token frame — no Python loop over rows.
+  4. Grid search reuses the adaptive strategy from stage 3 (vectorised path
+     for few items, threaded path for many items).
+  5. Results across all macroscopic rules are concatenated and deduplicated
+     before writing.
+
+Dependencies
+────────────
+  pip install mlxtend pandas numpy matplotlib seaborn
 """
 
-import ast
-import datetime
+from __future__ import annotations
+
+import argparse
+import itertools
+import logging
 import os
-import platform
 import re
-import shutil
-import subprocess
 import warnings
 from pathlib import Path
+from typing import Optional
 
-import matplotlib
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from joblib import Parallel, delayed
-from mlxtend.frequent_patterns import association_rules, fpgrowth
-from mlxtend.preprocessing import TransactionEncoder
 
-matplotlib.use('Agg')
+# Re-use the shared infrastructure from stage 3.
+from src.macroscopic_data_mining import (
+    DEFAULT_LIFT_INDEPENDENCE_LOW,
+    DEFAULT_LIFT_INDEPENDENCE_HIGH,
+    DEFAULT_MIN_CONFIDENCE,
+    DEFAULT_MAX_CONFIDENCE,
+    DEFAULT_MIN_SUPPORT,
+    DEFAULT_MAX_SUPPORT,
+    _DEFAULT_ARM_WORKERS,
+    _FOLDER_ARM,
+    _FOLDER_FEATURE_IMP,
+    _FOLDER_HEATMAPS,
+    _arm_root,
+    _k_dir,
+    _all_k_dir,
+    _heatmap_dir,
+    _build_boolean_matrix,
+    _mine_frequent_itemsets,
+    _annotate_lift_type,
+    _compute_data_driven_steps,
+    _linspace,
+    _build_grid,
+    generate_heatmaps,
+    run_grid_search,
+)
+
+logger = logging.getLogger("src.microscopic_data_mining")
+
+logging.getLogger("matplotlib").setLevel(logging.WARNING)
+logging.getLogger("PIL").setLevel(logging.WARNING)
+
+# Sub-folder name for microscopic outputs inside each k-folder.
+_FOLDER_MICRO = "micro"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Default parameters (inherit stage-3 defaults)
+# ─────────────────────────────────────────────────────────────────────────────
+
+DEFAULT_MICRO_MIN_SUPPORT         = DEFAULT_MIN_SUPPORT
+DEFAULT_MICRO_MAX_SUPPORT         = DEFAULT_MAX_SUPPORT
+DEFAULT_MICRO_SUPPORT_STEP        = None   # data-driven
+
+DEFAULT_MICRO_MIN_CONFIDENCE      = DEFAULT_MIN_CONFIDENCE
+DEFAULT_MICRO_MAX_CONFIDENCE      = DEFAULT_MAX_CONFIDENCE
+DEFAULT_MICRO_CONFIDENCE_STEP     = None   # data-driven
+
+DEFAULT_MICRO_LIFT_LOW  = DEFAULT_LIFT_INDEPENDENCE_LOW
+DEFAULT_MICRO_LIFT_HIGH = DEFAULT_LIFT_INDEPENDENCE_HIGH
 
 
-# ---------------------------------------------------------------------------
-# Hardware-aware parallelism
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Directory helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
-_CPU_CORES: int         = os.cpu_count() or 1
-_PERF_CORES: int | None = None
+def _micro_dir(k_or_allk_dir: Path) -> Path:
+    """Return <k_dir>/micro/ or <all_k_dir>/micro/, creating if absent."""
+    p = k_or_allk_dir / _FOLDER_MICRO
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
 
-def _detect_perf_cores() -> int:
+# ─────────────────────────────────────────────────────────────────────────────
+# Macroscopic rules loading
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_macro_rules(macro_rules_path: Path) -> pd.DataFrame:
     """
-    Return the number of P-cores on Apple Silicon, or total logical CPUs
-    on all other platforms.
+    Load the macroscopic rules CSV produced by stage 3.
+
+    Returns a DataFrame with at minimum columns:
+      macro_rule_id, macro_antecedents (str), macro_consequents (str)
+    and the full set of metric/filter columns from the macroscopic run.
+
+    Raises FileNotFoundError if the file does not exist.
     """
-    if platform.system() == 'Darwin':
-        try:
-            result = subprocess.run(
-                ['sysctl', '-n', 'hw.perflevel0.logicalcpu'],
-                capture_output=True, text=True, check=True,
-            )
-            p_cores = int(result.stdout.strip())
-            print(
-                f'  > Apple Silicon detected: {p_cores} P-cores '
-                f'(of {_CPU_CORES} logical total) — '
-                f'joblib capped at {p_cores} workers'
-            )
-            return p_cores
-        except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
-            pass
-    return _CPU_CORES
-
-
-def _get_perf_cores() -> int:
-    """Return the cached P-core count, detecting it on the first call."""
-    global _PERF_CORES
-    if _PERF_CORES is None:
-        _PERF_CORES = _detect_perf_cores()
-    return _PERF_CORES
-
-
-# ---------------------------------------------------------------------------
-# Neutral-window helper
-# ---------------------------------------------------------------------------
-
-def _neutral_window(half_window: float) -> tuple[float, float]:
-    """
-    Return (lo, hi) for the symmetric neutral-lift exclusion band.
-
-    With the default half_window=0.25 this gives [0.75, 1.25].
-    Rules with lift in [lo, hi] are excluded from the grid search.
-    Rules with lift < lo (negative correlations) are preserved.
-    """
-    lo = round(1.0 - half_window, 4)
-    hi = round(1.0 + half_window, 4)
-    return lo, hi
-
-
-# ---------------------------------------------------------------------------
-# Experiment labelling
-# ---------------------------------------------------------------------------
-
-def _experiment_label(
-    auto_calibrate: bool,
-    sup_min: float, sup_max: float, sup_delta: float,
-    conf_min: float, conf_max: float, conf_delta: float,
-    lift_min: float, lift_max: float, lift_delta: float,
-    lift_neutral_half_window: float,
-) -> str:
-    """
-    Build a filesystem-safe string encoding the grid configuration.
-
-    Inserted as a path component between association_rules_values/ and k_{k}/
-    so that different configurations coexist without overwriting each other.
-    Mirrors the identical function in macroscopic_experiment_association_rules.
-    """
-    def fmt(v: float) -> str:
-        return f'{v:.2f}'
-
-    if auto_calibrate:
-        prefix    = 'auto'
-        sup_part  = f'sup=auto_d{fmt(sup_delta)}'
-        lift_part = f'lift=auto_d{fmt(lift_delta)}_w{fmt(lift_neutral_half_window)}'
-    else:
-        prefix    = 'manual'
-        sup_part  = f'sup={fmt(sup_min)}-{fmt(sup_max)}_d{fmt(sup_delta)}'
-        lift_part = (
-            f'lift={fmt(lift_min)}-{fmt(lift_max)}'
-            f'_d{fmt(lift_delta)}_w{fmt(lift_neutral_half_window)}'
+    if not macro_rules_path.exists():
+        raise FileNotFoundError(
+            f"Macroscopic rules file not found: {macro_rules_path}.  "
+            "Make sure stage 3 (macroscopic_data_mining.py) has completed."
         )
-
-    conf_part = f'conf={fmt(conf_min)}-{fmt(conf_max)}_d{fmt(conf_delta)}'
-    return f'{prefix}_{sup_part}_{conf_part}_{lift_part}'
-
-
-# ---------------------------------------------------------------------------
-# Macroscopic rule utilities
-# ---------------------------------------------------------------------------
-
-def _parse_labels_from_cell(cell: str) -> set[str]:
-    """
-    Parse a comma-separated antecedents/consequents cell into a set of label
-    names.  E.g. 'OCCP, SCHL' → {'OCCP', 'SCHL'}.
-    """
-    return {s.strip() for s in str(cell).split(',') if s.strip()}
-
-
-def _make_rule_slug(rule_idx: int, ant_str: str, cons_str: str) -> str:
-    """
-    Build a filesystem-safe folder name for a single macroscopic rule.
-
-    Format: rule_{idx:03d}__{ant_clean}___{cons_clean}
-
-    Examples
-    --------
-    (0, 'SCHL', 'OCCP')        → 'rule_000__SCHL___OCCP'
-    (1, 'OCCP, SCHL', 'WKHP') → 'rule_001__OCCP_SCHL___WKHP'
-    """
-    def clean(s: str) -> str:
-        s = s.replace(', ', '_').replace(',', '_')
-        s = re.sub(r'[^\w]', '_', s)
-        s = re.sub(r'_+', '_', s).strip('_')
-        return s
-
-    return f'rule_{rule_idx:03d}__{clean(ant_str)}___{clean(cons_str)}'
-
-
-def collect_unique_macro_rules(
-    results_dir: Path,
-    region: str,
-    k: int,
-) -> list[dict]:
-    """
-    Collect all unique macroscopic rules for a given (region, k) by scanning
-    every sup_*/conf_*/rules.csv produced by Step 3 across all
-    experiment-label subdirectories.
-
-    Deduplication is by (antecedents, consequents) string pair.  When the same
-    rule appears in multiple files all source paths are recorded; statistics
-    (support, confidence, lift) come from the first occurrence (lexicographic
-    path order).
-
-    Returns
-    -------
-    list[dict]
-        Sorted list of unique rule dicts.  Each dict contains:
-            rule_index        int   — 0-based sequential index
-            antecedents       str   — e.g. 'OCCP, SCHL'
-            consequents       str   — e.g. 'WKHP'
-            active_labels     set   — union of both sides
-            rule_slug         str   — filesystem-safe folder name
-            source_paths      list  — all rules.csv paths for this rule
-            macro_support_pct float — support_pct from first occurrence
-            macro_conf_pct    float — confidence_pct from first occurrence
-            macro_lift        float — lift from first occurrence
-        Returns [] if no rules.csv exist for this (region, k).
-    """
-    base = results_dir / region / 'association_rules'
-    if not base.exists():
-        return []
-
-    all_paths = sorted(base.rglob(f'k_{k}/sup_*/conf_*/rules.csv'))
-    if not all_paths:
-        return []
-
-    seen: dict[tuple, dict] = {}   # (ant_norm, cons_norm) → rule dict
-
-    for p in all_paths:
-        try:
-            df = pd.read_csv(p)
-        except Exception:
-            continue
-        if df.empty:
-            continue
-        # itertuples is ~100× faster than iterrows for tight inner loops;
-        # fillna ensures missing cells become empty strings, not float NaN.
-        df = df.fillna('')
-        for row in df[['antecedents', 'consequents',
-                        'support_pct', 'confidence_pct', 'lift']].itertuples(index=False):
-            ant  = str(row.antecedents).strip()
-            cons = str(row.consequents).strip()
-            if not ant or not cons:
-                continue
-            key = (ant, cons)
-            if key not in seen:
-                seen[key] = {
-                    'antecedents':       ant,
-                    'consequents':       cons,
-                    'active_labels':     (
-                        _parse_labels_from_cell(ant) |
-                        _parse_labels_from_cell(cons)
-                    ),
-                    'source_paths':      [str(p)],
-                    'macro_support_pct': float(row.support_pct)   if row.support_pct   != '' else 0.0,
-                    'macro_conf_pct':    float(row.confidence_pct) if row.confidence_pct != '' else 0.0,
-                    'macro_lift':        float(row.lift)            if row.lift           != '' else 0.0,
-                }
-            else:
-                seen[key]['source_paths'].append(str(p))
-
-    unique_rules = []
-    for idx, ((ant, cons), info) in enumerate(seen.items()):
-        info['rule_index'] = idx
-        info['rule_slug']  = _make_rule_slug(idx, ant, cons)
-        unique_rules.append(info)
-
-    return unique_rules
-
-
-# ---------------------------------------------------------------------------
-# Transaction builder
-# ---------------------------------------------------------------------------
-
-def build_value_transactions(
-    transactions_values_path: Path,
-    active_labels: set[str],
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Read transactions_values.csv and build aggregated and pair-level
-    transaction DataFrames.
-
-    Row-selection logic (matches the spec)
-    --------------------------------------
-    A row (= one original-instance / CF-neighbour pair) is KEPT if it
-    contains at least one item whose label prefix belongs to *active_labels*.
-    ALL items in a kept row are retained for mining — including items whose
-    label is NOT in active_labels.  This is intentional: the macroscopic rule
-    tells us *which samples* to focus on (those that change at least one of
-    the rule's features), but the value-level ARM is then free to discover
-    associations among any features present in those samples.
-
-    Support denominator
-    -------------------
-    Support is computed over the set of samples that have at least one
-    CF-change in an active label — not the full region population.  This
-    characterises patterns within the sub-population sensitive to the
-    features named in the parent macroscopic rule.
-
-    Returns
-    -------
-    agg_df : pd.DataFrame
-        One row per Sample_ID (union of all CF-neighbour items, deduplicated).
-        Columns: Sample_ID, Values (str repr of sorted list),
-                 Num_Values, Num_CF_Neighbors.
-        Passed to encode_transactions() for FP-Growth.
-    pair_df : pd.DataFrame
-        One row per (Sample_ID, CF_Neighbor_ID).
-        Columns: Sample_ID, CF_Neighbor_ID, Values.
-        Saved for traceability.
-    """
-    df = pd.read_csv(transactions_values_path)
-
-    required = {'Sample_ID', 'CF_Neighbor_ID', 'Counterfactual_Values'}
-    missing  = required - set(df.columns)
-    if missing:
-        raise ValueError(
-            f'transactions_values.csv missing columns: {missing}  '
-            f'(found: {df.columns.tolist()})'
-        )
-
-    print(
-        f'    Loaded {len(df):,} rows, '
-        f'{df["Sample_ID"].nunique():,} unique samples'
-    )
-
-    def _parse_all_items(raw: str) -> list:
-        """Parse all label=value items from a cell, regardless of label."""
-        try:
-            items = ast.literal_eval(raw)
-        except (ValueError, SyntaxError):
-            return []
-        return [item for item in items if '=' in str(item)]
-
-    def _has_active_label(items: list) -> bool:
-        """True if at least one item's label prefix is in active_labels."""
-        return any(str(item).split('=', 1)[0] in active_labels for item in items)
-
-    df          = df.copy()
-    df['_all']  = df['Counterfactual_Values'].apply(_parse_all_items)
-
-    # Row selection: keep rows that contain ≥1 item from active_labels.
-    # Items from other labels are preserved — they may form meaningful
-    # associations with the active-label items in the value-level ARM.
-    df = df[df['_all'].apply(_has_active_label)].reset_index(drop=True)
-
-    # ── Pair-level DataFrame ──────────────────────────────────────────
-    pair_df = (
-        df[['Sample_ID', 'CF_Neighbor_ID', '_all']]
-        .rename(columns={'_all': 'Values'})
-        .assign(Values=lambda d: d['Values'].apply(str))
-        .reset_index(drop=True)
-    )
-
-    # ── Aggregated DataFrame ──────────────────────────────────────────
-    # One row per Sample_ID: union of all items across every CF-neighbour,
-    # deduplicated and sorted.  All items are included, not just active ones.
-    agg_df = (
-        df.groupby('Sample_ID', sort=False)
-        .agg(
-            _items=('_all',
-                    lambda x: sorted({item for sub in x for item in sub})),
-            Num_CF_Neighbors=('CF_Neighbor_ID', 'nunique'),
-        )
-        .reset_index()
-    )
-    agg_df['Values']     = agg_df['_items'].apply(str)
-    agg_df['Num_Values'] = agg_df['_items'].apply(len)
-    agg_df = agg_df[['Sample_ID', 'Values', 'Num_Values', 'Num_CF_Neighbors']]
-
-    print(
-        f'    Rows with ≥1 active-label item ({sorted(active_labels)}): '
-        f'{len(agg_df):,} samples, {len(pair_df):,} (sample, CF) pairs'
-    )
-    return agg_df, pair_df
-
-
-# ---------------------------------------------------------------------------
-# One-hot encoding
-# ---------------------------------------------------------------------------
-
-def encode_transactions(values_col: pd.Series) -> pd.DataFrame:
-    """
-    One-hot-encode a Series of stringified Python lists into a Boolean
-    DataFrame suitable for mlxtend's fpgrowth().
-
-    sparse=False is mandatory: on some pandas/scipy combinations the default
-    SparseDtype uses fill_value=True instead of False, which makes
-    DataFrame.mean() return 1.0 for every column and breaks calibrate_parameters().
-    """
-    itemsets = values_col.apply(ast.literal_eval)
-    te       = TransactionEncoder()
-    te_ary   = te.fit(itemsets).transform(itemsets, sparse=False)
-    enc_df   = pd.DataFrame(te_ary, columns=te.columns_)
-    print(
-        f'    Encoded: {len(enc_df):,} transactions × '
-        f'{enc_df.shape[1]:,} unique items'
-    )
-    return enc_df
-
-
-# ---------------------------------------------------------------------------
-# Filesystem helpers
-# ---------------------------------------------------------------------------
-
-def cleanup_empty_folders(output_dir: Path) -> tuple[int, int]:
-    """
-    Remove conf_* subdirs with no valid rules.csv, then remove empty sup_* dirs.
-
-    Uses stat().st_size instead of pd.read_csv to avoid loading every file
-    into memory during a hot cleanup loop. A rules.csv with at least one data
-    row is always > 120 bytes; a header-only file is < 120 bytes.
-
-    Returns (n_conf_removed, n_sup_removed).
-    """
-    removed_conf = 0
-    removed_sup  = 0
-    for sup_dir in sorted(Path(output_dir).glob('sup_*')):
-        if not sup_dir.is_dir():
-            continue
-        for conf_dir in sorted(sup_dir.glob('conf_*')):
-            if not conf_dir.is_dir():
-                continue
-            rules_csv     = conf_dir / 'rules.csv'
-            should_remove = not rules_csv.exists()
-            if not should_remove:
-                try:
-                    should_remove = rules_csv.stat().st_size < 120
-                except OSError:
-                    should_remove = True
-            if should_remove:
-                shutil.rmtree(conf_dir)
-                removed_conf += 1
-        if not list(sup_dir.glob('conf_*')):
-            shutil.rmtree(sup_dir)
-            removed_sup += 1
-    return removed_conf, removed_sup
-
-
-# ---------------------------------------------------------------------------
-# Macro-rule provenance writers
-# ---------------------------------------------------------------------------
-
-def _write_macro_rule_origin(rule_dir: Path, macro_rule: dict) -> None:
-    """
-    Write macro_rule_origin.csv (one row, machine-readable) and
-    macro_rule_origin.txt (human-readable) to *rule_dir*.
-
-    These files record the parent macroscopic rule for every microscopic
-    result directory, making rule_dir self-describing when processed in
-    isolation.
-    """
-    origin_row = {
-        'rule_index':        macro_rule['rule_index'],
-        'rule_slug':         macro_rule['rule_slug'],
-        'antecedents':       macro_rule['antecedents'],
-        'consequents':       macro_rule['consequents'],
-        'active_labels':     ', '.join(sorted(macro_rule['active_labels'])),
-        'macro_support_pct': macro_rule.get('macro_support_pct', ''),
-        'macro_conf_pct':    macro_rule.get('macro_conf_pct', ''),
-        'macro_lift':        macro_rule.get('macro_lift', ''),
-        'n_source_files':    len(macro_rule.get('source_paths', [])),
-        'source_paths':      ' | '.join(macro_rule.get('source_paths', [])),
-    }
-    pd.DataFrame([origin_row]).to_csv(
-        rule_dir / 'macro_rule_origin.csv', index=False
-    )
-
-    with open(rule_dir / 'macro_rule_origin.txt', 'w') as f:
-        f.write('PARENT MACROSCOPIC RULE\n')
-        f.write(f'{"=" * 60}\n\n')
-        f.write(f'Rule Index   : {macro_rule["rule_index"]}\n')
-        f.write(f'Rule Slug    : {macro_rule["rule_slug"]}\n')
-        f.write(f'Antecedents  : {macro_rule["antecedents"]}\n')
-        f.write(f'Consequents  : {macro_rule["consequents"]}\n')
-        f.write(f'Active Labels: {sorted(macro_rule["active_labels"])}\n\n')
-        f.write('Macroscopic Statistics (from first occurrence):\n')
-        f.write(f'  Support    : {macro_rule.get("macro_support_pct", 0.0):.2f}%\n')
-        f.write(f'  Confidence : {macro_rule.get("macro_conf_pct", 0.0):.2f}%\n')
-        f.write(f'  Lift       : {macro_rule.get("macro_lift", 0.0):.4f}\n\n')
-        f.write(
-            f'Found in {len(macro_rule.get("source_paths", []))} '
-            f'rules.csv file(s):\n'
-        )
-        for p in macro_rule.get('source_paths', []):
-            f.write(f'  {p}\n')
-
-
-# ---------------------------------------------------------------------------
-# Calibration log writer
-# ---------------------------------------------------------------------------
-
-def _write_calibration_log(
-    rule_dir: Path,
-    macro_rule: dict,
-    n_transactions: int,
-    item_supports: pd.Series,
-    params: dict | None,
-    auto_calibrate: bool,
-    manual_params: dict | None = None,
-) -> None:
-    """
-    Write item_supports.csv and calibration_log.txt to *rule_dir*.
-
-    Both files include a header identifying the parent macroscopic rule.
-    """
-    sup_df = pd.DataFrame({
-        'item':        list(item_supports.index),
-        'support_raw': [f'{v:.4f}' for v in item_supports.values],
-        'support_pct': [f'{v * 100:.2f}' for v in item_supports.values],
-    })
-    sup_df.to_csv(rule_dir / 'item_supports.csv', index=False)
-
-    m_idx  = macro_rule['rule_index']
-    m_ant  = macro_rule['antecedents']
-    m_cons = macro_rule['consequents']
-
-    with open(rule_dir / 'calibration_log.txt', 'w') as f:
-        f.write('CALIBRATION LOG (value level)\n')
-        f.write(f'{"=" * 60}\n\n')
-        f.write('Parent Macroscopic Rule:\n')
-        f.write(f'  Rule Index  : {m_idx}\n')
-        f.write(f'  Antecedents : {m_ant}\n')
-        f.write(f'  Consequents : {m_cons}\n\n')
-        f.write(f'Transactions : {n_transactions:,}\n')
-        f.write(f'Items        : {len(item_supports)}\n')
-        f.write(f'Active Labels: {sorted(macro_rule["active_labels"])}\n\n')
-        f.write(f'Item Supports (ascending):\n{"-" * 40}\n')
-        for item, sup in item_supports.items():
-            f.write(f'  {item:<45} {sup:.4f}\n')
-        f.write('\n')
-
-        if not auto_calibrate:
-            f.write('Mode: MANUAL (auto_calibrate=False)\n')
-            if manual_params:
-                for k2, v in manual_params.items():
-                    f.write(f'  {k2:<10}: {v}\n')
-            return
-
-        f.write('Mode: AUTO-CALIBRATED\n\n')
-        if params is None:
-            f.write('Result: SKIPPED\n')
-            f.write('Reason: no 2-itemsets found — transactions too sparse.\n')
-            return
-
-        f.write('Calibrated Parameters:\n')
-        f.write(
-            f'  sup_min  : {params["sup_min"]}  '
-            f'(raw={params["raw_sup_min"]:.6f})\n'
-        )
-        f.write(
-            f'  sup_max  : {params["sup_max"]}  '
-            f'(natural_ceiling={params["natural_sup_max"]}, +4 decay steps)\n'
-        )
-        f.write(
-            f'  conf_min : {params["conf_min"]}  '
-            f'(min_observed={params["min_conf_observed"]}, '
-            f'max={params["max_conf_observed"]})\n'
-        )
-        f.write(f'  conf_max : {params["conf_max"]}\n')
-        f.write(
-            f'  lift_min : {params["lift_min"]}  '
-            f'(0.0 — negative correlations included)\n'
-        )
-        f.write(
-            f'  lift_max : {params["lift_max"]}  '
-            f'(raw ceiling={params["raw_lift_max"]:.4f}, capped at 10.0)\n'
-        )
-
-
-# ---------------------------------------------------------------------------
-# Auto-calibration
-# ---------------------------------------------------------------------------
-
-def calibrate_parameters(
-    encoded_df: pd.DataFrame,
-    sup_delta: float      = 0.02,
-    lift_delta: float     = 0.05,
-    conf_delta: float     = 0.05,
-    conf_min_floor: float = 0.05,
-    conf_max: float       = 1.00,
-) -> dict | None:
-    """
-    Derive data-driven grid bounds from item frequencies.
-
-    Strategy
-    --------
-    sup_min  — product of the two rarest item supports, snapped up to the
-               nearest sup_delta; floored at sup_delta.
-    sup_max  — support at which 2-itemsets stop appearing, plus 4 decay
-               steps; capped at 0.50.  Found via binary search O(log N)
-               instead of a linear scan — identical result, far fewer
-               FP-Growth calls.
-    lift_max — 1 / support(rarest item), rounded up to nearest 0.5; capped
-               at 10.0.
-    conf_min — minimum confidence in a probe run at sup_min, snapped down
-               to the nearest conf_delta; floored at conf_min_floor.
-
-    All calibration FP-Growth calls use max_len=2 — we only need to detect
-    presence/absence of 2-itemsets, so mining longer itemsets here is waste.
-
-    Returns None if no 2-itemsets can be formed.
-    """
-    print('    Calibrating parameters from item frequencies...')
-
-    item_supports = encoded_df.mean().sort_values()
-    if len(item_supports) < 2:
-        print('    WARNING: fewer than 2 items — cannot form pairwise rules.')
-        return None
-
-    rarest = item_supports.iloc[0]
-    second = item_supports.iloc[1]
-    freq_2 = item_supports.iloc[-2]
-
-    raw_sup_min = rarest * second
-    sup_min = max(
-        round(np.floor(raw_sup_min / sup_delta) * sup_delta, 4), sup_delta
-    )
-
-    # ── Binary search for the natural 2-itemset ceiling ─────────────────
-    # FP-Growth is monotone: raising min_support can only remove itemsets.
-    # Binary search finds the highest threshold with ≥1 2-itemset in
-    # O(log(range/step)) calls rather than O(range/step).
-    # max_len=2: calibration only needs pairwise presence/absence detection.
-    scan_grid               = np.round(
-        np.arange(sup_min, freq_2 + sup_delta / 2, sup_delta), 4
-    )
-    natural_sup_max         = sup_min
-    prev_had_2itemsets      = False
-    fi_first_with_2itemsets = None
-
-    # Phase A: verify at least one 2-itemset exists at sup_min.
-    fi_lo = fpgrowth(encoded_df, min_support=float(scan_grid[0]),
-                     use_colnames=True, max_len=2)
-    if not fi_lo.empty and (fi_lo['itemsets'].apply(len) >= 2).any():
-        fi_first_with_2itemsets = fi_lo
-        prev_had_2itemsets      = True
-
-        if len(scan_grid) == 1:
-            natural_sup_max = scan_grid[0]
-        else:
-            # Phase B: binary search for the last grid index with 2-itemsets.
-            lo_idx, hi_idx = 0, len(scan_grid) - 1
-            while lo_idx < hi_idx:
-                mid_idx = (lo_idx + hi_idx + 1) // 2
-                fi_mid  = fpgrowth(
-                    encoded_df,
-                    min_support=float(scan_grid[mid_idx]),
-                    use_colnames=True,
-                    max_len=2,
-                )
-                has_2 = (
-                    not fi_mid.empty
-                    and (fi_mid['itemsets'].apply(len) >= 2).any()
-                )
-                if has_2:
-                    lo_idx = mid_idx
-                else:
-                    hi_idx = mid_idx - 1
-            natural_sup_max = scan_grid[lo_idx]
-
-    _DECAY_STEPS = 4
-    sup_max = min(
-        round(natural_sup_max + _DECAY_STEPS * sup_delta, 4), 0.50
-    )
-
-    if not prev_had_2itemsets:
-        print('    WARNING: no 2-itemsets found — transactions too sparse.')
-        return None
-
-    raw_lift_max = 1.0 / rarest
-    lift_max     = min(round(np.ceil(raw_lift_max * 2) / 2, 1), 10.0)
-
-    calibrated_conf_min = conf_min_floor
-    min_conf_observed   = None
-    max_conf_observed   = None
 
     try:
-        if fi_first_with_2itemsets is not None and not fi_first_with_2itemsets.empty:
-            rules_probe = association_rules(
-                fi_first_with_2itemsets, metric='confidence', min_threshold=0.01
-            )
-            if not rules_probe.empty:
-                min_conf_observed   = rules_probe['confidence'].min()
-                max_conf_observed   = rules_probe['confidence'].max()
-                calibrated          = round(
-                    np.floor(min_conf_observed / conf_delta) * conf_delta, 4
-                )
-                calibrated_conf_min = max(calibrated, conf_min_floor)
-    except Exception as exc:
-        print(
-            f'    WARNING: conf_min calibration failed ({exc!r}) '
-            f'— using floor={conf_min_floor}'
-        )
+        df = pd.read_csv(macro_rules_path)
+    except pd.errors.EmptyDataError:
+        logger.warning("Macroscopic rules file %s is empty.", macro_rules_path.name)
+        return pd.DataFrame()
 
-    return {
-        'sup_min':           sup_min,
-        'sup_max':           sup_max,
-        'natural_sup_max':   natural_sup_max,
-        'sup_delta':         sup_delta,
-        'conf_min':          calibrated_conf_min,
-        'conf_max':          conf_max,
-        'conf_delta':        conf_delta,
-        'lift_min':          0.0,
-        'lift_max':          lift_max,
-        'lift_delta':        lift_delta,
-        'raw_sup_min':       round(raw_sup_min, 6),
-        'raw_lift_max':      round(raw_lift_max, 4),
-        'min_conf_observed': (
-            round(min_conf_observed, 4) if min_conf_observed is not None else None
-        ),
-        'max_conf_observed': (
-            round(max_conf_observed, 4) if max_conf_observed is not None else None
-        ),
-        'item_supports': item_supports.round(4).to_dict(),
-    }
+    if df.empty:
+        logger.warning("Macroscopic rules file %s has no data rows.", macro_rules_path.name)
+        return pd.DataFrame()
 
+    # Rename for clarity in the microscopic context.
+    rename = {}
+    if "antecedents" in df.columns:
+        rename["antecedents"] = "macro_antecedents"
+    if "consequents" in df.columns:
+        rename["consequents"] = "macro_consequents"
+    df = df.rename(columns=rename)
 
-# ---------------------------------------------------------------------------
-# Heatmaps
-# ---------------------------------------------------------------------------
+    # Add a stable 0-based rule index.
+    df.insert(0, "macro_rule_id", range(len(df)))
 
-def plot_heatmaps(
-    summary_df: pd.DataFrame,
-    output_dir: Path,
-    macro_rule: dict,
-    lift_neutral_half_window: float = 0.25,
-    lift_delta: float               = 0.05,
-    lift_display_step: float        = 0.1,
-) -> None:
-    """
-    Generate three parameter-space heatmaps for a single rule_dir.
-
-    Each heatmap shows the maximum number of microscopic rules over the full
-    support × confidence × lift grid, marginalising over the third parameter.
-    The parent macroscopic rule is printed in the title.
-    """
-    if summary_df.empty:
-        print('    > Summary empty — skipping heatmaps.')
-        return
-
-    output_dir  = Path(output_dir)
-    heatmap_dir = output_dir / 'heatmaps'
-    heatmap_dir.mkdir(parents=True, exist_ok=True)
-
-    df = summary_df.copy()
-    df['Lift_display'] = (
-        (df['Lift_threshold'] / lift_display_step).round() * lift_display_step
-    ).round(4)
-
-    neutral_lo, neutral_hi = _neutral_window(lift_neutral_half_window)
-    rule_title = (
-        f'[{macro_rule["antecedents"]}] => [{macro_rule["consequents"]}]'
+    logger.info(
+        "Loaded %d macroscopic rules from %s.", len(df), macro_rules_path.name
     )
-
-    configs = [
-        ('Confidence',   'Support',    'support_confidence', False),
-        ('Lift_display', 'Support',    'support_lift',        True),
-        ('Lift_display', 'Confidence', 'confidence_lift',     True),
-    ]
-
-    for x_col, y_col, suffix, x_is_lift in configs:
-        pivot = (
-            df.groupby([y_col, x_col])['Number_of_Rules']
-            .max()
-            .unstack(level=x_col)
-            .sort_index(ascending=False)
-            .fillna(0)
-            .astype(int)
-        )
-
-        if x_is_lift:
-            pivot = pivot.loc[
-                :,
-                ~pivot.columns.to_series().between(
-                    neutral_lo, neutral_hi, inclusive='both'
-                ),
-            ]
-            nz_mask = (pivot != 0).any(axis=0).values
-            if nz_mask.any():
-                last_nz = int(np.where(nz_mask)[0].max())
-                pivot   = pivot.iloc[:, :last_nz + 1]
-
-        n_cols = len(pivot.columns)
-        n_rows = len(pivot.index)
-        fig, ax = plt.subplots(
-            figsize=(max(10, n_cols * 0.75), max(4, n_rows * 0.55))
-        )
-
-        img = ax.imshow(
-            pivot.values, aspect='auto', cmap='YlOrBr', interpolation='nearest'
-        )
-        ax.set_xticks(range(n_cols))
-        ax.set_xticklabels(
-            [f'{v:.2f}' if isinstance(v, float) else str(v)
-             for v in pivot.columns],
-            rotation=40, ha='right', fontsize=8,
-        )
-        ax.set_yticks(range(n_rows))
-        ax.set_yticklabels([f'{v:.2f}' for v in pivot.index], fontsize=8)
-
-        x_label = 'Lift' if x_is_lift else x_col
-        ax.set_xlabel(x_label, fontsize=11, labelpad=8)
-        ax.set_ylabel(y_col,   fontsize=11, labelpad=8)
-        ax.set_title(
-            f'Micro-rules — {y_col} vs {x_label}\n'
-            f'Macro: {rule_title}\n'
-            f'(darker = more rules; max over the third parameter)',
-            fontsize=10, pad=14,
-        )
-
-        max_val = pivot.values.max() if pivot.values.max() > 0 else 1
-        for ri in range(n_rows):
-            for ci in range(n_cols):
-                val = pivot.values[ri, ci]
-                if val > 0:
-                    txt_color = 'white' if (val / max_val) > 0.55 else 'black'
-                    ax.text(
-                        ci, ri, str(val),
-                        ha='center', va='center', fontsize=7, color=txt_color,
-                    )
-
-        cbar = plt.colorbar(img, ax=ax, fraction=0.025, pad=0.02)
-        cbar.set_label('Number of Rules', fontsize=9)
-        plt.tight_layout()
-        fig.savefig(
-            heatmap_dir / f'heatmap_{suffix}.png', dpi=150, bbox_inches='tight'
-        )
-        plt.close(fig)
-        print(f'      > saved heatmaps/heatmap_{suffix}.png')
+    return df
 
 
-# ---------------------------------------------------------------------------
-# Inner worker — one support threshold
-# ---------------------------------------------------------------------------
-
-def _process_one_support(
-    min_sup: float,
-    sup_idx: int,
-    n_sup: int,
-    df,
-    output_dir: Path,
-    confidence_grid,
-    lift_grid_used,
-    lift_window_lo: float,
-    lift_window_hi: float,
-    macro_rule: dict,
-) -> list:
+def _macro_label_sets(macro_rules: pd.DataFrame) -> list[frozenset[str]]:
     """
-    Run FP-Growth at *min_sup* and write association rules for every
-    (confidence, lift) combination.  Called as a joblib.Parallel worker.
+    For each macroscopic rule return the frozenset of feature labels that appear
+    in its antecedent OR consequent.
 
-    All output files include three provenance columns that trace each
-    microscopic rule back to its parent macroscopic rule:
-        macro_rule_index    — sequential index of the macroscopic rule
-        macro_antecedents   — antecedent label(s) of the macroscopic rule
-        macro_consequents   — consequent label(s) of the macroscopic rule
-
-    Returns
-    -------
-    list[dict]
-        One summary-row dict per (support, confidence, lift) triple that
-        produced rules.  Empty list if FP-Growth finds no frequent itemsets.
+    Input format: antecedent/consequent are strings like "SCHL" or "SCHL & WKHP".
     """
-    output_dir = Path(output_dir)
-    sup_label  = f'{min_sup:.2f}'
-    sup_dir    = output_dir / f'sup_{sup_label}'
-    sup_dir.mkdir(parents=True, exist_ok=True)
+    label_sets: list[frozenset[str]] = []
+    for row in macro_rules.itertuples(index=False):
+        row_dict = row._asdict()
+        labels: set[str] = set()
+        for col in ("macro_antecedents", "macro_consequents"):
+            val = str(row_dict.get(col, ""))
+            if val and val.lower() not in ("nan", ""):
+                for part in val.split(" & "):
+                    lbl = part.strip()
+                    if lbl:
+                        labels.add(lbl)
+        label_sets.append(frozenset(labels))
+    return label_sets
 
-    m_idx  = macro_rule['rule_index']
-    m_ant  = macro_rule['antecedents']
-    m_cons = macro_rule['consequents']
 
-    print(f'\n      [{sup_idx}/{n_sup}] sup={min_sup}')
+# ─────────────────────────────────────────────────────────────────────────────
+# Microscopic transaction loading and filtering
+# ─────────────────────────────────────────────────────────────────────────────
 
-    frequent_itemsets = fpgrowth(df, min_support=min_sup, use_colnames=True)
-    n_fi = len(frequent_itemsets)
-    print(f'        > {n_fi} frequent itemsets')
+def load_micro_itemsets(csv_path: Path) -> pd.DataFrame:
+    """
+    Load the stage-2 itemset CSV and return a DataFrame with columns:
+      _txn_idx  — original row index (one per boundary instance)
+      token     — each "LABEL=value" token (one row per token per transaction)
+      label     — the LABEL part (before "=")
 
-    if n_fi == 0:
-        return []
+    This is the exploded form used for vectorised per-rule filtering.
+    The full "LABEL=value" tokens are retained (not reduced to labels).
 
-    fi = frequent_itemsets.copy()
-    fi['itemset_str']    = fi['itemsets'].apply(lambda x: ', '.join(sorted(x)))
-    fi['itemset_length'] = fi['itemsets'].apply(len)
-    fi = fi[['itemset_str', 'itemset_length', 'support']]
-    fi = fi.sort_values(
-        by=['itemset_length', 'support'], ascending=[True, False]
-    )
-    fi.to_csv(sup_dir / 'frequent_itemsets.csv', index=False)
-
-    itemsets_by_len = fi['itemset_length'].value_counts().sort_index().to_dict()
-
-    with open(sup_dir / 'frequent_itemsets_summary.txt', 'w') as f:
-        f.write('Frequent Itemsets Summary (value level)\n')
-        f.write(f'{"=" * 60}\n\n')
-        f.write('Parent Macroscopic Rule:\n')
-        f.write(f'  [{m_ant}] => [{m_cons}]  (rule_index={m_idx})\n\n')
-        f.write(f'Parameters:\n  Min Support: {min_sup}\n\n')
-        f.write(f'Results:\n  Total: {n_fi}\n')
-        for length, count in itemsets_by_len.items():
-            f.write(f'  len={length}: {count}\n')
-        f.write(f'\nAll Frequent Itemsets:\n{"-" * 60}\n')
-        for _, row in fi.iterrows():
-            f.write(
-                f'  [{row["itemset_str"]}]  '
-                f'support={row["support"]:.4f}  '
-                f'length={row["itemset_length"]}\n'
-            )
-
-    local_summary_rows = []
-
+    Returns an empty DataFrame if the file is empty or has no data.
+    """
     try:
-        all_rules = association_rules(
-            frequent_itemsets,
-            metric='confidence',
-            min_threshold=float(confidence_grid[0]),
-        )
-    except ValueError:
-        return local_summary_rows
+        df = pd.read_csv(csv_path)
+    except pd.errors.EmptyDataError:
+        logger.warning("File %s is empty.", csv_path.name)
+        return pd.DataFrame()
 
-    if len(all_rules) == 0 or 'lift' not in all_rules.columns:
-        return local_summary_rows
+    if df.empty or "itemset" not in df.columns:
+        logger.warning("File %s has no usable itemset data.", csv_path.name)
+        return pd.DataFrame()
 
-    all_rules = all_rules[
-        (all_rules['lift'] < lift_window_lo) |
-        (all_rules['lift'] > lift_window_hi)
-    ]
+    df = df[["itemset"]].dropna().reset_index(drop=True)
+    df.index.name = "_txn_idx"
 
-    if len(all_rules) == 0:
-        return local_summary_rows
+    exploded = df["itemset"].str.split().explode().reset_index()
+    exploded.columns = ["_txn_idx", "token"]
+    exploded = exploded[exploded["token"].str.contains("=", na=False)].copy()
+    exploded["label"] = exploded["token"].str.split("=", n=1).str[0]
+    exploded = exploded.drop_duplicates(subset=["_txn_idx", "token"])
 
-    # Exclude rules whose antecedents and consequents share at least one label.
-    # E.g. ST=NJ → ST=MA is meaningless at the value level because both sides
-    # belong to the same feature (ST); a macroscopic rule would never pair a
-    # feature with itself, so such micro-rules have no interpretive value.
-    # The label of an item is the prefix before the first '=' character.
-    _ant_labels  = all_rules['antecedents'].apply(
-        lambda x: frozenset(i.split('=')[0] for i in x if '=' in i)
+    logger.info(
+        "Loaded %d tokens from %d transactions in %s.",
+        len(exploded),
+        exploded["_txn_idx"].nunique(),
+        csv_path.name,
     )
-    _cons_labels = all_rules['consequents'].apply(
-        lambda x: frozenset(i.split('=')[0] for i in x if '=' in i)
-    )
-    _cross_label_mask = [
-        a.isdisjoint(c) for a, c in zip(_ant_labels, _cons_labels)
-    ]
-    # Capture the count before same-label filtering so summary.txt can report
-    # the exact number excluded (avoids the fragile len(all_rules)+n_same_label
-    # reconstruction that breaks if all_rules were ever mutated between steps).
-    n_after_lift_window = len(all_rules)
-    n_same_label        = n_after_lift_window - sum(_cross_label_mask)
-    all_rules = all_rules[_cross_label_mask].reset_index(drop=True)
-
-    if len(all_rules) == 0:
-        return local_summary_rows
-
-    all_rules = all_rules.sort_values(
-        'lift', ascending=False
-    ).reset_index(drop=True)
-
-    if len(all_rules) == 0:
-        return local_summary_rows
-
-    for min_conf in confidence_grid:
-        conf_dir = sup_dir / f'conf_{min_conf:.2f}'
-
-        rules = all_rules[
-            all_rules['confidence'] >= min_conf
-        ].reset_index(drop=True)
-        if len(rules) == 0:
-            continue
-
-        conviction_vals = rules['conviction'].replace([np.inf, -np.inf], np.nan)
-
-        # ── Compact output (rules.csv) ────────────────────────────────
-        # Initialise with rules.index so scalar assignments broadcast to all
-        # rows instead of creating a single-row DataFrame that mis-aligns with
-        # the Series columns added afterwards (which would leave all macro_*
-        # columns NaN except the first row).
-        fmt = pd.DataFrame(index=rules.index)
-        fmt['macro_rule_index']  = m_idx
-        fmt['macro_antecedents'] = m_ant
-        fmt['macro_consequents'] = m_cons
-        fmt['antecedents']       = rules['antecedents'].apply(
-            lambda x: ', '.join(sorted(x))
-        )
-        fmt['consequents']       = rules['consequents'].apply(
-            lambda x: ', '.join(sorted(x))
-        )
-        fmt['support_raw']       = [f'{v:.4f}' for v in rules['support']]
-        fmt['support_pct']       = (rules['support']    * 100).round(2)
-        fmt['confidence_raw']    = [f'{v:.4f}' for v in rules['confidence']]
-        fmt['confidence_pct']    = (rules['confidence'] * 100).round(2)
-        fmt['lift']              = rules['lift'].round(4)
-        fmt['leverage']          = rules['leverage'].round(6)
-        fmt['conviction']        = conviction_vals.round(4)
-
-        # ── Detailed output (rules_detailed.csv) ─────────────────────
-        det = pd.DataFrame(index=rules.index)
-        det['macro_rule_index']       = m_idx
-        det['macro_antecedents']      = m_ant
-        det['macro_consequents']      = m_cons
-        det['antecedents']            = fmt['antecedents']
-        det['consequents']            = fmt['consequents']
-        det['antecedent_length']      = rules['antecedents'].apply(len)
-        det['consequent_length']      = rules['consequents'].apply(len)
-        det['rule_length']            = (
-            det['antecedent_length'] + det['consequent_length']
-        )
-        det['antecedent_support_raw'] = [
-            f'{v:.4f}' for v in rules['antecedent support']
-        ]
-        det['antecedent_support_pct'] = (
-            rules['antecedent support'] * 100
-        ).round(2)
-        det['consequent_support_raw'] = [
-            f'{v:.4f}' for v in rules['consequent support']
-        ]
-        det['consequent_support_pct'] = (
-            rules['consequent support'] * 100
-        ).round(2)
-        det['support_raw']            = fmt['support_raw']
-        det['support_pct']            = fmt['support_pct']
-        det['confidence_raw']         = fmt['confidence_raw']
-        det['confidence_pct']         = fmt['confidence_pct']
-        det['lift']                   = fmt['lift']
-        det['leverage']               = fmt['leverage']
-        det['conviction']             = fmt['conviction']
-        # Back-mapping: value-level item → originating ACS label
-        det['antecedent_labels']      = rules['antecedents'].apply(
-            lambda x: ', '.join(
-                sorted({i.split('=')[0] for i in x if '=' in i})
-            )
-        )
-        det['consequent_labels']      = rules['consequents'].apply(
-            lambda x: ', '.join(
-                sorted({i.split('=')[0] for i in x if '=' in i})
-            )
-        )
-
-        conf_dir.mkdir(parents=True, exist_ok=True)
-        fmt.to_csv(conf_dir / 'rules.csv',          index=False)
-        det.to_csv(conf_dir / 'rules_detailed.csv', index=False)
-
-        with open(conf_dir / 'summary.txt', 'w') as f:
-            f.write('Association Rules Summary (value level)\n')
-            f.write(f'{"=" * 60}\n\n')
-            f.write('Parent Macroscopic Rule:\n')
-            f.write(f'  Rule Index  : {m_idx}\n')
-            f.write(f'  Antecedents : {m_ant}\n')
-            f.write(f'  Consequents : {m_cons}\n\n')
-            f.write('Parameters:\n')
-            f.write(f'  Min Support    : {min_sup}\n')
-            f.write(f'  Min Confidence : {min_conf}\n')
-            f.write(
-                f'  Neutral Lift Window (excluded): '
-                f'[{lift_window_lo}, {lift_window_hi}]\n'
-            )
-            f.write(
-                f'  Same-label rules excluded    : yes '
-                f'(antecedents ∩ consequents labels must be empty)\n\n'
-            )
-            f.write('Results:\n')
-            f.write(f'  Frequent Itemsets              : {n_fi}\n')
-            f.write(f'  After lift-window filter       : {n_after_lift_window}\n')
-            f.write(f'  Same-label rules excluded      : {n_same_label}\n')
-            f.write(f'  After same-label filter        : {len(all_rules)}\n')
-            f.write(f'  After confidence filter (final): {len(rules)}\n\n')
-            f.write('Statistics:\n')
-            f.write(
-                f'  Avg Support    : {rules["support"].mean() * 100:.2f}%\n'
-            )
-            f.write(
-                f'  Avg Confidence : {rules["confidence"].mean() * 100:.2f}%\n'
-            )
-            f.write(f'  Avg Lift       : {rules["lift"].mean():.4f}\n')
-            f.write(
-                f'  Lift Range     : {rules["lift"].min():.4f} — '
-                f'{rules["lift"].max():.4f}\n'
-            )
-            f.write(
-                f'  Avg Leverage   : {rules["leverage"].mean():.6f}\n'
-            )
-            f.write(
-                f'  Avg Rule Length: {det["rule_length"].mean():.2f}\n\n'
-            )
-            n_inf = conviction_vals.isna().sum()
-            if n_inf > 0:
-                f.write(
-                    f'  Note: {n_inf} rule(s) have confidence=1.0 '
-                    f'(conviction=inf → saved as NaN)\n\n'
-                )
-            f.write(f'Top 10 Rules by Lift:\n{"-" * 60}\n')
-            for idx2, row2 in fmt.head(10).iterrows():
-                f.write(
-                    f'{idx2 + 1}. {row2["antecedents"]} => {row2["consequents"]}\n'
-                    f'   support={row2["support_pct"]:.2f}% | '
-                    f'confidence={row2["confidence_pct"]:.2f}% | '
-                    f'lift={row2["lift"]:.4f} | '
-                    f'leverage={row2["leverage"]:.6f}\n\n'
-                )
-
-        print(f'        > [conf={min_conf:.2f}] {len(rules)} rules → {conf_dir.name}/')
-
-        for min_lift in lift_grid_used:
-            filtered = rules[rules['lift'] >= min_lift]
-            n  = len(filtered)
-            rl = (
-                filtered['antecedents'].apply(len) +
-                filtered['consequents'].apply(len)
-            ) if n > 0 else pd.Series(dtype=float)
-
-            local_summary_rows.append({
-                'macro_rule_index':      m_idx,
-                'macro_antecedents':     m_ant,
-                'macro_consequents':     m_cons,
-                'Support':               min_sup,
-                'Confidence':            min_conf,
-                'Lift_threshold':        min_lift,
-                'Number_of_Rules':       n,
-                'Max_Lift':   round(filtered['lift'].max(), 4)      if n > 0 else 0.0,
-                'Min_Lift':   round(filtered['lift'].min(), 4)      if n > 0 else 0.0,
-                'Avg_Lift':   round(filtered['lift'].mean(), 4)     if n > 0 else 0.0,
-                'Avg_Confidence': round(filtered['confidence'].mean(), 4) if n > 0 else 0.0,
-                'Avg_Support':    round(filtered['support'].mean(), 4)    if n > 0 else 0.0,
-                'Avg_Rule_Length':  round(rl.mean(), 4) if n > 0 else 0.0,
-                'Max_Rule_Length':  int(rl.max())        if n > 0 else 0,
-                'Num_Frequent_Itemsets':      n_fi,
-                'Num_Same_Label_Excluded':    n_same_label,
-                'Num_FI_length_1':            itemsets_by_len.get(1, 0),
-                'Num_FI_length_2':            itemsets_by_len.get(2, 0),
-                'Num_FI_length_3plus':        sum(
-                    v for k2, v in itemsets_by_len.items() if k2 >= 3
-                ),
-            })
-
-    return local_summary_rows
+    return exploded
 
 
-# ---------------------------------------------------------------------------
-# Middle worker — one macroscopic rule
-# ---------------------------------------------------------------------------
-
-def _process_one_rule(
-    macro_rule: dict,
-    tv_path: Path,
-    k_dir: Path,
-    auto_calibrate: bool,
-    sup_min: float, sup_max: float, sup_delta: float,
-    conf_min: float, conf_max: float, conf_delta: float,
-    lift_min: float, lift_max: float, lift_delta: float,
-    lift_neutral_half_window: float,
-    inner_n_jobs: int = 1,
-) -> dict:
+def _filter_transactions_for_rule(
+    exploded: pd.DataFrame,
+    label_set: frozenset[str],
+) -> list[list[str]]:
     """
-    End-to-end microscopic ARM for one macroscopic rule.
-
-    Called as a joblib.Parallel worker at the rule level.
-
-    Steps
-    -----
-    A. Create rule_dir, write macro_rule_origin files.
-    B. Select rows from transactions_values.csv that contain ≥1 item whose
-       label prefix is in active_labels.  All items in kept rows are
-       retained for mining (not just the active-label items).
-    C. Persist aggregated and pair-level CSVs.
-    D. One-hot-encode the aggregated transactions.
-    E. Calibrate grid parameters (auto) or use manual bounds.
-    F. Run full support × confidence × lift grid search via _explore_rule().
-
-    Returns
-    -------
-    dict
-        Row for rule_index.csv.
-    """
-    rule_dir = k_dir / macro_rule['rule_slug']
-    rule_dir.mkdir(parents=True, exist_ok=True)
-
-    m_idx  = macro_rule['rule_index']
-    m_ant  = macro_rule['antecedents']
-    m_cons = macro_rule['consequents']
-
-    _base = {
-        'rule_index':        m_idx,
-        'rule_slug':         macro_rule['rule_slug'],
-        'antecedents':       m_ant,
-        'consequents':       m_cons,
-        'active_labels':     str(sorted(macro_rule['active_labels'])),
-        'macro_support_pct': macro_rule.get('macro_support_pct', ''),
-        'macro_conf_pct':    macro_rule.get('macro_conf_pct', ''),
-        'macro_lift':        macro_rule.get('macro_lift', ''),
-        'n_source_files':    len(macro_rule.get('source_paths', [])),
-    }
-
-    print(f'\n  Rule {m_idx}: [{m_ant}] => [{m_cons}]')
-
-    # A — provenance artefacts
-    _write_macro_rule_origin(rule_dir, macro_rule)
-
-    # B — filter transactions
-    try:
-        agg_df, pair_df = build_value_transactions(
-            tv_path, macro_rule['active_labels']
-        )
-    except Exception as exc:
-        print(f'    ERROR: {exc!r}')
-        return {
-            **_base,
-            'skipped_reason': f'transaction_error: {exc!r}',
-            'n_transactions': 0, 'n_items': 0,
-            'sup_min_used': None, 'conf_min_used': None, 'lift_max_used': None,
-            'summary_rows': 0, 'combos_with_rules': 0,
-            'max_rules_any_combo': 0, 'max_lift_observed': 0.0,
-        }
-
-    # C — persist transaction CSVs
-    agg_df.to_csv(rule_dir / 'aggregated_values_by_sample.csv', index=False)
-    pair_df.to_csv(rule_dir / 'values_only_unique.csv',          index=False)
-
-    if agg_df.empty:
-        print('    No transactions after filtering — skipping.')
-        return {
-            **_base,
-            'skipped_reason': 'empty_after_filter',
-            'n_transactions': 0, 'n_items': 0,
-            'sup_min_used': None, 'conf_min_used': None, 'lift_max_used': None,
-            'summary_rows': 0, 'combos_with_rules': 0,
-            'max_rules_any_combo': 0, 'max_lift_observed': 0.0,
-        }
-
-    # D — encode
-    df_encoded    = encode_transactions(agg_df['Values'])
-    item_supports = df_encoded.mean().sort_values()
-
-    # E — calibrate
-    if auto_calibrate:
-        params = calibrate_parameters(
-            encoded_df=df_encoded,
-            sup_delta=sup_delta, lift_delta=lift_delta,
-            conf_delta=conf_delta, conf_min_floor=conf_min, conf_max=conf_max,
-        )
-        _write_calibration_log(
-            rule_dir=rule_dir, macro_rule=macro_rule,
-            n_transactions=len(df_encoded),
-            item_supports=item_supports,
-            params=params, auto_calibrate=True,
-        )
-        if params is None:
-            print('    Skipping — too sparse for 2-itemsets.')
-            return {
-                **_base,
-                'skipped_reason': 'too_sparse',
-                'n_transactions': len(df_encoded),
-                'n_items': df_encoded.shape[1],
-                'sup_min_used': None, 'conf_min_used': None,
-                'lift_max_used': None,
-                'summary_rows': 0, 'combos_with_rules': 0,
-                'max_rules_any_combo': 0, 'max_lift_observed': 0.0,
-            }
-        r_sup_min  = params['sup_min']
-        r_sup_max  = params['sup_max']
-        r_lift_max = params['lift_max']
-        r_conf_min = params['conf_min']
-        r_lift_min = params['lift_min']   # always 0.0
-
-    else:
-        r_sup_min  = sup_min
-        r_sup_max  = sup_max
-        r_lift_max = lift_max
-        r_conf_min = conf_min
-        r_lift_min = lift_min
-        _write_calibration_log(
-            rule_dir=rule_dir, macro_rule=macro_rule,
-            n_transactions=len(df_encoded),
-            item_supports=item_supports,
-            params=None, auto_calibrate=False,
-            manual_params={
-                'sup_min':  r_sup_min,  'sup_max':  r_sup_max,
-                'conf_min': r_conf_min, 'lift_max': r_lift_max,
-            },
-        )
-
-    # F — grid search
-    summary_df = _explore_rule(
-        df=df_encoded, rule_dir=rule_dir, macro_rule=macro_rule,
-        sup_min=r_sup_min,   sup_max=r_sup_max,   sup_delta=sup_delta,
-        conf_min=r_conf_min, conf_max=conf_max,   conf_delta=conf_delta,
-        lift_min=r_lift_min, lift_max=r_lift_max, lift_delta=lift_delta,
-        lift_neutral_half_window=lift_neutral_half_window,
-        inner_n_jobs=inner_n_jobs,
-    )
-
-    has_col           = not summary_df.empty and 'Number_of_Rules' in summary_df.columns
-    max_rules         = int(summary_df['Number_of_Rules'].max()) if has_col else 0
-    max_lift          = round(summary_df['Max_Lift'].max(), 4)   if has_col else 0.0
-    combos_with_rules = int((summary_df['Number_of_Rules'] > 0).sum()) if has_col else 0
-
-    return {
-        **_base,
-        'skipped_reason':      '',
-        'n_transactions':      len(df_encoded),
-        'n_items':             df_encoded.shape[1],
-        'sup_min_used':        r_sup_min,
-        'conf_min_used':       r_conf_min,
-        'lift_max_used':       r_lift_max,
-        'summary_rows':        len(summary_df),
-        'combos_with_rules':   combos_with_rules,
-        'max_rules_any_combo': max_rules,
-        'max_lift_observed':   max_lift,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Grid exploration for one rule
-# ---------------------------------------------------------------------------
-
-def _explore_rule(
-    df,
-    rule_dir: Path,
-    macro_rule: dict,
-    sup_min, sup_max, sup_delta,
-    conf_min, conf_max, conf_delta,
-    lift_min, lift_max, lift_delta,
-    lift_neutral_half_window: float = 0.25,
-    inner_n_jobs: int | None        = None,
-) -> pd.DataFrame:
-    """
-    Run the full support × confidence × lift grid for one rule_dir.
-
-    Parallelises over support thresholds (inner / Level-3 workers).
-
-    Returns a summary DataFrame sorted by (Number_of_Rules DESC,
-    Max_Lift DESC), or an empty DataFrame if nothing was found.
-    """
-    rule_dir = Path(rule_dir)
-
-    support_grid    = np.round(
-        np.arange(sup_min, sup_max + sup_delta / 2, sup_delta), 4
-    )
-    confidence_grid = np.round(
-        np.arange(conf_min, conf_max + conf_delta / 2, conf_delta), 4
-    )
-    lift_grid       = np.round(
-        np.arange(lift_min, lift_max + lift_delta / 2, lift_delta), 4
-    )
-
-    lift_window_lo, lift_window_hi = _neutral_window(lift_neutral_half_window)
-    lift_grid_used = [
-        v for v in lift_grid
-        if not (lift_window_lo <= v <= lift_window_hi)
-    ]
-    total_combos = (
-        len(support_grid) * len(confidence_grid) * len(lift_grid_used)
-    )
-
-    m_ant = macro_rule['antecedents']
-    m_cons = macro_rule['consequents']
-    m_idx  = macro_rule['rule_index']
-
-    print(f'\n    {"=" * 56}')
-    print(
-        f'    Grid for rule {m_idx}: [{m_ant}] => [{m_cons}]'
-    )
-    print(
-        f'    sup: {len(support_grid)} values | '
-        f'conf: {len(confidence_grid)} values | '
-        f'lift: {len(lift_grid_used)} values | '
-        f'total: {total_combos:,}'
-    )
-
-    perf_cores = _get_perf_cores()
-    if inner_n_jobs is None:
-        inner_n_jobs = min(perf_cores, len(support_grid))
-    n_jobs = min(inner_n_jobs, len(support_grid))
-    print(f'    inner n_jobs (support): {n_jobs}')
-
-    parallel_results = Parallel(
-        n_jobs=n_jobs, backend='loky', verbose=0, pre_dispatch=n_jobs,
-    )(
-        delayed(_process_one_support)(
-            min_sup         = min_sup,
-            sup_idx         = sup_idx,
-            n_sup           = len(support_grid),
-            df              = df,
-            output_dir      = rule_dir,
-            confidence_grid = confidence_grid,
-            lift_grid_used  = lift_grid_used,
-            lift_window_lo  = lift_window_lo,
-            lift_window_hi  = lift_window_hi,
-            macro_rule      = macro_rule,
-        )
-        for sup_idx, min_sup in enumerate(support_grid, start=1)
-    )
-
-    summary_rows = [
-        row for worker_rows in parallel_results for row in worker_rows
-    ]
-    summary_df = pd.DataFrame(summary_rows)
-    if not summary_df.empty:
-        summary_df = summary_df.sort_values(
-            by=['Number_of_Rules', 'Max_Lift'], ascending=[False, False]
-        ).reset_index(drop=True)
-
-    summary_df.to_csv(rule_dir / 'summary.csv', index=False)
-    combos_with_rules = (
-        int((summary_df['Number_of_Rules'] > 0).sum())
-        if not summary_df.empty else 0
-    )
-
-    with open(rule_dir / 'exploration_summary.txt', 'w') as f:
-        f.write('FULL EXPLORATION SUMMARY (value level)\n')
-        f.write(f'{"=" * 70}\n\n')
-        f.write(
-            f'Generated: '
-            f'{datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}\n\n'
-        )
-        f.write('Parent Macroscopic Rule:\n')
-        f.write(f'  Rule Index  : {m_idx}\n')
-        f.write(f'  Antecedents : {m_ant}\n')
-        f.write(f'  Consequents : {m_cons}\n\n')
-        f.write('Parameter Grids:\n')
-        f.write(
-            f'  Support    : {len(support_grid)} values '
-            f'[{support_grid[0]} … {support_grid[-1]}, step={sup_delta}]\n'
-        )
-        f.write(
-            f'  Confidence : {len(confidence_grid)} values '
-            f'[{confidence_grid[0]} … {confidence_grid[-1]}, step={conf_delta}]\n'
-        )
-        f.write(
-            f'  Lift       : {len(lift_grid_used)} values '
-            f'(neutral window [{lift_window_lo}, {lift_window_hi}] excluded, '
-            f'step={lift_delta})\n\n'
-        )
-        # Aggregate same-label exclusions across all support thresholds.
-        # n_same_label is constant within each support level (computed before
-        # the confidence loop), so we take the first value per support threshold.
-        _total_sl_excl = 0
-        if (
-            not summary_df.empty
-            and 'Num_Same_Label_Excluded' in summary_df.columns
-            and 'Support' in summary_df.columns
-        ):
-            _total_sl_excl = int(
-                summary_df.groupby('Support')['Num_Same_Label_Excluded']
-                .first().sum()
-            )
-        f.write('Active Filters:\n')
-        f.write(f'  Neutral lift window : [{lift_window_lo}, {lift_window_hi}] excluded\n')
-        f.write(
-            f'  Same-label rules    : {_total_sl_excl} excluded across all support thresholds '
-            f'(antecedents \u2229 consequents label set must be empty)\n\n'
-        )
-        f.write('Results:\n')
-        f.write(f'  Total combinations : {total_combos:,}\n')
-        f.write(f'  With >= 1 rule     : {combos_with_rules:,}\n\n')
-        if not summary_df.empty and combos_with_rules > 0:
-            best = summary_df.iloc[0]
-            f.write('Best combination (most rules, then highest lift):\n')
-            f.write(f'{"-" * 60}\n')
-            f.write(f'  Support         : {best["Support"]}\n')
-            f.write(f'  Confidence      : {best["Confidence"]}\n')
-            f.write(f'  Lift threshold  : {best["Lift_threshold"]}\n')
-            f.write(f'  Number of Rules : {int(best["Number_of_Rules"])}\n')
-            f.write(f'  Max Lift        : {best["Max_Lift"]}\n')
-
-    print('    > Cleaning empty folders...')
-    rc, rs = cleanup_empty_folders(rule_dir)
-    print(f'    > Removed {rc} conf dir(s) and {rs} sup dir(s)')
-
-    with open(rule_dir / 'exploration_summary.txt', 'a') as f:
-        f.write('\nParallelism:\n')
-        f.write(f'  n_jobs (support-level): {n_jobs}\n\n')
-        f.write('Folder cleanup:\n')
-        f.write(f'  conf dirs removed: {rc}\n')
-        f.write(f'  sup dirs removed : {rs}\n')
-
-    plot_heatmaps(
-        summary_df, rule_dir,
-        macro_rule=macro_rule,
-        lift_neutral_half_window=lift_neutral_half_window,
-        lift_delta=lift_delta,
-    )
-
-    return summary_df
-
-
-# ---------------------------------------------------------------------------
-# Outer worker — one k value
-# ---------------------------------------------------------------------------
-
-def _process_one_k(
-    k: int,
-    results_dir: Path,
-    region: str,
-    output_dir: Path,
-    auto_calibrate: bool,
-    sup_min: float, sup_max: float, sup_delta: float,
-    conf_min: float, conf_max: float, conf_delta: float,
-    lift_min: float, lift_max: float, lift_delta: float,
-    lift_neutral_half_window: float,
-    outer_jobs: int = 1,
-) -> tuple[int, list[dict]]:
-    """
-    Run microscopic ARM for every unique macroscopic rule found for (region, k).
-
-    Level-1 worker (k-level).  Dispatches Level-2 (_process_one_rule) and
-    propagates the three-level parallelism budget downward.
-
-    Returns
-    -------
-    tuple[int, list[dict]]
-        (k, rule_index_rows) where rule_index_rows is the list of per-rule
-        outcome dicts written to rule_index.csv.
-    """
-    k_dir = output_dir / f'k_{k}'
-    k_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f'\n{"=" * 70}')
-    print(f'  k = {k}  |  region = {region}')
-    print(f'{"=" * 70}')
-
-    macro_rules = collect_unique_macro_rules(results_dir, region, k)
-    if not macro_rules:
-        print(
-            f'  > No macroscopic rules found for k={k}.  '
-            f'Run Step 3 first.'
-        )
-        return k, []
-
-    print(f'  > {len(macro_rules)} unique macro rules found for k={k}')
-
-    tv_path = (
-        results_dir / region / 'important_features'
-        / f'k_{k}' / 'transactions_values.csv'
-    )
-    if not tv_path.exists():
-        print(f'  > transactions_values.csv not found: {tv_path}')
-        skipped = [
-            {
-                'rule_index': r['rule_index'],
-                'rule_slug':  r['rule_slug'],
-                'antecedents': r['antecedents'],
-                'consequents': r['consequents'],
-                'active_labels': str(sorted(r['active_labels'])),
-                'macro_support_pct': r.get('macro_support_pct', ''),
-                'macro_conf_pct':    r.get('macro_conf_pct', ''),
-                'macro_lift':        r.get('macro_lift', ''),
-                'n_source_files': len(r.get('source_paths', [])),
-                'skipped_reason': 'no_transactions_values',
-                'n_transactions': None, 'n_items': None,
-                'sup_min_used': None, 'conf_min_used': None,
-                'lift_max_used': None,
-                'summary_rows': 0, 'combos_with_rules': 0,
-                'max_rules_any_combo': 0, 'max_lift_observed': 0.0,
-            }
-            for r in macro_rules
-        ]
-        pd.DataFrame(skipped).to_csv(k_dir / 'rule_index.csv', index=False)
-        return k, skipped
-
-    # Three-level parallelism budget
-    # ────────────────────────────────
-    # outer_jobs  (k-level)    : passed in from run_k_comparison_values
-    # rule_jobs   (rule-level) : max(1, perf_cores // outer_jobs),
-    #                            capped at number of rules
-    # inner_jobs  (sup-level)  : max(1, perf_cores // (outer × rule))
-    #
-    # Guarantee: outer × rule × inner ≤ perf_cores
-    #
-    # Example: M1 Ultra, 16 P-cores, 2 k-values, 8 macro rules
-    #   outer_jobs = 2
-    #   rule_jobs  = min(8, max(1, 16//2)) = min(8, 8) = 8
-    #   inner_jobs = max(1, 16//(2×8)) = max(1, 1) = 1
-    #   total = 2 × 8 × 1 = 16 — perfectly saturates all P-cores
-    perf_cores = _get_perf_cores()
-    rule_jobs  = min(len(macro_rules), max(1, perf_cores // outer_jobs))
-    inner_jobs = max(1, perf_cores // (outer_jobs * rule_jobs))
-
-    print(
-        f'  > rule_jobs={rule_jobs}, inner_jobs={inner_jobs} '
-        f'(outer={outer_jobs} × rule={rule_jobs} × inner={inner_jobs} '
-        f'= {outer_jobs * rule_jobs * inner_jobs} ≤ {perf_cores} P-cores)'
-    )
-
-    # Dispatch rules in parallel (middle level)
-    rule_results: list[dict] = Parallel(
-        n_jobs=rule_jobs, backend='loky', verbose=0,
-    )(
-        delayed(_process_one_rule)(
-            macro_rule               = rule,
-            tv_path                  = tv_path,
-            k_dir                    = k_dir,
-            auto_calibrate           = auto_calibrate,
-            sup_min=sup_min,   sup_max=sup_max,   sup_delta=sup_delta,
-            conf_min=conf_min, conf_max=conf_max, conf_delta=conf_delta,
-            lift_min=lift_min, lift_max=lift_max, lift_delta=lift_delta,
-            lift_neutral_half_window = lift_neutral_half_window,
-            inner_n_jobs             = inner_jobs,
-        )
-        for rule in macro_rules
-    )
-
-    pd.DataFrame(rule_results).to_csv(k_dir / 'rule_index.csv', index=False)
-    print(f'\n  > rule_index.csv saved ({len(rule_results)} rows)')
-
-    return k, rule_results
-
-
-# ---------------------------------------------------------------------------
-# K-comparison
-# ---------------------------------------------------------------------------
-
-def run_k_comparison_values(
-    k_values: list[int],
-    results_dir: Path,
-    region: str,
-    output_dir: Path,
-    auto_calibrate: bool    = True,
-    sup_min: float          = 0.02,
-    sup_max: float          = 0.50,
-    sup_delta: float        = 0.02,
-    conf_min: float         = 0.05,
-    conf_max: float         = 1.00,
-    conf_delta: float       = 0.05,
-    lift_min: float         = 0.0,
-    lift_max: float         = 5.0,
-    lift_delta: float       = 0.05,
-    lift_neutral_half_window: float = 0.25,
-) -> None:
-    """
-    Run per-rule microscopic ARM for every k in *k_values* and produce a
-    cross-k comparison report.
-
-    Three-level parallelism
-    -----------------------
-    Level 1 (outer)  : k values.
-                       outer_jobs = min(n_k, perf_cores)
-    Level 2 (middle) : macroscopic rules within each k-worker.
-                       rule_jobs = min(n_rules, max(1, perf_cores//outer))
-    Level 3 (inner)  : support thresholds within each rule-worker.
-                       inner_jobs = max(1, perf_cores//(outer×rule))
-    Guarantee: outer × rule × inner ≤ perf_cores.
-    """
-    comp_dir = output_dir / 'k_comparison'
-    comp_dir.mkdir(parents=True, exist_ok=True)
-
-    k_sorted   = sorted(k_values)
-    perf_cores = _get_perf_cores()
-    outer_jobs = min(len(k_sorted), perf_cores)
-
-    print(f'\n{"=" * 70}')
-    print(f'K-VARIATION EXPERIMENT (VALUE LEVEL, PER-RULE) — region: {region}')
-    print(f'{"=" * 70}')
-    print(f'  > k values      : {k_sorted}')
-    print(f'  > outer n_jobs  : {outer_jobs}  (k-level)')
-    print(f'  > auto_calibrate: {auto_calibrate}')
-    print('-' * 50)
-
-    raw_results = Parallel(
-        n_jobs=outer_jobs, backend='loky', verbose=0,
-    )(
-        delayed(_process_one_k)(
-            k                        = k,
-            results_dir              = results_dir,
-            region                   = region,
-            output_dir               = output_dir,
-            auto_calibrate           = auto_calibrate,
-            sup_min=sup_min,   sup_max=sup_max,   sup_delta=sup_delta,
-            conf_min=conf_min, conf_max=conf_max, conf_delta=conf_delta,
-            lift_min=lift_min, lift_max=lift_max, lift_delta=lift_delta,
-            lift_neutral_half_window = lift_neutral_half_window,
-            outer_jobs               = outer_jobs,
-        )
-        for k in k_sorted
-    )
-
-    # Collect all rule_index rows across k values
-    all_rows: list[dict] = []
-    for k, rule_rows in raw_results:
-        for row in rule_rows:
-            row_with_k       = dict(row)
-            row_with_k['k']  = k
-            all_rows.append(row_with_k)
-
-    comp_df = pd.DataFrame(all_rows)
-    comp_df.to_csv(comp_dir / 'k_comparison_summary.csv', index=False)
-
-    print(f'\n{"=" * 70}')
-    print('  > Building cross-k comparison report...')
-
-    with open(comp_dir / 'k_comparison_summary.txt', 'w') as f:
-        f.write(
-            'K-VARIATION EXPERIMENT SUMMARY '
-            '(value level, per macroscopic rule)\n'
-        )
-        f.write(f'{"=" * 70}\n\n')
-        f.write(
-            f'Generated      : '
-            f'{datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}\n'
-        )
-        f.write(f'Region         : {region}\n')
-        f.write(f'k values tested: {k_sorted}\n')
-        f.write(f'auto_calibrate : {auto_calibrate}\n\n')
-
-        if comp_df.empty:
-            f.write('No results produced.\n')
-        else:
-            skipped_mask = (
-                comp_df['skipped_reason'] != ''
-                if 'skipped_reason' in comp_df.columns
-                else pd.Series([False] * len(comp_df))
-            )
-            skipped = comp_df[skipped_mask]
-            ran     = comp_df[~skipped_mask]
-
-            if not skipped.empty:
-                f.write(
-                    f'Skipped ({len(skipped)} rule-k pairs):\n'
-                    f'{"-" * 40}\n'
-                )
-                for _, row in skipped.iterrows():
-                    f.write(
-                        f'  k={row["k"]}  '
-                        f'[{row["antecedents"]}]=>[{row["consequents"]}]: '
-                        f'{row["skipped_reason"]}\n'
-                    )
-                f.write('\n')
-
-            if not ran.empty:
-                summary_cols = [
-                    'k', 'rule_index', 'antecedents', 'consequents',
-                    'n_transactions', 'n_items',
-                    'max_rules_any_combo', 'max_lift_observed',
-                ]
-                summary_cols = [c for c in summary_cols if c in ran.columns]
-                f.write(f'Results ({len(ran)} rule-k pairs):\n{"-" * 60}\n')
-                f.write(ran[summary_cols].to_string(index=False))
-                f.write('\n\n')
-
-                if 'max_rules_any_combo' in ran.columns:
-                    nz = ran[ran['max_rules_any_combo'] > 0]
-                    if not nz.empty:
-                        best = nz.loc[nz['max_rules_any_combo'].idxmax()]
-                        f.write(
-                            f'Best result: k={best["k"]}  '
-                            f'[{best["antecedents"]}]=>[{best["consequents"]}]  '
-                            f'{int(best["max_rules_any_combo"])} rules '
-                            f'at best combination\n'
-                        )
-
-    # Cross-k heatmaps (k vs Support/Confidence/Lift, pooled over all rules)
-    all_summaries = []
-    for k in k_sorted:
-        k_dir = output_dir / f'k_{k}'
-        if not k_dir.exists():
-            continue
-        for rule_dir in sorted(k_dir.glob('rule_*')):
-            summary_csv = rule_dir / 'summary.csv'
-            if not summary_csv.exists():
-                continue
-            try:
-                sdf    = pd.read_csv(summary_csv)
-                sdf['k'] = k
-                all_summaries.append(sdf)
-            except Exception:
-                pass
-
-    if not all_summaries:
-        print('  > No rule summaries found — skipping cross-k heatmaps.')
-        print(f'  > k_comparison saved to {comp_dir}/')
-        return
-
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore', category=FutureWarning)
-        combined = pd.concat(all_summaries, ignore_index=True)
-
-    if combined.empty or 'Lift_threshold' not in combined.columns:
-        print(f'  > k_comparison saved to {comp_dir}/')
-        return
-
-    combined['Lift_display'] = (
-        (combined['Lift_threshold'] / 0.1).round() * 0.1
-    ).round(4)
-    neutral_lo, neutral_hi   = _neutral_window(lift_neutral_half_window)
-
-    for x_col, suffix in [
-        ('Support',      'k_support'),
-        ('Confidence',   'k_confidence'),
-        ('Lift_display', 'k_lift'),
-    ]:
-        is_lift = 'lift' in suffix
-        x_label = 'Lift' if is_lift else x_col
-
-        pivot = (
-            combined.groupby(['k', x_col])['Number_of_Rules']
-            .max()
-            .unstack(level=x_col)
-            .sort_index(ascending=False)
-            .fillna(0)
-            .astype(int)
-        )
-
-        if is_lift:
-            pivot = pivot.loc[
-                :,
-                ~pivot.columns.to_series().between(
-                    neutral_lo, neutral_hi, inclusive='both'
-                ),
-            ]
-            nz_mask = (pivot != 0).any(axis=0).values
-            if nz_mask.any():
-                last_nz = int(np.where(nz_mask)[0].max())
-                pivot   = pivot.iloc[:, :last_nz + 1]
-
-        n_cols = len(pivot.columns)
-        n_rows = len(pivot.index)
-        fig, ax = plt.subplots(
-            figsize=(max(10, n_cols * 0.75), max(4, n_rows * 0.6))
-        )
-
-        img = ax.imshow(
-            pivot.values, aspect='auto', cmap='YlOrBr', interpolation='nearest'
-        )
-        ax.set_xticks(range(n_cols))
-        ax.set_xticklabels(
-            [f'{v:.2f}' if isinstance(v, float) else str(v)
-             for v in pivot.columns],
-            rotation=40, ha='right', fontsize=8,
-        )
-        ax.set_yticks(range(n_rows))
-        ax.set_yticklabels([f'k={v}' for v in pivot.index], fontsize=9)
-        ax.set_xlabel(x_label, fontsize=11, labelpad=8)
-        ax.set_ylabel('k',     fontsize=11, labelpad=8)
-        ax.set_title(
-            f'Max Micro-Rules (pooled over all macro rules) — k vs {x_label}\n'
-            f'(darker = more rules; max over the other two parameters)',
-            fontsize=11, pad=14,
-        )
-
-        max_val = pivot.values.max() if pivot.values.max() > 0 else 1
-        for ri in range(n_rows):
-            for ci in range(n_cols):
-                val = pivot.values[ri, ci]
-                if val > 0:
-                    txt_color = 'white' if (val / max_val) > 0.55 else 'black'
-                    ax.text(
-                        ci, ri, str(val),
-                        ha='center', va='center', fontsize=7, color=txt_color,
-                    )
-
-        cbar = plt.colorbar(img, ax=ax, fraction=0.025, pad=0.02)
-        cbar.set_label('Number of Rules', fontsize=9)
-        plt.tight_layout()
-        fig.savefig(
-            comp_dir / f'heatmap_{suffix}.png', dpi=150, bbox_inches='tight'
-        )
-        plt.close(fig)
-        print(f'    > saved k_comparison/heatmap_{suffix}.png')
-
-    print(f'  > k_comparison saved to {comp_dir}/')
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
-def main(
-    regions: list[str]              = None,
-    k_values: list[int]             = None,
-    auto_calibrate: bool            = True,
-    sup_min: float                  = 0.02,
-    sup_max: float                  = 0.50,
-    sup_delta: float                = 0.02,
-    conf_min: float                 = 0.05,
-    conf_max: float                 = 1.00,
-    conf_delta: float               = 0.05,
-    lift_min: float                 = 0.0,
-    lift_max: float                 = 5.0,
-    lift_delta: float               = 0.05,
-    lift_neutral_half_window: float = 0.25,
-    base_dir: Path                  = None,
-) -> None:
-    """
-    Entry point for per-rule value-level association-rule mining.
-
-    Mirrors macroscopic_experiment_association_rules.main() so that main.py
-    can invoke both steps with an identical parameter set.
+    From the exploded token DataFrame, select all transactions (rows) that
+    contain at least one token whose label is in *label_set*.
+
+    Returns microscopic transactions: each transaction is a sorted list of
+    unique "LABEL=value" tokens from the matching rows.
 
     Parameters
     ----------
-    regions : list[str] or None
-        Regions to process.  Defaults to ['northeast', 'south'].
-    k_values : list[int] or None
-        CF neighbourhood sizes.  Defaults to [1, 3, 5, 7].
-    auto_calibrate : bool
-        Derive grid bounds from item frequencies (True) or use manual values.
-    sup_min … lift_neutral_half_window : float
-        Grid parameters.  In auto mode used as floor / ceiling constraints.
-    base_dir : Path or None
-        Project root.  Auto-detected for Kaggle, Colab, and local envs.
+    exploded   : Output of load_micro_itemsets().
+    label_set  : Frozenset of feature labels from the macroscopic rule's
+                 antecedent ∪ consequent.
     """
-    print(
-        f'  > Parallel backend — {_CPU_CORES} logical cores / '
-        f'{_get_perf_cores()} perf cores (loky, 3-level)\n'
+    if exploded.empty or not label_set:
+        return []
+
+    # Vectorised mask: keep rows where label is in the label_set.
+    mask = exploded["label"].isin(label_set)
+    matching_txn_ids = exploded.loc[mask, "_txn_idx"].unique()
+
+    if len(matching_txn_ids) == 0:
+        return []
+
+    # Keep ALL tokens of the matching transactions (not just the matched ones),
+    # so the full microscopic context of each instance is preserved.
+    subset = exploded[exploded["_txn_idx"].isin(matching_txn_ids)]
+
+    grouped = (
+        subset.groupby("_txn_idx", sort=True)["token"]
+        .apply(lambda s: sorted(s.unique().tolist()))
+    )
+    return grouped.tolist()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CSV formatting
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _format_micro_rules_for_csv(
+    rules_df: pd.DataFrame,
+    lift_independence_low: float,
+    lift_independence_high: float,
+    min_support: Optional[float] = None,
+    max_support: Optional[float] = None,
+    min_confidence: Optional[float] = None,
+    max_confidence: Optional[float] = None,
+) -> pd.DataFrame:
+    """
+    Prepare the microscopic rules DataFrame for CSV output.
+
+    Applies the same formatting as the macroscopic version but prepends the
+    macro_rule_id / macro_antecedents / macro_consequents columns so every
+    row traces back to its macroscopic anchor rule.
+    """
+    df = rules_df.copy()
+
+    # Convert frozenset columns to readable strings.
+    for col in ("antecedents", "consequents"):
+        if col in df.columns:
+            df[col] = df[col].apply(
+                lambda x: " & ".join(sorted(x)) if isinstance(x, frozenset) else str(x)
+            )
+
+    # Add lift_type.
+    df = _annotate_lift_type(df, lift_independence_low, lift_independence_high)
+
+    # Rename internal grid columns.
+    df = df.rename(columns={
+        "grid_support":    "grid_min_support",
+        "grid_confidence": "grid_min_confidence",
+    })
+
+    # Add global filter thresholds.
+    if min_support    is not None: df["filter_min_support"]    = min_support
+    if max_support    is not None: df["filter_max_support"]    = max_support
+    if min_confidence is not None: df["filter_min_confidence"] = min_confidence
+    if max_confidence is not None: df["filter_max_confidence"] = max_confidence
+    df["filter_lift_kept_below"] = lift_independence_low
+    df["filter_lift_kept_above"] = lift_independence_high
+    df["filter_lift_discarded"]  = f"[{lift_independence_low}, {lift_independence_high}]"
+
+    # Drop unwanted columns.
+    _DROP = {"zhangs_metric", "jaccard", "certainty", "kulczynski", "representativity"}
+    df = df.drop(columns=[c for c in _DROP if c in df.columns])
+
+    # Canonical column order — macro provenance columns come first.
+    _ORDERED = [
+        "macro_rule_id", "macro_antecedents", "macro_consequents",
+        "k_value",
+        "antecedents", "consequents",
+        "antecedent support", "consequent support",
+        "support", "confidence", "lift", "leverage", "conviction", "lift_type",
+        "grid_min_support", "grid_min_confidence",
+        "filter_min_support", "filter_max_support",
+        "filter_min_confidence", "filter_max_confidence",
+        "filter_lift_kept_below", "filter_lift_kept_above",
+        "filter_lift_discarded",
+    ]
+    present = [c for c in _ORDERED if c in df.columns]
+    extra   = [c for c in df.columns if c not in present]
+    return df[present + extra]
+
+
+def _save_micro_results(
+    all_rules: pd.DataFrame,
+    grid_summary: pd.DataFrame,
+    dest_dir: Path,
+    filename_stem: str,
+    lift_independence_low: float,
+    lift_independence_high: float,
+    min_support: Optional[float]    = None,
+    max_support: Optional[float]    = None,
+    min_confidence: Optional[float] = None,
+    max_confidence: Optional[float] = None,
+) -> None:
+    """Write micro_rules and micro_grid_summary CSVs to dest_dir."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    rules_path   = dest_dir / f"{filename_stem}_rules.csv"
+    summary_path = dest_dir / f"{filename_stem}_grid_summary.csv"
+
+    rules_csv = _format_micro_rules_for_csv(
+        all_rules,
+        lift_independence_low=lift_independence_low,
+        lift_independence_high=lift_independence_high,
+        min_support=min_support,
+        max_support=max_support,
+        min_confidence=min_confidence,
+        max_confidence=max_confidence,
+    )
+    rules_csv.to_csv(rules_path, index=False, float_format="%.6g")
+    logger.info("    Micro rules   → %s  (%d rows)", rules_path.name, len(rules_csv))
+
+    gs = grid_summary.copy()
+    if min_support    is not None: gs["filter_min_support"]    = min_support
+    if max_support    is not None: gs["filter_max_support"]    = max_support
+    if min_confidence is not None: gs["filter_min_confidence"] = min_confidence
+    if max_confidence is not None: gs["filter_max_confidence"] = max_confidence
+    gs["filter_lift_kept_below"] = lift_independence_low
+    gs["filter_lift_kept_above"] = lift_independence_high
+    gs["filter_lift_discarded"]  = f"[{lift_independence_low}, {lift_independence_high}]"
+    gs.to_csv(summary_path, index=False, float_format="%.6g")
+    logger.info("    Micro summary → %s  (%d cells)", summary_path.name, len(grid_summary))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Core: microscopic ARM for a single macroscopic rule
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _run_micro_for_macro_rule(
+    macro_rule: pd.Series,
+    label_set: frozenset[str],
+    exploded_tokens: pd.DataFrame,
+    min_support: float,
+    max_support: float,
+    support_step: Optional[float],
+    min_confidence: float,
+    max_confidence: float,
+    confidence_step: Optional[float],
+    lift_independence_low: float,
+    lift_independence_high: float,
+    n_workers: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Run the microscopic grid search for a single macroscopic rule.
+
+    Returns (micro_rules_df, grid_summary_df).  Both are annotated with
+    macro_rule_id, macro_antecedents, macro_consequents.  Returns empty
+    DataFrames if no transactions survive the filter or no rules are found.
+    """
+    macro_id   = int(macro_rule["macro_rule_id"])
+    macro_ant  = str(macro_rule.get("macro_antecedents", ""))
+    macro_cons = str(macro_rule.get("macro_consequents", ""))
+
+    logger.info(
+        "    macro rule %d: [%s] → [%s]  |  label filter: %s",
+        macro_id, macro_ant, macro_cons, sorted(label_set),
     )
 
-    if base_dir is None:
-        if Path('/kaggle/working').exists():
-            base_dir = Path('/kaggle/working')
-        elif Path('/content').exists():
-            base_dir = Path('/content')
+    # Filter transactions to those relevant to this macroscopic rule.
+    transactions = _filter_transactions_for_rule(exploded_tokens, label_set)
+
+    if not transactions:
+        logger.info(
+            "      No transactions contain any label from this rule — skipping."
+        )
+        return pd.DataFrame(), pd.DataFrame()
+
+    logger.info("      %d transactions selected for microscopic ARM.", len(transactions))
+
+    all_rules, grid_summary = run_grid_search(
+        transactions=transactions,
+        min_support=min_support,
+        max_support=max_support,
+        support_step=support_step,
+        min_confidence=min_confidence,
+        max_confidence=max_confidence,
+        confidence_step=confidence_step,
+        lift_independence_low=lift_independence_low,
+        lift_independence_high=lift_independence_high,
+        n_workers=n_workers,
+    )
+
+    if all_rules.empty:
+        logger.info("      No microscopic rules found.")
+        return pd.DataFrame(), grid_summary
+
+    # Annotate with macroscopic provenance.
+    all_rules = all_rules.copy()
+    all_rules.insert(0, "macro_consequents",  macro_cons)
+    all_rules.insert(0, "macro_antecedents",  macro_ant)
+    all_rules.insert(0, "macro_rule_id",      macro_id)
+
+    grid_summary = grid_summary.copy()
+    grid_summary.insert(0, "macro_consequents", macro_cons)
+    grid_summary.insert(0, "macro_antecedents", macro_ant)
+    grid_summary.insert(0, "macro_rule_id",     macro_id)
+
+    logger.info("      → %d microscopic rules found.", len(all_rules))
+    return all_rules, grid_summary
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-k runner
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _run_micro_for_k(
+    k_val: int,
+    output_dir: Path,
+    suffix: str,
+    macro_rules: pd.DataFrame,
+    min_support: float,
+    max_support: float,
+    support_step: Optional[float],
+    min_confidence: float,
+    max_confidence: float,
+    confidence_step: Optional[float],
+    lift_independence_low: float,
+    lift_independence_high: float,
+    n_workers: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Run the full microscopic ARM for a single k value.
+
+    Loads the per-k itemset file (or falls back to the combined file),
+    iterates over all macroscopic rules, runs the microscopic grid search
+    for each, aggregates results, saves to association_rules/k<N>/micro/,
+    and returns (all_micro_rules_df, all_grid_summary_df).
+    """
+    logger.info("  ── micro k=%d ─────────────────────────────────────", k_val)
+
+    # Locate the itemset CSV (search output_dir and feature_importance/).
+    search_dirs = [output_dir, output_dir / _FOLDER_FEATURE_IMP]
+    csv_path: Optional[Path] = None
+    for d in search_dirs:
+        candidate = d / f"feature_importance_itemsets_k{k_val}{suffix}.csv"
+        if candidate.exists():
+            csv_path = candidate
+            break
+    if csv_path is None:
+        # Fallback: combined file.
+        for d in search_dirs:
+            candidate = d / f"feature_importance_itemsets{suffix}.csv"
+            if candidate.exists():
+                csv_path = candidate
+                break
+    if csv_path is None:
+        logger.error(
+            "    No itemset CSV found for k=%d suffix='%s' — skipping.", k_val, suffix
+        )
+        return pd.DataFrame(), pd.DataFrame()
+
+    # Load the full exploded token frame once; reuse for all macro rules.
+    exploded_tokens = load_micro_itemsets(csv_path)
+    if exploded_tokens.empty:
+        logger.warning("    No usable tokens for k=%d — skipping.", k_val)
+        return pd.DataFrame(), pd.DataFrame()
+
+    # Pre-compute label sets for all macroscopic rules.
+    label_sets = _macro_label_sets(macro_rules)
+
+    all_rules_list:   list[pd.DataFrame] = []
+    all_summary_list: list[pd.DataFrame] = []
+
+    for macro_rule, label_set in zip(macro_rules.itertuples(index=False), label_sets):
+        # Convert namedtuple to dict-like access via _asdict().
+        macro_row = macro_rule._asdict()
+        rules_i, summary_i = _run_micro_for_macro_rule(
+            macro_rule=pd.Series(macro_row),
+            label_set=label_set,
+            exploded_tokens=exploded_tokens,
+            min_support=min_support,
+            max_support=max_support,
+            support_step=support_step,
+            min_confidence=min_confidence,
+            max_confidence=max_confidence,
+            confidence_step=confidence_step,
+            lift_independence_low=lift_independence_low,
+            lift_independence_high=lift_independence_high,
+            n_workers=n_workers,
+        )
+        if not rules_i.empty:
+            all_rules_list.append(rules_i)
+        if not summary_i.empty:
+            all_summary_list.append(summary_i)
+
+    # Aggregate.
+    if all_rules_list:
+        combined_rules = pd.concat(all_rules_list, ignore_index=True)
+        # Deduplicate on (macro_rule_id, antecedents, consequents) — the same
+        # micro rule may appear across different grid cells.
+        key_cols = ["macro_rule_id", "antecedents", "consequents"]
+        key_cols = [c for c in key_cols if c in combined_rules.columns]
+        if key_cols:
+            def _fs_str(x: object) -> str:
+                return "|".join(sorted(x)) if isinstance(x, frozenset) else str(x)
+            combined_rules["_dedup_key"] = (
+                combined_rules["macro_rule_id"].astype(str)
+                + "||"
+                + combined_rules["antecedents"].apply(_fs_str)
+                + "→"
+                + combined_rules["consequents"].apply(_fs_str)
+            )
+            combined_rules = (
+                combined_rules
+                .drop_duplicates(subset="_dedup_key", keep="first")
+                .drop(columns="_dedup_key")
+                .reset_index(drop=True)
+            )
+        # Annotate with k value.
+        combined_rules.insert(0, "k_value", k_val)
+    else:
+        combined_rules = pd.DataFrame()
+
+    if all_summary_list:
+        combined_summary = pd.concat(all_summary_list, ignore_index=True)
+        combined_summary.insert(0, "k_value", k_val)
+    else:
+        combined_summary = pd.DataFrame(
+            columns=["k_value", "macro_rule_id", "min_support", "min_confidence", "n_rules"]
+        )
+
+    # Save per-k micro outputs.
+    k_out  = _k_dir(output_dir, k_val)
+    micro_out = _micro_dir(k_out)
+    stem = f"micro{suffix}"
+
+    _save_micro_results(
+        combined_rules, combined_summary, micro_out, stem,
+        lift_independence_low=lift_independence_low,
+        lift_independence_high=lift_independence_high,
+        min_support=min_support, max_support=max_support,
+        min_confidence=min_confidence, max_confidence=max_confidence,
+    )
+
+    _hm_grid: pd.DataFrame
+    if (not combined_summary.empty
+            and {"min_support", "min_confidence", "n_rules"} <= set(combined_summary.columns)):
+        _hm_grid = (
+            combined_summary
+            .groupby(["min_support", "min_confidence"], as_index=False)["n_rules"]
+            .sum()
+        )
+    else:
+        _hm_grid = pd.DataFrame(columns=["min_support", "min_confidence", "n_rules"])
+
+    generate_heatmaps(
+        all_rules=combined_rules,
+        grid_summary=_hm_grid,
+        heatmap_dir=_heatmap_dir(micro_out),
+        suffix=suffix,
+        lift_independence_low=lift_independence_low,
+        lift_independence_high=lift_independence_high,
+        k_label=f"micro k={k_val}",
+        min_support=min_support, max_support=max_support,
+        min_confidence=min_confidence, max_confidence=max_confidence,
+    )
+
+    return combined_rules, combined_summary
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers to locate macroscopic rules files
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _find_macro_rules_path(output_dir: Path, k_val: int, suffix: str) -> Optional[Path]:
+    """
+    Locate the macroscopic rules CSV for a given k value.
+
+    Tries, in order:
+      association_rules/k<N>/arm[suffix]_rules.csv
+      association_rules/all_k/arm[suffix]_all_k_rules.csv  (fallback)
+    """
+    per_k = _k_dir(output_dir, k_val) / f"arm{suffix}_rules.csv"
+    if per_k.exists():
+        return per_k
+    all_k = _all_k_dir(output_dir) / f"arm{suffix}_all_k_rules.csv"
+    if all_k.exists():
+        logger.info(
+            "    Per-k macro rules not found for k=%d; using all_k rules.", k_val
+        )
+        return all_k
+    return None
+
+
+def _discover_k_values_micro(output_dir: Path, suffix: str) -> list[int]:
+    """
+    Discover k values for which macroscopic rules already exist.
+    Returns sorted list of k values found in association_rules/k<N>/.
+    """
+    arm_root = _arm_root(output_dir)
+    pattern = re.compile(r"^k(\d+)$")
+    found: list[int] = []
+    if arm_root.is_dir():
+        for d in arm_root.iterdir():
+            m = pattern.match(d.name)
+            if m and d.is_dir():
+                rules_file = d / f"arm{suffix}_rules.csv"
+                if rules_file.exists():
+                    found.append(int(m.group(1)))
+    return sorted(found)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main stage-4 runner
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_microscopic_mining(
+    output_dir: Path,
+    original_class: list[int],
+    k_value: Optional[int]              = None,
+    min_support: float                  = DEFAULT_MICRO_MIN_SUPPORT,
+    max_support: float                  = DEFAULT_MICRO_MAX_SUPPORT,
+    support_step: Optional[float]       = DEFAULT_MICRO_SUPPORT_STEP,
+    min_confidence: float               = DEFAULT_MICRO_MIN_CONFIDENCE,
+    max_confidence: float               = DEFAULT_MICRO_MAX_CONFIDENCE,
+    confidence_step: Optional[float]    = DEFAULT_MICRO_CONFIDENCE_STEP,
+    lift_independence_low: float        = DEFAULT_MICRO_LIFT_LOW,
+    lift_independence_high: float       = DEFAULT_MICRO_LIFT_HIGH,
+    n_workers: int                      = _DEFAULT_ARM_WORKERS,
+) -> None:
+    """
+    Entry point for stage 4, called by main.py after stage 3 completes.
+
+    For each class in *original_class*:
+      1. Discovers k values for which macroscopic rules exist.
+      2. For each k: loads macroscopic rules → filters itemset transactions
+         per rule → runs microscopic grid search → saves results.
+      3. Aggregates all per-k microscopic rules into association_rules/all_k/micro/.
+
+    Skip-if-exists: if micro_rules[suffix].csv already exists in a k-folder
+    the microscopic run for that k is skipped.  The all_k aggregation is
+    repeated whenever any per-k result is new.
+
+    Parameters
+    ----------
+    output_dir             : Stage-2/3 output directory.
+    original_class         : List of class indices ([0], [1], or [0, 1]).
+    k_value                : If set, process only that k value.
+    min_support            : Lower bound of the support grid.
+    max_support            : Upper bound filter for support.
+    support_step           : Step size (None = data-driven).
+    min_confidence         : Lower bound of the confidence grid.
+    max_confidence         : Upper bound filter for confidence.
+    confidence_step        : Step size (None = data-driven).
+    lift_independence_low  : Lower boundary of the lift independence interval.
+    lift_independence_high : Upper boundary of the lift independence interval.
+    n_workers              : Thread-pool size (parallel path only).
+    """
+    logger.info("═" * 62)
+    logger.info("  ACS INCOME PIPELINE  —  stage 4: microscopic ARM")
+    logger.info("═" * 62)
+    logger.info("  Output dir             : %s", output_dir.resolve())
+    logger.info("  k selector             : %s",
+                k_value if k_value else "auto (all k with macro rules)")
+    logger.info("  Support  grid          : [%.3f, %.3f]  step=%s",
+                min_support, max_support,
+                f"{support_step:.4f}" if support_step is not None else "auto")
+    logger.info("  Confidence grid        : [%.3f, %.3f]  step=%s",
+                min_confidence, max_confidence,
+                f"{confidence_step:.4f}" if confidence_step is not None else "auto")
+    logger.info("  Lift independence zone : [%.2f, %.2f]  → discarded",
+                lift_independence_low, lift_independence_high)
+    logger.info("  Workers                : %d", n_workers)
+    logger.info("═" * 62)
+
+    orig_classes_requested = sorted(set(original_class))
+    suffix_map = {
+        c: (f"_class{c}" if len(orig_classes_requested) > 1 else "")
+        for c in orig_classes_requested
+    }
+
+    for orig_cls in orig_classes_requested:
+        suffix = suffix_map[orig_cls]
+
+        logger.info("── Class %d ──────────────────────────────────────────", orig_cls)
+
+        # Determine k values to process.
+        if k_value is not None:
+            k_values_to_run = [k_value]
         else:
-            base_dir = Path(__file__).resolve().parent.parent
-    base_dir = Path(base_dir)
+            k_values_to_run = _discover_k_values_micro(output_dir, suffix)
+            if not k_values_to_run:
+                logger.warning(
+                    "No macroscopic rules found for suffix='%s' — "
+                    "run stage 3 first.", suffix
+                )
+                continue
 
-    if regions  is None: regions  = ['northeast', 'south']
-    if k_values is None: k_values = [1, 3, 5, 7]
+        logger.info("  k values to process: %s", k_values_to_run)
 
-    results_dir = base_dir / 'results'
+        all_micro_rules_list:   list[pd.DataFrame] = []
+        all_micro_summary_list: list[pd.DataFrame] = []
 
-    exp_label = _experiment_label(
-        auto_calibrate=auto_calibrate,
-        sup_min=sup_min,   sup_max=sup_max,   sup_delta=sup_delta,
-        conf_min=conf_min, conf_max=conf_max, conf_delta=conf_delta,
-        lift_min=lift_min, lift_max=lift_max, lift_delta=lift_delta,
-        lift_neutral_half_window=lift_neutral_half_window,
+        for k_val in k_values_to_run:
+            k_out        = _k_dir(output_dir, k_val)
+            micro_out    = _micro_dir(k_out)
+            micro_rules_path = micro_out / f"micro{suffix}_rules.csv"
+
+            # Skip-if-exists for this k.
+            if micro_rules_path.exists():
+                logger.info(
+                    "  Skipping micro k=%d: %s already exists.",
+                    k_val, micro_rules_path.name,
+                )
+                try:
+                    ex_rules   = pd.read_csv(micro_rules_path)
+                    ex_summary = pd.read_csv(micro_out / f"micro{suffix}_grid_summary.csv")
+                    if not ex_rules.empty:
+                        all_micro_rules_list.append(ex_rules)
+                    if not ex_summary.empty:
+                        all_micro_summary_list.append(ex_summary)
+                except (pd.errors.EmptyDataError, FileNotFoundError):
+                    pass
+                continue
+
+            # Locate macroscopic rules for this k.
+            macro_path = _find_macro_rules_path(output_dir, k_val, suffix)
+            if macro_path is None:
+                logger.warning(
+                    "  No macroscopic rules found for k=%d suffix='%s' — skipping.",
+                    k_val, suffix,
+                )
+                continue
+
+            macro_rules = _load_macro_rules(macro_path)
+            if macro_rules.empty:
+                logger.warning("  Macroscopic rules file is empty for k=%d.", k_val)
+                continue
+
+            rules_k, summary_k = _run_micro_for_k(
+                k_val=k_val,
+                output_dir=output_dir,
+                suffix=suffix,
+                macro_rules=macro_rules,
+                min_support=min_support, max_support=max_support,
+                support_step=support_step,
+                min_confidence=min_confidence, max_confidence=max_confidence,
+                confidence_step=confidence_step,
+                lift_independence_low=lift_independence_low,
+                lift_independence_high=lift_independence_high,
+                n_workers=n_workers,
+            )
+
+            if not rules_k.empty:
+                all_micro_rules_list.append(rules_k)
+            if not summary_k.empty:
+                all_micro_summary_list.append(summary_k)
+
+        # ── Aggregate all-k micro results ─────────────────────────────────────
+        logger.info("── Aggregating all-k micro results for class %d …", orig_cls)
+        all_k_micro_out = _micro_dir(_all_k_dir(output_dir))
+
+        if all_micro_rules_list:
+            combined_rules = pd.concat(all_micro_rules_list, ignore_index=True)
+        else:
+            combined_rules = pd.DataFrame()
+
+        if all_micro_summary_list:
+            _concat_summary = pd.concat(all_micro_summary_list, ignore_index=True)
+            grp_cols = ["macro_rule_id", "macro_antecedents", "macro_consequents",
+                        "min_support", "min_confidence"]
+            grp_cols = [c for c in grp_cols if c in _concat_summary.columns]
+            if grp_cols and "n_rules" in _concat_summary.columns:
+                combined_summary = (
+                    _concat_summary
+                    .groupby(grp_cols, as_index=False)["n_rules"]
+                    .sum()
+                )
+            else:
+                combined_summary = _concat_summary
+        else:
+            combined_summary = pd.DataFrame()
+
+        _save_micro_results(
+            combined_rules, combined_summary, all_k_micro_out,
+            f"micro{suffix}_all_k",
+            lift_independence_low=lift_independence_low,
+            lift_independence_high=lift_independence_high,
+            min_support=min_support, max_support=max_support,
+            min_confidence=min_confidence, max_confidence=max_confidence,
+        )
+
+        _hm_grid_allk: pd.DataFrame
+        if (not combined_summary.empty
+                and {"min_support", "min_confidence", "n_rules"} <= set(combined_summary.columns)):
+            _hm_grid_allk = (
+                combined_summary
+                .groupby(["min_support", "min_confidence"], as_index=False)["n_rules"]
+                .sum()
+            )
+        else:
+            _hm_grid_allk = pd.DataFrame(columns=["min_support", "min_confidence", "n_rules"])
+
+        generate_heatmaps(
+            all_rules=combined_rules,
+            grid_summary=_hm_grid_allk,
+            heatmap_dir=_heatmap_dir(all_k_micro_out),
+            suffix=suffix,
+            lift_independence_low=lift_independence_low,
+            lift_independence_high=lift_independence_high,
+            k_label="micro all k",
+            min_support=min_support, max_support=max_support,
+            min_confidence=min_confidence, max_confidence=max_confidence,
+        )
+
+    logger.info("═" * 62)
+    logger.info("  Stage 4 (microscopic ARM) completed.")
+    logger.info("  Outputs in: %s", (_arm_root(output_dir)).resolve())
+    logger.info("═" * 62)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI argument definitions (consumed by main.py's build_parser)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def add_micro_arguments(parser: argparse.ArgumentParser) -> None:
+    """
+    Add stage-4 (microscopic ARM) arguments to an existing ArgumentParser.
+
+    Called by main.py's build_parser() to keep all CLI logic in one place.
+    All arguments are optional with sensible defaults.
+    """
+    micro = parser.add_argument_group(
+        "Micro ARM hyperparameters  (stage 4 — microscopic association rule mining)"
     )
 
-    for region in regions:
-        out_dir = (
-            results_dir / region / 'association_rules_values' / exp_label
-        )
-        out_dir.mkdir(parents=True, exist_ok=True)
+    micro.add_argument(
+        "--micro-min-support", type=float,
+        default=DEFAULT_MICRO_MIN_SUPPORT, metavar="S",
+        help=f"Minimum support for the microscopic FP-Growth grid search.  "
+             f"Default: {DEFAULT_MICRO_MIN_SUPPORT}.",
+    )
+    micro.add_argument(
+        "--micro-max-support", type=float,
+        default=DEFAULT_MICRO_MAX_SUPPORT, metavar="S",
+        help=f"Maximum support upper-bound filter.  Default: {DEFAULT_MICRO_MAX_SUPPORT}.",
+    )
+    micro.add_argument(
+        "--micro-support-step", type=float, default=None, metavar="S",
+        help="Step size for the microscopic support grid.  "
+             "Default: auto-computed from transaction data.",
+    )
+    micro.add_argument(
+        "--micro-min-confidence", type=float,
+        default=DEFAULT_MICRO_MIN_CONFIDENCE, metavar="C",
+        help=f"Minimum confidence for the microscopic grid search.  "
+             f"Default: {DEFAULT_MICRO_MIN_CONFIDENCE}.",
+    )
+    micro.add_argument(
+        "--micro-max-confidence", type=float,
+        default=DEFAULT_MICRO_MAX_CONFIDENCE, metavar="C",
+        help=f"Maximum confidence upper-bound filter.  "
+             f"Default: {DEFAULT_MICRO_MAX_CONFIDENCE}.",
+    )
+    micro.add_argument(
+        "--micro-confidence-step", type=float, default=None, metavar="C",
+        help="Step size for the microscopic confidence grid.  "
+             "Default: auto-computed from transaction data.",
+    )
+    micro.add_argument(
+        "--micro-lift-low", type=float,
+        default=DEFAULT_MICRO_LIFT_LOW, metavar="L",
+        help=f"Lower boundary of the lift independence interval for microscopic rules.  "
+             f"Default: {DEFAULT_MICRO_LIFT_LOW}.",
+    )
+    micro.add_argument(
+        "--micro-lift-high", type=float,
+        default=DEFAULT_MICRO_LIFT_HIGH, metavar="L",
+        help=f"Upper boundary of the lift independence interval for microscopic rules.  "
+             f"Default: {DEFAULT_MICRO_LIFT_HIGH}.",
+    )
+    micro.add_argument(
+        "--micro-k", type=int, default=None, metavar="K",
+        help="If set, run microscopic ARM only for this k value.  "
+             "Default: process all k values for which macroscopic rules exist.",
+    )
+    micro.add_argument(
+        "--micro-workers", type=int,
+        default=_DEFAULT_ARM_WORKERS, metavar="N",
+        help=f"Thread-pool size for the microscopic grid-search (parallel path only).  "
+             f"Default: {_DEFAULT_ARM_WORKERS} (auto-detected).",
+    )
 
-        print('\n' + '=' * 70)
-        print(
-            f'ASSOCIATION RULES (VALUE LEVEL — PER MACRO RULE) — '
-            f'{region.upper()}'
-        )
-        print(f'Experiment label: {exp_label}')
-        print('=' * 70 + '\n')
 
-        run_k_comparison_values(
-            k_values=k_values,
-            results_dir=results_dir,
-            region=region,
-            output_dir=out_dir,
-            auto_calibrate=auto_calibrate,
-            sup_min=sup_min,   sup_max=sup_max,   sup_delta=sup_delta,
-            conf_min=conf_min, conf_max=conf_max, conf_delta=conf_delta,
-            lift_min=lift_min, lift_max=lift_max, lift_delta=lift_delta,
-            lift_neutral_half_window=lift_neutral_half_window,
-        )
+# ─────────────────────────────────────────────────────────────────────────────
+# Standalone entry-point guard
+# ─────────────────────────────────────────────────────────────────────────────
 
-    print('\n' + '=' * 70)
-    print('Done.')
-    print('=' * 70 + '\n')
-
-
+if __name__ == "__main__":
+    import sys
+    print(
+        "microscopic_data_mining.py is stage 4 of the pipeline and cannot be\n"
+        "run independently — it depends on stage 3 macroscopic rules.\n\n"
+        "Run the full pipeline via:\n"
+        "  python -m src.main [OPTIONS]\n\n"
+        "Stage-4 specific options:\n"
+        "  --micro-min-support        (default: 0.05)\n"
+        "  --micro-max-support        (default: 1.00)\n"
+        "  --micro-support-step       (default: auto)\n"
+        "  --micro-min-confidence     (default: 0.50)\n"
+        "  --micro-max-confidence     (default: 1.00)\n"
+        "  --micro-confidence-step    (default: auto)\n"
+        "  --micro-lift-low           (default: 0.75)\n"
+        "  --micro-lift-high          (default: 1.25)\n"
+        f"  --micro-workers            (default: {_DEFAULT_ARM_WORKERS}, auto-detected)\n"
+        "  --micro-k                  (default: None — all k with macro rules)\n",
+        file=sys.stderr,
+    )
+    sys.exit(1)

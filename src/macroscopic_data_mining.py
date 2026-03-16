@@ -397,15 +397,32 @@ def _build_boolean_matrix(
     transactions: list[list[str]],
 ) -> tuple[pd.DataFrame, list[str]]:
     """
-    Build the one-hot boolean matrix for FP-Growth using numpy indexing.
+    Build the one-hot boolean matrix for FP-Growth.
+
+    Uses numpy advanced indexing with pre-computed row/column index arrays —
+    no Python loop over transactions.
 
     Returns (bool_df, sorted_item_names).
     """
     all_items: list[str] = sorted({item for txn in transactions for item in txn})
     item_index: dict[str, int] = {item: i for i, item in enumerate(all_items)}
-    arr = np.zeros((len(transactions), len(all_items)), dtype=bool)
-    for row_idx, txn in enumerate(transactions):
-        arr[row_idx, [item_index[it] for it in txn]] = True
+    n_txn  = len(transactions)
+    n_item = len(all_items)
+
+    # Build parallel row/col index arrays for all (transaction, item) pairs.
+    row_idx = np.fromiter(
+        (r for r, txn in enumerate(transactions) for _ in txn),
+        dtype=np.intp,
+        count=sum(len(t) for t in transactions),
+    )
+    col_idx = np.fromiter(
+        (item_index[it] for txn in transactions for it in txn),
+        dtype=np.intp,
+        count=len(row_idx),
+    )
+
+    arr = np.zeros((n_txn, n_item), dtype=bool)
+    arr[row_idx, col_idx] = True
     return pd.DataFrame(arr, columns=all_items), all_items
 
 
@@ -667,7 +684,7 @@ def run_grid_search(
         for sup, conf in grid:
             base = rules_cache[sup]
             if base.empty:
-                cell_results[(sup, conf)] = pd.DataFrame()
+                cell_results[(sup, conf)] = base
                 continue
             mask = (
                 (base["support"]    <= max_support)
@@ -680,9 +697,9 @@ def run_grid_search(
             )
             filtered = base.loc[mask]
             if not filtered.empty:
-                filtered = filtered.copy()
-                filtered["grid_support"]    = sup
-                filtered["grid_confidence"] = conf
+                # assign() returns a copy only when there are actual rows,
+                # avoiding an unconditional copy of the full DataFrame.
+                filtered = filtered.assign(grid_support=sup, grid_confidence=conf)
             cell_results[(sup, conf)] = filtered
 
     else:
@@ -1277,7 +1294,7 @@ def _save_rules(
         min_confidence=min_confidence,
         max_confidence=max_confidence,
     )
-    rules_csv.to_csv(rules_path, index=False)
+    rules_csv.to_csv(rules_path, index=False, float_format="%.6g")
     logger.info("    Rules   → %s  (%d rows)", rules_path.name, len(rules_csv))
 
     gs = grid_summary.copy()
@@ -1288,7 +1305,7 @@ def _save_rules(
     gs["filter_lift_kept_below"]  = lift_independence_low
     gs["filter_lift_kept_above"]  = lift_independence_high
     gs["filter_lift_discarded"]   = f"[{lift_independence_low}, {lift_independence_high}]"
-    gs.to_csv(summary_path, index=False)
+    gs.to_csv(summary_path, index=False, float_format="%.6g")
     logger.info("    Summary → %s  (%d cells)", summary_path.name, len(grid_summary))
 
 

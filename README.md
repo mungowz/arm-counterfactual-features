@@ -1,9 +1,10 @@
 # ACS Income Dataset Pipeline
 
-A three-stage command-line pipeline for building binary-classification datasets
+A four-stage command-line pipeline for building binary-classification datasets
 from the U.S. Census Bureau's American Community Survey (ACS) Public Use
 Microdata Sample (PUMS), computing global feature importance via the **BoCSoR**
-algorithm, and mining macroscopic association rules via **FP-Growth**.
+algorithm, mining macroscopic association rules via **FP-Growth**, and drilling
+down into value-level microscopic rules anchored to the macroscopic findings.
 
 The pipeline predicts whether an individual's annual personal income (`PINCP`)
 exceeds a configurable threshold.  All categorical features are decoded from
@@ -25,7 +26,8 @@ project/
 │   ├── create_dataset.py           # Stage 1: download → encode → split → save
 │   ├── feature_importance.py       # Stage 2: BoCSoR XAI (rank encoding, CatBoost, itemsets)
 │   ├── macroscopic_data_mining.py  # Stage 3: FP-Growth ARM on macroscopic feature labels
-│   └── main.py                     # CLI entry point — orchestrates all three stages
+│   ├── microscopic_data_mining.py  # Stage 4: FP-Growth ARM on full LABEL=value tokens
+│   └── main.py                     # CLI entry point — orchestrates all four stages
 └── data/
     ├── raw/                        # Cached raw PUMS files (auto-created)
     └── *.csv                       # Processed output datasets
@@ -82,14 +84,19 @@ re-download or re-encoding.
 
 ## Pipeline behaviour
 
-The pipeline always runs all three stages. Re-runs are safe:
+The pipeline always runs all four stages. Re-runs are safe:
 
 - **Stage 1** is skipped if the expected `train_*.csv` / `test_*.csv` files
   already exist in `--data-dir`.
 - **Stage 2** skips any class whose `feature_importance[_classN].csv` already
   exists in the output directory.
-- **Stage 3** skips any class whose `arm_rules[_classN].csv` already exists
-  in the output directory.
+- **Stage 3** skips any class whose `association_rules/all_k/arm[suffix]_all_k_rules.csv`
+  already exists.  Individual per-k runs are also skipped if their output exists.
+  k values with zero rules leave a sentinel file (`.arm[suffix]_done`) so they
+  are not re-executed.
+- **Stage 4** skips any k value whose `micro[suffix]_rules.csv` already exists
+  in the corresponding `micro/` sub-folder.  The all_k aggregation is always
+  refreshed when any per-k result is new.
 
 ---
 
@@ -205,6 +212,11 @@ per-k runs (`association_rules/k<N>/`) are also skipped if their output already 
 k values that were processed but yielded zero rules leave a sentinel file
 (`.arm[suffix]_done`) so they are not re-executed on subsequent runs.
 
+**Stage 4** (`microscopic_data_mining.py`): if `micro[suffix]_rules.csv` already
+exists in a `association_rules/k<N>/micro/` folder, that k is skipped.  The
+all_k microscopic aggregation is always regenerated from the available per-k
+results when at least one new k was processed.
+
 In all cases the skip is logged at INFO level so it is always visible.
 
 > To force a re-run, delete the relevant output files first.
@@ -306,6 +318,21 @@ further cuts the number of boundary instances to process.
 | `--arm-k` | int | `None` | If set, process only that k value (`feature_importance_itemsets_k<K>.csv`). Default: process all k values found automatically. |
 | `--arm-workers` | int | auto-detected | Thread-pool size for the parallel confidence-axis sweep. Auto-detected as `max(1, min(16, cpu_count - 2))`. |
 
+### Micro ARM hyperparameters *(stage 4)*
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `--micro-min-support` | float | `0.05` | Minimum support threshold for microscopic FP-Growth. |
+| `--micro-max-support` | float | `1.00` | Maximum support upper-bound filter. |
+| `--micro-support-step` | float | auto | Step size for the microscopic support grid (same auto-detection as `--arm-support-step`). |
+| `--micro-min-confidence` | float | `0.50` | Minimum confidence threshold for microscopic rule generation. |
+| `--micro-max-confidence` | float | `1.00` | Maximum confidence upper-bound filter. |
+| `--micro-confidence-step` | float | auto | Step size for the microscopic confidence grid. |
+| `--micro-lift-low` | float | `0.75` | Lower boundary of the lift independence interval for microscopic rules. |
+| `--micro-lift-high` | float | `1.25` | Upper boundary of the lift independence interval. |
+| `--micro-k` | int | `None` | If set, run microscopic ARM only for this k value. Default: all k values for which macroscopic rules exist. |
+| `--micro-workers` | int | auto-detected | Thread-pool size for the microscopic grid search (parallel path only). |
+
 ### Logging
 
 | Option | Values | Default | Description |
@@ -343,17 +370,31 @@ directory:
     ├── k<N>/                    ← one sub-folder per k value
     │   ├── arm[suffix]_rules.csv
     │   ├── arm[suffix]_grid_summary.csv
-    │   └── heatmaps/
-    │       ├── heatmap_support_confidence[suffix].png
-    │       ├── heatmap_support_lift[suffix].png
-    │       └── heatmap_confidence_lift[suffix].png
+    │   ├── heatmaps/
+    │   │   ├── heatmap_support_confidence[suffix].png
+    │   │   ├── heatmap_support_lift[suffix].png
+    │   │   └── heatmap_confidence_lift[suffix].png
+    │   └── micro/               ← stage-4 microscopic outputs for this k
+    │       ├── micro[suffix]_rules.csv
+    │       ├── micro[suffix]_grid_summary.csv
+    │       └── heatmaps/
+    │           ├── heatmap_support_confidence[suffix].png
+    │           ├── heatmap_support_lift[suffix].png
+    │           └── heatmap_confidence_lift[suffix].png
     └── all_k/                   ← rules aggregated across all k values
         ├── arm[suffix]_all_k_rules.csv
         ├── arm[suffix]_all_k_grid_summary.csv
-        └── heatmaps/
-            ├── heatmap_support_confidence[suffix].png
-            ├── heatmap_support_lift[suffix].png
-            └── heatmap_confidence_lift[suffix].png
+        ├── heatmaps/
+        │   ├── heatmap_support_confidence[suffix].png
+        │   ├── heatmap_support_lift[suffix].png
+        │   └── heatmap_confidence_lift[suffix].png
+        └── micro/               ← stage-4 microscopic outputs aggregated
+            ├── micro[suffix]_all_k_rules.csv
+            ├── micro[suffix]_all_k_grid_summary.csv
+            └── heatmaps/
+                ├── heatmap_support_confidence[suffix].png
+                ├── heatmap_support_lift[suffix].png
+                └── heatmap_confidence_lift[suffix].png
 ```
 
 When `--original-class 0 1` is used all files carry a `_class0` / `_class1`
@@ -481,6 +522,87 @@ One row per `(min_support, min_confidence)` grid cell.  Columns: `min_support`,
 
 When `--original-class 0 1` is used all files carry a `_class0` / `_class1`
 suffix, mirroring the stage-2 naming convention.
+
+---
+
+## Stage 4 — Microscopic Association Rule Mining
+
+Stage 4 is the **microscopic** companion to stage 3.  While stage 3 discards
+feature values and works only with feature *labels* (e.g. `{SCHL, WKHP}`),
+stage 4 retains the full `LABEL=value` tokens (e.g. `{SCHL=Bachelors-Degree,
+WKHP=Full-Time}`) to produce value-level association rules anchored to the
+macroscopic findings.
+
+### Relation to macroscopic rules
+
+For each macroscopic rule `antecedent_labels → consequent_labels` produced by
+stage 3, the microscopic analysis:
+
+1. Extracts the set of feature labels that appear in the rule's antecedent
+   **or** consequent.
+2. Filters the itemset CSV: retains only boundary instances whose itemset
+   contains **at least one token** whose label matches a label in the rule.
+   All tokens of each matching instance are kept (not just the matched ones),
+   preserving the full value context.
+3. Runs the same adaptive FP-Growth grid search on the filtered microscopic
+   transactions.
+4. Annotates every surviving microscopic rule with `macro_rule_id`,
+   `macro_antecedents`, and `macro_consequents` so the value-level finding
+   can always be traced back to its macroscopic anchor.
+
+### Output files
+
+#### Microscopic rules CSV (`micro[suffix]_rules.csv`)
+
+Each row is a unique value-level association rule.  Columns prepend the
+macroscopic provenance before the standard metric columns:
+
+| Column | Description |
+|---|---|
+| `macro_rule_id` | 0-based index of the macroscopic anchor rule |
+| `macro_antecedents` | Macroscopic antecedent label(s), e.g. `SCHL` |
+| `macro_consequents` | Macroscopic consequent label(s), e.g. `WKHP` |
+| `k_value` | k value (per-k files only) |
+| `antecedents` | Microscopic antecedent `LABEL=value` item(s) |
+| `consequents` | Microscopic consequent `LABEL=value` item(s) |
+| `antecedent support` | P(antecedent) |
+| `consequent support` | P(consequent) |
+| `support` | P(antecedent ∪ consequent) |
+| `confidence` | P(consequent \| antecedent) |
+| `lift` | Observed / expected co-occurrence |
+| `leverage` | P(A∪C) − P(A)·P(C) |
+| `conviction` | (1 − P(C)) / (1 − confidence) |
+| `lift_type` | `positive_correlation` or `negative_correlation` |
+| `grid_min_support` | min_support threshold that produced this rule |
+| `grid_min_confidence` | min_confidence threshold that produced this rule |
+| `filter_*` | Active filter thresholds (self-documenting) |
+
+All floating-point values are written with `%.6g` format (6 significant
+figures, compact notation — no spurious trailing decimals).
+
+#### Microscopic grid summary CSV (`micro[suffix]_grid_summary.csv`)
+
+One row per `(macro_rule_id, min_support, min_confidence)` triplet with
+`n_rules` and the same `filter_*` columns.
+
+#### Heatmap PNGs
+
+Same three heatmaps as stage 3 (Support×Confidence, Support×Lift,
+Confidence×Lift), generated per k and for all_k, saved under
+`association_rules/k<N>/micro/heatmaps/` and `association_rules/all_k/micro/heatmaps/`.
+
+### Performance
+
+Stage 4 shares all performance infrastructure with stage 3:
+
+- The exploded token DataFrame is loaded **once per k** and reused for all
+  macroscopic rules — no repeated CSV reads.
+- Transaction filtering is fully **vectorised** via `pandas.isin()` — no
+  Python loop over rows.
+- The grid search uses the same **adaptive strategy** (vectorised path for
+  few items, threaded path for many items).
+- All floating-point values in CSV output use **`%.6g`** format to avoid
+  IEEE 754 representation noise (e.g. `0.276` instead of `0.27600000000000003`).
 
 ---
 
