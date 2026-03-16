@@ -374,40 +374,46 @@ evaluated with three metrics:
 ### Grid search
 
 A grid search over all `(min_support, min_confidence)` pairs is run per k value.
-The confidence axis is swept in parallel across a thread pool.  FP-Growth is
-executed once per distinct support threshold and the result is cached across
-all confidence values at that support level.
+FP-Growth is executed once per distinct support threshold and the result is
+cached.  Rule generation and filtering use an **adaptive strategy** chosen at
+runtime by probing the actual rule volume at the lowest support threshold (see
+Performance optimisations below).
 
 ### Per-k runs and combined output
 
 Stage 3 automatically discovers all per-k itemset files
-(`feature_importance_itemsets_k<N>.csv`) produced by stage 2 and runs the full
-grid search independently for each k.  Results are written to
+(`feature_importance_itemsets_k<N>.csv`) produced by stage 2 — searching both
+the root output directory and the `feature_importance/` sub-folder — and runs
+the full grid search independently for each k.  Results are written to
 `association_rules/k<N>/`.  After all k runs complete, the rules are aggregated
 (with deduplication) into `association_rules/all_k/`.
 
 Use `--arm-k K` to restrict processing to a single k value.
 
+Stage-2 files (`feature_importance*.csv`, `bocsor_summary*.md`) are moved into
+the `feature_importance/` sub-folder automatically at the end of stage 3, after
+all reads are complete.
+
 ### Heatmaps
 
 Three heatmaps are generated for each k value **and** for the aggregated all-k
-run.  All heatmaps use a blue colour scale where **darker = more rules**.
+run.  All heatmaps use a blue colour scale where **darker = more rules**.  A
+subtitle on each PNG shows the exact active filter thresholds, making every
+image fully self-documenting.
 
-| Heatmap | Rows | Columns | Notes |
-|---|---|---|---|
-| Support × Confidence | min_support values | min_confidence values | Counts from the grid-search summary. |
-| Support × Lift | min_support values | lift bins | Counts of surviving rules per bin. |
-| Confidence × Lift | min_confidence values | lift bins | Counts of surviving rules per bin. |
+| Heatmap | Rows | Columns | Cell value | Notes |
+|---|---|---|---|---|
+| Support × Confidence | `min_support` thresholds (grid) | `min_confidence` thresholds (grid) | n_rules at that threshold pair | Direct view of where the grid produces rules |
+| Support × Lift | actual `support` values (binned) | actual `lift` values (binned) | n_rules in that bin pair | Shows where rules concentrate in metric space |
+| Confidence × Lift | actual `confidence` values (binned) | actual `lift` values (binned) | n_rules in that bin pair | Shows where rules concentrate in metric space |
 
 On the lift-based heatmaps the **lift independence window**
 (`[arm_lift_low, arm_lift_high]`) is annotated with a red hatched band, making
-it immediately visible that no rules are generated in that region — only
+it immediately visible that no rules fall in that region — only
 positive-correlation rules (lift > `arm_lift_high`) and contrast /
 negative-correlation rules (lift < `arm_lift_low`) are retained.
 
 ### Performance optimisations
-
-The following optimisations are applied in stage 3:
 
 - **Vectorised transaction parsing** — the `itemset` column is parsed with
   pandas `str.split()` + `explode()` + `groupby()` instead of a Python row loop.
@@ -429,14 +435,49 @@ The following optimisations are applied in stage 3:
 
 ### Output files
 
+#### Rules CSV (`arm[suffix]_rules.csv`)
+
+Each row is a unique association rule that survived all filters.  Every row is
+fully self-describing — no external file is needed to interpret the thresholds.
+
+| Column | Description |
+|---|---|
+| `k_value` | k value (per-k files only) |
+| `antecedents` | Feature label(s) in the antecedent, joined by ` & ` |
+| `consequents` | Feature label(s) in the consequent |
+| `antecedent support` | P(antecedent) |
+| `consequent support` | P(consequent) |
+| `support` | P(antecedent ∪ consequent) — actual rule metric |
+| `confidence` | P(consequent \| antecedent) — actual rule metric |
+| `lift` | Observed / expected co-occurrence — actual rule metric |
+| `leverage` | P(A∪C) − P(A)·P(C) |
+| `conviction` | (1 − P(C)) / (1 − confidence) |
+| `lift_type` | `positive_correlation` (lift > `arm_lift_high`) or `negative_correlation` (lift < `arm_lift_low`) |
+| `grid_min_support` | `min_support` threshold at which this rule was found |
+| `grid_min_confidence` | `min_confidence` threshold at which this rule was found |
+| `filter_min_support` | Global lower bound of the support grid |
+| `filter_max_support` | Global upper bound of the support grid |
+| `filter_min_confidence` | Global lower bound of the confidence grid |
+| `filter_max_confidence` | Global upper bound of the confidence grid |
+| `filter_lift_kept_below` | Rules with lift below this are kept (negative correlation) |
+| `filter_lift_kept_above` | Rules with lift above this are kept (positive correlation) |
+| `filter_lift_discarded` | Discarded lift interval, e.g. `[0.75, 1.25]` |
+
+Columns removed (not informative for this analysis): `zhangs_metric`, `jaccard`,
+`certainty`, `kulczynski`, `representativity`.
+
+#### Grid summary CSV (`arm[suffix]_grid_summary.csv`)
+
+One row per `(min_support, min_confidence)` grid cell.  Columns: `min_support`,
+`min_confidence`, `n_rules`, plus the same `filter_*` columns as the rules CSV.
+
+#### Heatmap PNGs (`heatmaps/*.png`)
+
 | File | Description |
 |---|---|
-| `association_rules/k<N>/arm[suffix]_rules.csv` | Unique rules for k=N surviving all filters. Columns: `k_value`, `antecedents`, `consequents`, `support`, `confidence`, `lift`, `leverage`, `conviction`, `grid_support`, `grid_confidence`. |
-| `association_rules/k<N>/arm[suffix]_grid_summary.csv` | Grid summary for k=N: one row per `(min_support, min_confidence)` cell with `n_rules`. |
-| `association_rules/k<N>/heatmaps/*.png` | Three heatmaps (support×confidence, support×lift, confidence×lift) for k=N. |
-| `association_rules/all_k/arm[suffix]_all_k_rules.csv` | All unique rules aggregated across every k value. |
-| `association_rules/all_k/arm[suffix]_all_k_grid_summary.csv` | Aggregated grid summary (rule counts summed across k values). |
-| `association_rules/all_k/heatmaps/*.png` | Three heatmaps for the aggregated all-k dataset. |
+| `heatmap_support_confidence[suffix].png` | Support (rows) × Confidence (cols), threshold view |
+| `heatmap_support_lift[suffix].png` | Support (rows) × Lift (cols), actual-value binned view |
+| `heatmap_confidence_lift[suffix].png` | Confidence (rows) × Lift (cols), actual-value binned view |
 
 When `--original-class 0 1` is used all files carry a `_class0` / `_class1`
 suffix, mirroring the stage-2 naming convention.

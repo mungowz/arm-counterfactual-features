@@ -234,10 +234,15 @@ def _move_feature_importance_files(output_dir: Path) -> None:
 
 def _discover_k_values(output_dir: Path, suffix: str) -> list[int]:
     """
-    Scan *output_dir* for per-k itemset files and return sorted k values.
+    Scan *output_dir* and its ``feature_importance/`` sub-folder for per-k
+    itemset files and return sorted k values.
 
-    Looks for files matching the pattern:
+    Looks for files matching:
         feature_importance_itemsets_k<N><suffix>.csv
+
+    Searches both the root output directory and the feature_importance/
+    sub-folder so that discovery works regardless of whether the move has
+    already been performed.
 
     Returns an empty list if no per-k files are found.
     """
@@ -245,10 +250,16 @@ def _discover_k_values(output_dir: Path, suffix: str) -> list[int]:
         r"^feature_importance_itemsets_k(\d+)" + re.escape(suffix) + r"\.csv$"
     )
     found: list[int] = []
-    for f in output_dir.iterdir():
-        m = pattern.match(f.name)
-        if m:
-            found.append(int(m.group(1)))
+    search_dirs = [output_dir, output_dir / _FOLDER_FEATURE_IMP]
+    for search_dir in search_dirs:
+        if not search_dir.is_dir():
+            continue
+        for f in search_dir.iterdir():
+            m = pattern.match(f.name)
+            if m:
+                k = int(m.group(1))
+                if k not in found:
+                    found.append(k)
     return sorted(found)
 
 
@@ -260,28 +271,38 @@ def _build_input_path(
     """
     Resolve the stage-2 itemset CSV for a given k value (or the combined file).
 
-    Resolution order:
-      1. Per-k file  feature_importance_itemsets_k<N><suffix>.csv  (if k_value given).
-      2. Combined    feature_importance_itemsets<suffix>.csv.
+    Searches both *output_dir* and its ``feature_importance/`` sub-folder so
+    that file resolution works regardless of whether the post-processing move
+    has already been performed (files may be in either location).
 
-    Raises FileNotFoundError if neither is found.
+    Resolution order for each location:
+      1. Per-k file  feature_importance_itemsets_k<N><suffix>.csv
+      2. Combined    feature_importance_itemsets<suffix>.csv
+
+    Raises FileNotFoundError if neither is found in either location.
     """
+    search_dirs = [output_dir, output_dir / _FOLDER_FEATURE_IMP]
+
     if k_value is not None:
-        candidate = output_dir / f"feature_importance_itemsets_k{k_value}{suffix}.csv"
-        if candidate.exists():
-            return candidate
+        for d in search_dirs:
+            candidate = d / f"feature_importance_itemsets_k{k_value}{suffix}.csv"
+            if candidate.exists():
+                return candidate
         logger.warning(
-            "Per-k file %s not found; falling back to combined itemset file.",
-            candidate.name,
+            "Per-k file feature_importance_itemsets_k%d%s.csv not found "
+            "in output_dir or feature_importance/; falling back to combined file.",
+            k_value, suffix,
         )
 
-    combined = output_dir / f"feature_importance_itemsets{suffix}.csv"
-    if combined.exists():
-        return combined
+    for d in search_dirs:
+        combined = d / f"feature_importance_itemsets{suffix}.csv"
+        if combined.exists():
+            return combined
 
     raise FileNotFoundError(
-        f"No itemset CSV found in {output_dir} for suffix='{suffix}' "
-        f"(tried k_value={k_value} and combined file).  "
+        f"No itemset CSV found for suffix='{suffix}' "
+        f"(tried k_value={k_value} and combined file in {output_dir} "
+        f"and {output_dir / _FOLDER_FEATURE_IMP}).  "
         "Make sure stage 2 (feature_importance.py) has completed."
     )
 
@@ -935,71 +956,105 @@ def generate_heatmaps(
     """
     Generate the three heatmaps for a given k (or all-k) run.
 
-    A subtitle line on each heatmap shows the exact thresholds that were active
-    so the PNG file is self-documenting without needing to cross-reference the
-    CSV.
+    Each heatmap shows how many rules were found at each parameter combination.
+    A subtitle records the active filter thresholds so every PNG is self-
+    documenting.
 
-    Heatmap 1 — Support × Confidence
-        rows = min_support values, cols = min_confidence values,
-        cell = n_rules from grid_summary.
+    Heatmap 1 — Support × Confidence  (grid-threshold view)
+    ─────────────────────────────────────────────────────────
+    rows  = min_support thresholds used in the grid
+    cols  = min_confidence thresholds used in the grid
+    cell  = n_rules found at that (min_support, min_confidence) pair
+            (sourced from grid_summary, which already has the exact counts)
 
-    Heatmap 2 — Support × Lift (binned)
-        rows = min_support values, cols = lift bins.
-        The lift independence window is hatched in red.
+    Heatmap 2 — Support × Lift  (actual-metric view)
+    ──────────────────────────────────────────────────
+    rows  = actual rule support values (binned)
+    cols  = actual rule lift values (binned, with independence window hatched)
+    cell  = number of surviving rules in that (support_bin, lift_bin) cell
 
-    Heatmap 3 — Confidence × Lift (binned)
-        rows = min_confidence values, cols = lift bins.
-        The lift independence window is hatched in red.
+    Heatmap 3 — Confidence × Lift  (actual-metric view)
+    ─────────────────────────────────────────────────────
+    rows  = actual rule confidence values (binned)
+    cols  = actual rule lift values (binned, with independence window hatched)
+    cell  = number of surviving rules in that (confidence_bin, lift_bin) cell
     """
     heatmap_dir.mkdir(parents=True, exist_ok=True)
 
-    # Build the subtitle string from active filter parameters.
+    # ── Subtitle: active filter thresholds ────────────────────────────────────
     parts: list[str] = []
     if min_support is not None and max_support is not None:
         parts.append(f"support ∈ [{min_support:.3f}, {max_support:.3f}]")
     if min_confidence is not None and max_confidence is not None:
         parts.append(f"confidence ∈ [{min_confidence:.3f}, {max_confidence:.3f}]")
     parts.append(
-        f"lift kept: < {lift_independence_low:.2f} (negative)  "
-        f"or > {lift_independence_high:.2f} (positive)  |  "
+        f"lift kept: <{lift_independence_low:.2f} (neg.) "
+        f"or >{lift_independence_high:.2f} (pos.) | "
         f"discarded: [{lift_independence_low:.2f}, {lift_independence_high:.2f}]"
     )
     subtitle = "   ·   ".join(parts)
 
-    # ── Heatmap 1: Support × Confidence ──────────────────────────────────────
+    # ── Heatmap 1: Support × Confidence (grid thresholds, from grid_summary) ──
     if not grid_summary.empty:
+        # Use the actual column names regardless of whether they come from
+        # grid_summary (min_support/min_confidence) or from a rules CSV that
+        # was already renamed (grid_min_support/grid_min_confidence).
+        sup_col  = "min_support"    if "min_support"    in grid_summary.columns else "grid_min_support"
+        conf_col = "min_confidence" if "min_confidence" in grid_summary.columns else "grid_min_confidence"
+
         pivot_sc = grid_summary.pivot_table(
-            index="min_support",
-            columns="min_confidence",
+            index=sup_col,
+            columns=conf_col,
             values="n_rules",
             aggfunc="sum",
             fill_value=0,
         )
-        pivot_sc.index   = [f"{v:.2f}" for v in pivot_sc.index]
-        pivot_sc.columns = [f"{v:.2f}" for v in pivot_sc.columns]
-        pivot_sc.index.name   = "min_support"
-        pivot_sc.columns.name = "min_confidence"
+        pivot_sc.index   = [f"{v:.3f}" for v in pivot_sc.index]
+        pivot_sc.columns = [f"{v:.3f}" for v in pivot_sc.columns]
+        pivot_sc.index.name   = "min_support (threshold)"
+        pivot_sc.columns.name = "min_confidence (threshold)"
 
         _make_heatmap(
             pivot=pivot_sc,
-            title=f"Rules by Support × Confidence  ({k_label})",
+            title=f"Rules found per (min_support, min_confidence) threshold  [{k_label}]",
             subtitle=subtitle,
-            xlabel="min_confidence",
-            ylabel="min_support",
+            xlabel="min_confidence threshold",
+            ylabel="min_support threshold",
             save_path=heatmap_dir / f"heatmap_support_confidence{suffix}.png",
         )
 
-    # ── Heatmap 2 & 3 require actual lift values ──────────────────────────────
+    # ── Heatmaps 2 & 3 use actual rule metric values ──────────────────────────
     if all_rules.empty or "lift" not in all_rules.columns:
-        logger.info(
-            "    No rules with lift values available — skipping lift heatmaps."
-        )
+        logger.info("    No rules with lift values — skipping lift heatmaps.")
+        return
+
+    # Detect renamed columns (rules may come from a post-format DataFrame).
+    sup_col_r  = "support"
+    conf_col_r = "confidence"
+    if sup_col_r not in all_rules.columns or conf_col_r not in all_rules.columns:
+        logger.info("    Missing support/confidence columns — skipping lift heatmaps.")
         return
 
     lift_edges, lift_labels = _lift_bins(
         all_rules, lift_independence_low, lift_independence_high
     )
+
+    def _bin_axis(series: pd.Series, n_bins: int = 20) -> tuple[list[str], pd.Series]:
+        """Bin a continuous series into n_bins equal-width bins, return labels and binned series."""
+        lo, hi = float(series.min()), float(series.max())
+        if lo == hi:
+            edges = np.array([lo - 0.01, hi + 0.01])
+        else:
+            edges = np.linspace(lo, hi, n_bins + 1)
+        edges = np.round(edges, 4)
+        labels = [f"{edges[i]:.3f}–{edges[i+1]:.3f}" for i in range(len(edges) - 1)]
+        binned = pd.cut(series, bins=edges, labels=labels,
+                        include_lowest=True).astype(str)
+        return labels, binned
+
     rules_work = all_rules.copy()
+
+    # Bin the lift axis (shared across heatmaps 2 and 3).
     rules_work["lift_bin"] = pd.cut(
         rules_work["lift"],
         bins=lift_edges,
@@ -1007,63 +1062,55 @@ def generate_heatmaps(
         include_lowest=True,
     ).astype(str)
 
-    # ── Heatmap 2: Support × Lift ─────────────────────────────────────────────
-    if "grid_support" in rules_work.columns:
-        rules_work["sup_label"] = rules_work["grid_support"].apply(
-            lambda v: f"{v:.2f}"
-        )
-        sup_levels = sorted(rules_work["sup_label"].unique())
+    # ── Heatmap 2: Support × Lift (actual values) ─────────────────────────────
+    sup_labels, rules_work["sup_bin"] = _bin_axis(rules_work[sup_col_r])
 
-        pivot_sl = (
-            rules_work.groupby(["sup_label", "lift_bin"], observed=True)
-            .size()
-            .unstack(fill_value=0)
-            .reindex(index=sup_levels, fill_value=0)
-            .reindex(columns=lift_labels, fill_value=0)
-        )
-        pivot_sl.index.name   = "min_support"
-        pivot_sl.columns.name = "lift_bin"
+    pivot_sl = (
+        rules_work.groupby(["sup_bin", "lift_bin"], observed=True)
+        .size()
+        .unstack(fill_value=0)
+        .reindex(index=sup_labels,  fill_value=0)
+        .reindex(columns=lift_labels, fill_value=0)
+    )
+    pivot_sl.index.name   = "support (actual)"
+    pivot_sl.columns.name = "lift (actual)"
 
-        _make_heatmap(
-            pivot=pivot_sl,
-            title=f"Rules by Support × Lift  ({k_label})",
-            subtitle=subtitle,
-            xlabel="lift bin",
-            ylabel="min_support",
-            save_path=heatmap_dir / f"heatmap_support_lift{suffix}.png",
-            lift_independence_low=lift_independence_low,
-            lift_independence_high=lift_independence_high,
-            lift_axis="x",
-        )
+    _make_heatmap(
+        pivot=pivot_sl,
+        title=f"Rules by actual Support × Lift  [{k_label}]",
+        subtitle=subtitle,
+        xlabel="lift (actual value, binned)",
+        ylabel="support (actual value, binned)",
+        save_path=heatmap_dir / f"heatmap_support_lift{suffix}.png",
+        lift_independence_low=lift_independence_low,
+        lift_independence_high=lift_independence_high,
+        lift_axis="x",
+    )
 
-    # ── Heatmap 3: Confidence × Lift ──────────────────────────────────────────
-    if "grid_confidence" in rules_work.columns:
-        rules_work["conf_label"] = rules_work["grid_confidence"].apply(
-            lambda v: f"{v:.2f}"
-        )
-        conf_levels = sorted(rules_work["conf_label"].unique())
+    # ── Heatmap 3: Confidence × Lift (actual values) ──────────────────────────
+    conf_labels, rules_work["conf_bin"] = _bin_axis(rules_work[conf_col_r])
 
-        pivot_cl = (
-            rules_work.groupby(["conf_label", "lift_bin"], observed=True)
-            .size()
-            .unstack(fill_value=0)
-            .reindex(index=conf_levels, fill_value=0)
-            .reindex(columns=lift_labels, fill_value=0)
-        )
-        pivot_cl.index.name   = "min_confidence"
-        pivot_cl.columns.name = "lift_bin"
+    pivot_cl = (
+        rules_work.groupby(["conf_bin", "lift_bin"], observed=True)
+        .size()
+        .unstack(fill_value=0)
+        .reindex(index=conf_labels,  fill_value=0)
+        .reindex(columns=lift_labels, fill_value=0)
+    )
+    pivot_cl.index.name   = "confidence (actual)"
+    pivot_cl.columns.name = "lift (actual)"
 
-        _make_heatmap(
-            pivot=pivot_cl,
-            title=f"Rules by Confidence × Lift  ({k_label})",
-            subtitle=subtitle,
-            xlabel="lift bin",
-            ylabel="min_confidence",
-            save_path=heatmap_dir / f"heatmap_confidence_lift{suffix}.png",
-            lift_independence_low=lift_independence_low,
-            lift_independence_high=lift_independence_high,
-            lift_axis="x",
-        )
+    _make_heatmap(
+        pivot=pivot_cl,
+        title=f"Rules by actual Confidence × Lift  [{k_label}]",
+        subtitle=subtitle,
+        xlabel="lift (actual value, binned)",
+        ylabel="confidence (actual value, binned)",
+        save_path=heatmap_dir / f"heatmap_confidence_lift{suffix}.png",
+        lift_independence_low=lift_independence_low,
+        lift_independence_high=lift_independence_high,
+        lift_axis="x",
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1099,15 +1146,91 @@ def _format_rules_for_csv(
     rules_df: pd.DataFrame,
     lift_independence_low: float  = DEFAULT_LIFT_INDEPENDENCE_LOW,
     lift_independence_high: float = DEFAULT_LIFT_INDEPENDENCE_HIGH,
+    min_support: Optional[float]    = None,
+    max_support: Optional[float]    = None,
+    min_confidence: Optional[float] = None,
+    max_confidence: Optional[float] = None,
 ) -> pd.DataFrame:
-    """Convert frozenset columns to readable strings and add lift_type."""
+    """
+    Prepare the rules DataFrame for CSV output.
+
+    Column layout (in order)
+    ────────────────────────
+    antecedents          — feature label(s) in the antecedent (human-readable)
+    consequents          — feature label(s) in the consequent
+    antecedent support   — P(antecedent)
+    consequent support   — P(consequent)
+    support              — P(antecedent ∪ consequent)  [actual rule metric]
+    confidence           — P(consequent | antecedent)  [actual rule metric]
+    lift                 — observed / expected co-occurrence [actual rule metric]
+    leverage             — P(A∪C) - P(A)·P(C)
+    conviction           — (1 - P(C)) / (1 - confidence)
+    lift_type            — "positive_correlation" or "negative_correlation"
+    grid_min_support     — min_support threshold at which this rule was found
+    grid_min_confidence  — min_confidence threshold at which this rule was found
+    filter_min_support   — global lower bound of the support grid
+    filter_max_support   — global upper bound of the support grid
+    filter_min_confidence — global lower bound of the confidence grid
+    filter_max_confidence — global upper bound of the confidence grid
+    filter_lift_kept_below   — lift < this → kept (negative correlation)
+    filter_lift_kept_above   — lift > this → kept (positive correlation)
+    filter_lift_discarded    — interval [low, high] that was discarded
+    k_value              — k value (present only in per-k files)
+
+    Columns dropped (not requested)
+    ────────────────────────────────
+    zhangs_metric, jaccard, certainty, kulczynski, representativity
+    """
     df = rules_df.copy()
+
+    # ── Convert frozenset columns to readable strings ─────────────────────────
     for col in ("antecedents", "consequents"):
         if col in df.columns:
             df[col] = df[col].apply(
                 lambda x: " & ".join(sorted(x)) if isinstance(x, frozenset) else str(x)
             )
+
+    # ── Add lift_type ─────────────────────────────────────────────────────────
     df = _annotate_lift_type(df, lift_independence_low, lift_independence_high)
+
+    # ── Rename grid annotation columns to be self-explanatory ────────────────
+    df = df.rename(columns={
+        "grid_support":    "grid_min_support",
+        "grid_confidence": "grid_min_confidence",
+    })
+
+    # ── Add global filter thresholds as per-row columns ──────────────────────
+    if min_support    is not None: df["filter_min_support"]    = min_support
+    if max_support    is not None: df["filter_max_support"]    = max_support
+    if min_confidence is not None: df["filter_min_confidence"] = min_confidence
+    if max_confidence is not None: df["filter_max_confidence"] = max_confidence
+    df["filter_lift_kept_below"]  = lift_independence_low
+    df["filter_lift_kept_above"]  = lift_independence_high
+    df["filter_lift_discarded"]   = f"[{lift_independence_low}, {lift_independence_high}]"
+
+    # ── Drop columns that are not needed ─────────────────────────────────────
+    _DROP = {
+        "zhangs_metric",
+        "jaccard", "certainty", "kulczynski", "representativity",
+    }
+    df = df.drop(columns=[c for c in _DROP if c in df.columns])
+
+    # ── Enforce canonical column order ────────────────────────────────────────
+    _ORDERED = [
+        "k_value",
+        "antecedents", "consequents",
+        "antecedent support", "consequent support",
+        "support", "confidence", "lift", "leverage", "conviction", "lift_type",
+        "grid_min_support", "grid_min_confidence",
+        "filter_min_support", "filter_max_support",
+        "filter_min_confidence", "filter_max_confidence",
+        "filter_lift_kept_below", "filter_lift_kept_above",
+        "filter_lift_discarded",
+    ]
+    present = [c for c in _ORDERED if c in df.columns]
+    extra   = [c for c in df.columns if c not in present]
+    df = df[present + extra]
+
     return df
 
 
@@ -1126,23 +1249,32 @@ def _save_rules(
     """
     Write arm_rules and arm_grid_summary CSVs to dest_dir.
 
-    Rules CSV extras
-    ────────────────
-    • ``lift_type``  — "positive_correlation" or "negative_correlation", making
-      it immediately clear which kind of relationship each rule represents and
-      that only non-independent rules are present.
+    Rules CSV
+    ─────────
+    Each row contains the actual rule metrics (support, confidence, lift),
+    antecedent/consequent supports, lift_type, the grid thresholds at which
+    the rule was found (grid_min_support, grid_min_confidence), and the global
+    filter bounds — making every row fully self-describing.
+    Columns not requested (zhangs_metric, jaccard, certainty,
+    kulczynski, representativity) are dropped.
 
-    Grid summary CSV extras
-    ───────────────────────
-    • ``filter_*`` columns record the exact thresholds that were active when
-      the grid was computed, so the file is fully self-describing.
+    Grid summary CSV
+    ────────────────
+    One row per (min_support, min_confidence) grid cell with n_rules count
+    plus the global filter parameters as extra columns.
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
     rules_path   = dest_dir / f"{filename_stem}_rules.csv"
     summary_path = dest_dir / f"{filename_stem}_grid_summary.csv"
 
     rules_csv = _format_rules_for_csv(
-        all_rules, lift_independence_low, lift_independence_high
+        all_rules,
+        lift_independence_low=lift_independence_low,
+        lift_independence_high=lift_independence_high,
+        min_support=min_support,
+        max_support=max_support,
+        min_confidence=min_confidence,
+        max_confidence=max_confidence,
     )
     rules_csv.to_csv(rules_path, index=False)
     logger.info("    Rules   → %s  (%d rows)", rules_path.name, len(rules_csv))
@@ -1154,9 +1286,7 @@ def _save_rules(
     if max_confidence is not None: gs["filter_max_confidence"] = max_confidence
     gs["filter_lift_kept_below"]  = lift_independence_low
     gs["filter_lift_kept_above"]  = lift_independence_high
-    gs["filter_lift_discarded_interval"] = (
-        f"[{lift_independence_low}, {lift_independence_high}]"
-    )
+    gs["filter_lift_discarded"]   = f"[{lift_independence_low}, {lift_independence_high}]"
     gs.to_csv(summary_path, index=False)
     logger.info("    Summary → %s  (%d cells)", summary_path.name, len(grid_summary))
 
@@ -1301,8 +1431,8 @@ def run_macroscopic_mining(
     logger.info("  Workers                : %d", n_workers)
     logger.info("═" * 62)
 
-    # ── Move stage-2 files into feature_importance/ ───────────────────────────
-    _move_feature_importance_files(output_dir)
+    # Ensure the feature_importance sub-folder exists.
+    _feature_imp_dir(output_dir)
 
     orig_classes_requested = sorted(set(original_class))
     suffix_map = {
@@ -1474,6 +1604,9 @@ def run_macroscopic_mining(
             min_support=min_support, max_support=max_support,
             min_confidence=min_confidence, max_confidence=max_confidence,
         )
+
+    # ── Move stage-2 files into feature_importance/ now that all reads are done ─
+    _move_feature_importance_files(output_dir)
 
     logger.info("═" * 62)
     logger.info("  Stage 3 (ARM) completed.")
