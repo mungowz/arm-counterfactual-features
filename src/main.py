@@ -1,24 +1,46 @@
 """
 src/main.py
 ───────────
-Command-line entry point for the ACS Income pipeline — stage 1: dataset creation.
+Command-line entry point for the ACS Income pipeline.
+
+This file orchestrates both pipeline stages:
+
+  Stage 1 — dataset creation  (src/create_dataset.py)
+    Downloads ACS PUMS data via folktables, decodes categorical features,
+    discretises continuous variables, and writes train/test CSV files.
+    When --states is a group name (e.g. northeast) the group name is used
+    in the output filename instead of the individual state codes.
+
+  Stage 2 — feature importance  (src/feature_importance.py)
+    Trains a CatBoost classifier on the stage-1 output and computes global
+    feature importance using the BoCSoR algorithm (Alfeo et al., 2023).
+    Results are saved under <output-dir>/<states_tag>/<years_tag>/.
 
 Usage
 ─────
 From the project root:
     python -m src.main [OPTIONS]
 
-Or directly:
-    python src/main.py [OPTIONS]
-
 Examples
 ────────
-    python -m src.main
-    python -m src.main --states northeast --years 2024
-    python -m src.main --states south --threshold 75000
-    python -m src.main --states CA NY TX --columns COW SCHL MAR SEX RAC1P
-    python -m src.main --states ALL --columns ALL
-    python -m src.main --years 2021 2022 2023 2024 --states midwest
+    # Stage 1 only
+    python -m src.main --steps 1 --states northeast --years 2024 --test-size 0.2
+
+    # Both stages end-to-end
+    python -m src.main --steps 1 2 --states northeast --years 2024 --test-size 0.2
+
+    # Both stages, all feature columns, custom BoCSoR settings
+    python -m src.main --steps 1 2 --states CA NY TX --columns ALL \\
+                        --test-size 0.2 --k 11 --percentile 20
+
+    # Stage 2 only on an existing dataset (paths inferred automatically)
+    python -m src.main --steps 2 --states northeast --years 2024
+
+    # Stage 2 only with explicit file paths
+    python -m src.main --steps 2 \\
+        --train data/train_2024_northeast_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv \\
+        --test  data/test_2024_northeast_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv
+
     python -m src.main --help
 """
 
@@ -26,10 +48,13 @@ from __future__ import annotations
 
 import argparse
 import logging
+import multiprocessing
 import os
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
+
+import numpy as np
 
 _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
@@ -54,9 +79,9 @@ _DEFAULT_YEAR_WORKERS = min(4, os.cpu_count() or 2)
 logger = logging.getLogger("src.main")
 
 
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # Argument resolution helpers
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 def resolve_states(raw: list[str], horizon: str) -> list[str] | None:
     """
@@ -80,7 +105,7 @@ def resolve_states(raw: list[str], horizon: str) -> list[str] | None:
     Raises
     ------
     ValueError
-        On unrecognized state codes, mixed group/code input, or Alaska
+        On unrecognised state codes, mixed group/code input, or Alaska
         with an incompatible horizon.
     """
     if raw == ["ALL"]:
@@ -101,7 +126,7 @@ def resolve_states(raw: list[str], horizon: str) -> list[str] | None:
         invalid    = [s for s in normalized if s not in _ALL_STATE_CODES]
         if invalid:
             raise ValueError(
-                f"Unrecognized state codes: {invalid}.\n"
+                f"Unrecognised state codes: {invalid}.\n"
                 f"Available groups: {sorted(STATE_GROUPS)}.\n"
                 f"Valid state codes: {sorted(_ALL_STATE_CODES)}."
             )
@@ -146,9 +171,9 @@ def resolve_columns(raw: list[str] | None) -> list[str] | None:
     return raw
 
 
-# ─────────────────────────────────────────────────────────────
-# Multi-year process worker
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-year process worker  (stage 1)
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _process_year(
     year: int,
@@ -161,6 +186,7 @@ def _process_year(
     data_dir: Path,
     keep_columns: list[str] | None,
     log_level: str,
+    states_label: str | None = None,
 ) -> tuple[int, int, int]:
     """
     Worker function executed in a separate process for a single survey year.
@@ -187,13 +213,180 @@ def _process_year(
         random_seed=random_seed,
         data_dir=data_dir,
         keep_columns=keep_columns,
+        states_label=states_label,
     )
     return year, len(train_df), len(test_df)
 
 
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 2 runner
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _run_feature_importance(
+    train_path: Path,
+    test_path: Path,
+    output_dir: Path,
+    k: list[int],
+    percentile: float,
+    cb_iterations: int,
+    cb_lr: float,
+    cb_depth: int,
+    cb_verbose: bool,
+    cb_early_stopping: int,
+    original_class: list[int],
+    n_workers: int,
+    random_seed: int,
+    log_level: str,
+) -> None:
+    """
+    Invoke stage 2 (BoCSoR feature importance) programmatically.
+
+    Called after stage 1 completes when --steps 1 2 is used, or directly
+    when --steps 2 is used with explicit --train / --test paths.
+
+    Parameters
+    ----------
+    train_path           : Path to the train CSV produced by stage 1.
+    test_path            : Path to the test CSV produced by stage 1.
+    output_dir           : Directory where BoCSoR results will be written.
+    k                    : Raw list from --k (e.g. [11] or [1, 5, 11]).
+                           Passed to expand_k(): single value K is auto-expanded
+                           to all odd integers 1..K; multiple values used as-is.
+    percentile           : Percentile threshold for boundary instance selection.
+    cb_iterations        : CatBoost boosting rounds.
+    cb_lr                : CatBoost learning rate.
+    cb_depth             : CatBoost tree depth.
+    cb_verbose           : Whether CatBoost prints training progress.
+    cb_early_stopping    : Stop training if validation loss does not improve
+                           for this many rounds (0 = disabled).
+    original_class       : List of classes to explain ([0], [1], or [0, 1]).
+    random_seed          : Random seed for CatBoost.
+    log_level            : Logging level string (e.g. "INFO").
+    """
+    # Lazy import to keep stage-1-only runs free of catboost/sklearn overhead.
+    from src.feature_importance import (
+        load_split_data,
+        build_rank_maps,
+        train_catboost,
+        run_bocsor_multi_k,
+        expand_k,
+    )
+
+    k_values = expand_k(k)
+
+    logger.info("═" * 62)
+    logger.info("  ACS INCOME PIPELINE  —  stage 2: feature importance (BoCSoR)")
+    logger.info("═" * 62)
+    logger.info("  k values             : %s  (from --k %s)", k_values, k)
+    logger.info("  Percentile threshold : %.1f%%", percentile)
+    logger.info("  Output directory     : %s", output_dir.resolve())
+    logger.info("═" * 62)
+
+    X_train, X_test, y_train, y_test, target_col = load_split_data(
+        train_path=train_path,
+        test_path=test_path,
+        dataset_path=None,
+        random_seed=random_seed,
+    )
+    feature_cols = list(X_train.columns)
+    logger.info("Train: %d rows  |  Test: %d rows  |  Features: %d",
+                len(X_train), len(X_test), len(feature_cols))
+    logger.info("Target: %s  |  Features: %s", target_col, feature_cols)
+
+    logger.info("Building rank maps from training data …")
+    rank_maps = build_rank_maps(X_train)
+
+    model = train_catboost(
+        X_train=X_train,
+        y_train=y_train,
+        cat_features=feature_cols,
+        random_seed=random_seed,
+        iterations=cb_iterations,
+        learning_rate=cb_lr,
+        depth=cb_depth,
+        verbose=cb_verbose,
+        early_stopping_rounds=cb_early_stopping if cb_early_stopping > 0 else None,
+    )
+    y_pred_test  = model.predict(X_test).astype(int).ravel()
+    y_pred_train = model.predict(X_train).astype(int).ravel()
+    test_acc  = (y_pred_test  == y_test.values).mean()
+    train_acc = (y_pred_train == y_train.values).mean()
+    logger.info("CatBoost accuracy — train: %.4f  |  test: %.4f", train_acc, test_acc)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Skip classes whose output files already exist.
+    orig_classes_requested = sorted(set(original_class))
+    suffix_map = {
+        c: (f"_class{c}" if len(orig_classes_requested) > 1 else "")
+        for c in orig_classes_requested
+    }
+    orig_classes_todo = [
+        c for c in orig_classes_requested
+        if not (output_dir / f"feature_importance{suffix_map[c]}.csv").exists()
+    ]
+    if not orig_classes_todo:
+        logger.info(
+            "Skipping stage 2: all output files already exist in %s.",
+            output_dir.resolve(),
+        )
+        return
+    skipped = set(orig_classes_requested) - set(orig_classes_todo)
+    if skipped:
+        logger.info("Skipping class(es) %s: output already exists.", sorted(skipped))
+
+    orig_classes = orig_classes_todo
+    for orig_cls in orig_classes:
+        cf_cls = 1 - orig_cls
+        suffix = f"_class{orig_cls}" if len(orig_classes) > 1 else ""
+
+        logger.info(
+            "== BoCSoR: class %d boundary (counterfactual class %d) ==",
+            orig_cls, cf_cls,
+        )
+        all_itemsets_df, importance_df, per_k_itemsets = run_bocsor_multi_k(
+            model=model,
+            X_train=X_train,
+            y_train=y_train,
+            y_pred_train=y_pred_train,
+            rank_maps=rank_maps,
+            feature_cols=feature_cols,
+            k_values=k_values,
+            percentile_th=percentile,
+            original_class=orig_cls,
+            cf_class=cf_cls,
+            n_workers=n_workers,
+        )
+
+        itemsets_path = output_dir / f"feature_importance_itemsets{suffix}.csv"
+        all_itemsets_df.to_csv(itemsets_path, index=False)
+        logger.info("Itemsets (all k) -> %s  (%d rows)", itemsets_path, len(all_itemsets_df))
+
+        for k_val, k_df in per_k_itemsets.items():
+            k_path = output_dir / f"feature_importance_itemsets_k{k_val}{suffix}.csv"
+            k_df.to_csv(k_path, index=False)
+            logger.info("  k=%d -> %s  (%d rows)", k_val, k_path.name, len(k_df))
+
+        imp_path = output_dir / f"feature_importance{suffix}.csv"
+        importance_df.reset_index().to_csv(imp_path, index=False)
+        logger.info("Importance -> %s", imp_path)
+
+        logger.info("Feature importance summary (class %d):", orig_cls)
+        for k_col in importance_df.columns:
+            top = importance_df[k_col].sort_values(ascending=False)
+            logger.info("  %s:", k_col)
+            for feat, score in top.items():
+                logger.info("    %-40s %.4f", feat, score)
+
+    logger.info("═" * 62)
+    logger.info("  Stage 2 completed successfully.")
+    logger.info("  Outputs in: %s", output_dir.resolve())
+    logger.info("═" * 62)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Argument parser
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
     groups_str = ", ".join(sorted(STATE_GROUPS))
@@ -201,7 +394,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
         prog="python -m src.main",
-        description="ACS Income pipeline — stage 1: dataset creation",
+        description="ACS Income pipeline — stage 1 (dataset creation) and/or stage 2 (BoCSoR feature importance)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""
 Predefined state groups:
@@ -211,14 +404,50 @@ Available feature columns (--columns):
   {cols_str}
   or: ALL  (retain every feature column)
 
+Pipeline modes:
+  --steps 1         Run stage 1 only (dataset creation).  Default.
+  --steps 2         Run stage 2 only (BoCSoR).  Paths inferred from ACS
+                    parameters, or supply --train/--test explicitly.
+  --steps 1 2       Both stages end-to-end.  Requires --test-size > 0.
+
 Examples:
-  python -m src.main --states northeast --years 2024
-  python -m src.main --states CA NY TX --threshold 75000 --columns COW SCHL MAR
-  python -m src.main --states ALL --columns ALL --years 2023 2024
+  # Stage 1 only
+  python -m src.main --steps 1 --states northeast --years 2024 --test-size 0.2
+
+  # Both stages end-to-end
+  python -m src.main --steps 1 2 --states northeast --years 2024 --test-size 0.2
+
+  # Both stages, all features, custom BoCSoR settings
+  python -m src.main --steps 1 2 --states CA NY TX --columns ALL \\
+                      --test-size 0.2 --k 11 --percentile 20
+
+  # Stage 2 only — paths inferred automatically from ACS parameters
+  python -m src.main --steps 2 --states northeast --years 2024 --k 11
+
+  # Stage 2 only — explicit file paths
+  python -m src.main --steps 2 \\
+      --train data/train_2024_northeast_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv \\
+      --test  data/test_2024_northeast_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv \\
+      --k 11 --output-dir results/xai/
         """,
     )
 
-    acs = parser.add_argument_group("ACS parameters")
+    # ── Pipeline mode ─────────────────────────────────────────────────────────
+    mode = parser.add_argument_group("Pipeline mode")
+    mode.add_argument(
+        "--steps", nargs="+", type=int, choices=[1, 2], default=[1],
+        metavar="STEP",
+        help=(
+            "Pipeline step(s) to run.  "
+            "1 = dataset creation only.  "
+            "2 = BoCSoR feature importance only (requires --train and --test).  "
+            "1 2 = both stages end-to-end (requires --test-size > 0).  "
+            "Default: 1."
+        ),
+    )
+
+    # ── ACS parameters (stage 1) ──────────────────────────────────────────────
+    acs = parser.add_argument_group("ACS parameters  (stage 1)")
     acs.add_argument(
         "--years", nargs="+", type=int, default=[2024], metavar="YEAR",
         help="Survey year(s) in the range 2014–2024.  Default: 2024.",
@@ -242,7 +471,8 @@ Examples:
         ),
     )
 
-    task = parser.add_argument_group("Task parameters")
+    # ── Task parameters (stage 1) ─────────────────────────────────────────────
+    task = parser.add_argument_group("Task parameters  (stage 1)")
     task.add_argument(
         "--threshold", type=float, default=100_000.0, metavar="DOLLARS",
         help=(
@@ -251,7 +481,8 @@ Examples:
         ),
     )
 
-    cols = parser.add_argument_group("Output column selection")
+    # ── Output column selection (stage 1) ─────────────────────────────────────
+    cols = parser.add_argument_group("Output column selection  (stage 1)")
     cols.add_argument(
         "--columns", nargs="+", default=None, metavar="COL",
         help=(
@@ -261,29 +492,105 @@ Examples:
         ),
     )
 
-    split = parser.add_argument_group("Train / test split")
+    # ── Train / test split (stage 1) ──────────────────────────────────────────
+    split = parser.add_argument_group("Train / test split  (stage 1)")
     split.add_argument(
         "--test-size", type=float, default=0.0, metavar="FRACTION",
         help=(
             "Fraction of the dataset reserved for the test split (0.0–1.0).  "
-            "0.0 produces a single dataset_*.csv with no split.  Default: 0.0."
+            "0.0 produces a single dataset_*.csv with no split.  "
+            "Must be > 0 when using --steps 1 2.  Default: 0.0."
         ),
     )
     split.add_argument(
         "--seed", type=int, default=42,
-        help="Random seed for the stratified split.  Default: 42.",
+        help="Random seed for the stratified split and CatBoost.  Default: 42.",
     )
 
+    # ── Input / output ────────────────────────────────────────────────────────
     io = parser.add_argument_group("Input / output")
     io.add_argument(
         "--data-dir", type=Path, default=Path("data"), metavar="DIR",
         help=(
-            "Root output directory.  Raw PUMS files → <dir>/raw/.  "
+            "Root output directory for stage 1.  Raw PUMS files → <dir>/raw/.  "
             "Processed CSVs → <dir>/.  Default: data/."
         ),
     )
+    io.add_argument(
+        "--output-dir", type=Path, default=Path("results"), metavar="DIR",
+        help=(
+            "Output directory for stage 2 results (feature importance CSVs "
+            "and itemset CSVs).  Created if absent.  Default: results/."
+        ),
+    )
+    io.add_argument(
+        "--train", type=Path, default=None, metavar="CSV",
+        help=(
+            "Path to an existing train CSV.  Required with --steps 2.  "
+            "Ignored otherwise (stage 1 infers the path automatically)."
+        ),
+    )
+    io.add_argument(
+        "--test", type=Path, default=None, metavar="CSV",
+        help=(
+            "Path to an existing test CSV.  Required with --steps 2.  "
+            "Ignored otherwise (stage 1 infers the path automatically)."
+        ),
+    )
 
-    perf = parser.add_argument_group("Performance")
+    # ── BoCSoR hyperparameters (stage 2) ──────────────────────────────────────
+    boc = parser.add_argument_group("BoCSoR hyperparameters  (stage 2)")
+    boc.add_argument(
+        "--k", nargs="+", type=int, default=[11], metavar="K",
+        help=(
+            "Neighbourhood size(s) for the counterfactual search.  "
+            "A single value K is auto-expanded to all odd integers 1..K "
+            "(e.g. --k 11 -> 1 3 5 7 9 11).  "
+            "Multiple values are used as-is (e.g. --k 1 5 11).  "
+            "Values must be >= 1.  Default: 11."
+        ),
+    )
+    boc.add_argument(
+        "--percentile", type=float, default=20.0, metavar="PCT",
+        help=(
+            "Percentile threshold for boundary instance selection (0–100).  "
+            "Instances whose distance to the nearest opposite-class instance "
+            "is below this percentile are treated as boundary instances.  "
+            "Default: 20."
+        ),
+    )
+    boc.add_argument(
+        "--original-class", nargs="+", type=int, default=[0],
+        choices=[0, 1], metavar="C",
+        help=(
+            "Class(es) whose boundary instances to explain.  "
+            "0 = income <= threshold (default).  "
+            "1 = income > threshold.  "
+            "0 1 = both (produces separate output files per class).  "
+            "Default: 0."
+        ),
+    )
+
+    # ── CatBoost hyperparameters (stage 2) ────────────────────────────────────
+    cb = parser.add_argument_group("CatBoost hyperparameters  (stage 2)")
+    cb.add_argument("--cb-iterations", type=int,   default=500,  metavar="N",
+                    help="Boosting rounds.  Default: 500.")
+    cb.add_argument("--cb-lr",         type=float, default=0.05, metavar="LR",
+                    help="Learning rate.  Default: 0.05.")
+    cb.add_argument("--cb-depth",      type=int,   default=6,    metavar="D",
+                    help="Tree depth.  Default: 6.")
+    cb.add_argument("--cb-early-stopping", type=int, default=0, metavar="N",
+                    help=(
+                        "Stop training if the loss does not improve for N consecutive "
+                        "rounds (early stopping).  0 disables early stopping.  "
+                        "When enabled, 20%% of the training set is used as an internal "
+                        "validation split.  Default: 0 (disabled)."
+                    ))
+    cb.add_argument("--cb-verbose",    action="store_true",
+                    help="Print CatBoost training progress.")
+
+    # ── Performance (stage 1) ─────────────────────────────────────────────────
+    perf = parser.add_argument_group("Performance  (stage 1)")
     perf.add_argument(
         "--workers", type=int, default=_DEFAULT_YEAR_WORKERS, metavar="N",
         help=(
@@ -304,11 +611,146 @@ Examples:
     return parser
 
 
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers: infer stage-1 output paths
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _infer_split_paths(
+    data_dir: Path,
+    year: int,
+    states: list[str] | None,
+    threshold: float,
+    horizon: str,
+    survey: str,
+    keep_columns: list[str] | None,
+    states_label: str | None = None,
+) -> tuple[Path, Path]:
+    """
+    Reconstruct the train/test file paths that create_dataset writes.
+
+    The naming convention exactly mirrors create_dataset.py (step 8):
+
+        {prefix}_{year}_{states_tag}_{horizon_tag}_{survey}_thr{threshold}_cols{cols_tag}.csv
+
+    Mirrors the naming convention in create_dataset.py step 8.
+    When states_label is provided it is used in place of the sorted
+    state codes (e.g. 'northeast' instead of 'CT_MA_ME_NH_NJ_NY_PA_RI_VT').
+
+    Examples
+    --------
+        train_2024_NY_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv
+        train_2024_northeast_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv
+        test_2024_ALL_1Y_person_thr75000_colsALL.csv
+
+    Parameters
+    ----------
+    data_dir     : Root output directory passed to create_dataset.
+    year         : Survey year.
+    states       : Expanded state codes, or None for all states.
+    threshold    : Income threshold.
+    horizon      : Survey horizon ("1-Year" or "5-Year").
+    survey       : Survey unit ("person" or "household").
+    keep_columns : Feature columns retained (None means ALL).
+    states_label : Group name to use in the filename instead of state codes.
+    """
+    if states_label is not None:
+        states_tag = states_label
+    elif states is None:
+        states_tag = "ALL"
+    else:
+        states_tag = "_".join(sorted(states))
+    horizon_tag = horizon.replace("-", "").replace("Year", "Y")   # "1-Year" -> "1Y"
+    cols_tag    = "-".join(keep_columns) if keep_columns else "ALL"
+    stem = (
+        f"{year}_{states_tag}"
+        f"_{horizon_tag}_{survey}"
+        f"_thr{int(threshold)}"
+        f"_cols{cols_tag}"
+    )
+    return data_dir / f"train_{stem}.csv", data_dir / f"test_{stem}.csv"
+
+
+def _build_output_dir(
+    base_dir: Path,
+    states: list[str] | None,
+    raw_states_arg: list[str],
+    years: list[int],
+) -> Path:
+    """
+    Build the stage-2 output directory path, embedding the state scope and
+    the year range so that results from different runs never mix.
+
+    Directory structure
+    -------------------
+        <base_dir>/<states_tag>/<years_tag>/
+
+    <states_tag> rules
+    ------------------
+    - If the raw --states argument was a recognised group name (e.g.
+      "northeast", "midwest") the group name is used as-is.
+    - If ALL states are requested the tag is "ALL".
+    - Otherwise the state codes are sorted and joined by "_"
+      (e.g. "CA_NY_TX").
+
+    <years_tag> rules
+    -----------------
+    - Single year  → the year itself (e.g. "2024").
+    - Contiguous range → "<first>-<last>" (e.g. "2021-2024").
+    - Non-contiguous   → all years joined by "_" (e.g. "2021_2023").
+
+    Examples
+    --------
+        results/northeast/2024/
+        results/ALL/2021-2024/
+        results/CA_NY_TX/2024/
+        results/midwest/2021_2023/
+    """
+    # ── States tag ────────────────────────────────────────────────────────────
+    if raw_states_arg == ["ALL"] or states is None:
+        states_tag = "ALL"
+    elif (len(raw_states_arg) == 1
+          and raw_states_arg[0].lower() in STATE_GROUPS):
+        # Preserve the group name exactly as typed by the user.
+        states_tag = raw_states_arg[0].lower()
+    else:
+        states_tag = "_".join(sorted(states))
+
+    # ── Years tag ─────────────────────────────────────────────────────────────
+    sorted_years = sorted(years)
+    if len(sorted_years) == 1:
+        years_tag = str(sorted_years[0])
+    elif sorted_years == list(range(sorted_years[0], sorted_years[-1] + 1)):
+        # Contiguous range.
+        years_tag = f"{sorted_years[0]}-{sorted_years[-1]}"
+    else:
+        years_tag = "_".join(str(y) for y in sorted_years)
+
+    return base_dir / states_tag / years_tag
+
+
+def _resolve_states_label(raw_states_arg: list[str]) -> str | None:
+    """
+    Return a short label for the states scope used in filenames.
+
+    If the raw --states argument is a recognised group/region/division name
+    that label is returned as-is (e.g. "northeast").  If "ALL" is passed,
+    None is returned so create_dataset uses "ALL".  For individual state
+    codes None is returned so the codes are used directly.
+    """
+    if raw_states_arg == ["ALL"]:
+        return None
+    if (len(raw_states_arg) == 1
+            and raw_states_arg[0].lower() in STATE_GROUPS):
+        return raw_states_arg[0].lower()
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Entry point
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    multiprocessing.set_start_method("fork", force=True)
     parser = build_parser()
     args   = parser.parse_args()
 
@@ -318,48 +760,159 @@ def main() -> None:
         datefmt="%H:%M:%S",
     )
 
-    # ── Argument validation ───────────────────────────────────
-    try:
-        states       = resolve_states(args.states, args.horizon)
-        keep_columns = resolve_columns(args.columns)
-    except ValueError as exc:
-        logger.error("%s", exc)
-        parser.print_usage()
-        sys.exit(1)
+    # ── Resolve which steps to run ──────────────────────────────────────────
+    run_stage1 = 1 in args.steps
+    run_stage2 = 2 in args.steps
 
-    invalid_years = [y for y in args.years if not (2014 <= y <= 2024)]
-    if invalid_years:
-        logger.error("Year(s) out of supported range (2014–2024): %s", invalid_years)
-        sys.exit(1)
+    # ── Cross-option validation ───────────────────────────────────────────────
+    if run_stage1 and run_stage2 and args.test_size <= 0.0:
+        parser.error(
+            "--steps 1 2 requires a train/test split.  "
+            "Set --test-size to a value in (0, 1), e.g. --test-size 0.2."
+        )
 
-    if not (0.0 <= args.test_size < 1.0):
-        logger.error("--test-size must be in the range [0.0, 1.0).")
-        sys.exit(1)
+    # Resolve states and keep_columns whenever stage 1 runs OR whenever
+    # stage 2 runs without explicit --train/--test (so we can reconstruct
+    # the file paths from the ACS parameters).
+    need_acs_params = run_stage1 or (run_stage2 and args.train is None)
 
-    if args.threshold <= 0:
-        logger.error("--threshold must be a positive value.")
-        sys.exit(1)
+    if need_acs_params:
+        try:
+            states       = resolve_states(args.states, args.horizon)
+            keep_columns = resolve_columns(args.columns)
+        except ValueError as exc:
+            logger.error("%s", exc)
+            parser.print_usage()
+            sys.exit(1)
 
-    # ── Configuration summary ─────────────────────────────────
-    n_states = len(states) if states else len(USA_STATES)
+        states_label = _resolve_states_label(args.states)
+
+        invalid_years = [y for y in args.years if not (2014 <= y <= 2024)]
+        if invalid_years:
+            logger.error("Year(s) out of supported range (2014–2024): %s", invalid_years)
+            sys.exit(1)
+
+        if run_stage1:
+            if not (0.0 <= args.test_size < 1.0):
+                logger.error("--test-size must be in the range [0.0, 1.0).")
+                sys.exit(1)
+            if args.threshold <= 0:
+                logger.error("--threshold must be a positive value.")
+                sys.exit(1)
+    else:
+        # --steps 2 with explicit --train/--test: ACS params not needed.
+        states       = None
+        keep_columns = None
+        states_label = None
+
+    # When --steps 2 only and explicit paths given, validate they exist.
+    if run_stage2 and not run_stage1 and args.train is not None:
+        if not args.train.exists():
+            parser.error(f"--train file not found: {args.train}")
+        if args.test is None or not args.test.exists():
+            parser.error(f"--test file not found: {args.test}")
+
+
+    # ── Configuration summary ─────────────────────────────────────────────────
     logger.info("═" * 62)
-    logger.info("  ACS INCOME PIPELINE  —  stage 1: create_dataset")
+    logger.info("  ACS INCOME PIPELINE")
     logger.info("═" * 62)
-    logger.info("  Year(s)        : %s", args.years)
-    logger.info("  Horizon        : %s", args.horizon)
-    logger.info("  Survey         : %s", args.survey)
-    logger.info("  States         : %s (%d)", states or "ALL", n_states)
-    logger.info("  Threshold      : $%.0f", args.threshold)
-    logger.info("  Output columns : %s", keep_columns or "ALL")
-    logger.info("  Test split     : %.0f%%", args.test_size * 100)
+    mode_str = " + ".join(
+        (["stage 1 (dataset)"] if run_stage1 else [])
+        + (["stage 2 (BoCSoR)"] if run_stage2 else [])
+    )
+    logger.info("  Steps          : %s  → %s", args.steps, mode_str)
+    if run_stage1:
+        n_states = len(states) if states else len(USA_STATES)
+        logger.info("  Year(s)        : %s", args.years)
+        logger.info("  Horizon        : %s", args.horizon)
+        logger.info("  Survey         : %s", args.survey)
+        logger.info("  States         : %s (%d)", states or "ALL", n_states)
+        logger.info("  Threshold      : $%.0f", args.threshold)
+        logger.info("  Output columns : %s", keep_columns or "ALL")
+        logger.info("  Test split     : %.0f%%", args.test_size * 100)
+        logger.info("  Workers        : %d", args.workers if len(args.years) > 1 else 1)
+        logger.info("  Data dir       : %s", args.data_dir.resolve())
+    if run_stage2:
+        if not run_stage1:
+            if args.train is not None:
+                logger.info("  Train file     : %s", args.train)
+                logger.info("  Test file      : %s", args.test)
+            else:
+                logger.info("  Train/test     : inferred from ACS parameters")
+        logger.info("  BoCSoR k       : %s", args.k)
+        logger.info("  BoCSoR pct     : %.1f%%", args.percentile)
+        logger.info("  Output dir     : %s", args.output_dir.resolve())
     logger.info("  Random seed    : %d", args.seed)
-    logger.info("  Workers        : %d", args.workers if len(args.years) > 1 else 1)
-    logger.info("  Output dir     : %s", args.data_dir.resolve())
     logger.info("═" * 62)
 
-    # ── Execution ─────────────────────────────────────────────
+    # Build the stage-2 output directory: results/<states>/<years>/
+    # For --steps 2 with explicit --train/--test, states/years come from
+    # the ACS parameters if supplied, otherwise fall back to base --output-dir.
+    if need_acs_params:
+        xai_output_dir = _build_output_dir(
+            args.output_dir, states, args.states, args.years,
+        )
+    else:
+        # --steps 2 with explicit files and no ACS params: use base dir.
+        xai_output_dir = args.output_dir
+    logger.info("  XAI output dir : %s", xai_output_dir.resolve())
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # --steps 2 only: skip stage 1 entirely
+    # ─────────────────────────────────────────────────────────────────────────
+    if run_stage2 and not run_stage1:
+        # Resolve train/test paths: use explicit args if given, otherwise
+        # reconstruct from ACS parameters (same logic as --steps 1 2).
+        if args.train is not None:
+            s2_train_path = args.train
+            s2_test_path  = args.test
+        else:
+            if len(args.years) != 1:
+                parser.error(
+                    "--steps 2 without --train/--test requires exactly one "
+                    "--years value so the filename can be inferred."
+                )
+            s2_train_path, s2_test_path = _infer_split_paths(
+                args.data_dir, args.years[0], states, args.threshold,
+                args.horizon, args.survey, keep_columns,
+                states_label=states_label,
+            )
+            if not s2_train_path.exists():
+                parser.error(
+                    f"Inferred train file not found: {s2_train_path}\n"
+                    "Run --steps 1 first, or pass --train/--test explicitly."
+                )
+            if not s2_test_path.exists():
+                parser.error(
+                    f"Inferred test file not found: {s2_test_path}\n"
+                    "Run --steps 1 first, or pass --train/--test explicitly."
+                )
+            logger.info("Inferred train: %s", s2_train_path)
+            logger.info("Inferred test : %s", s2_test_path)
+
+        _run_feature_importance(
+            train_path=s2_train_path,
+            test_path=s2_test_path,
+            output_dir=xai_output_dir,
+            k=args.k,
+            percentile=args.percentile,
+            cb_iterations=args.cb_iterations,
+            cb_lr=args.cb_lr,
+            cb_depth=args.cb_depth,
+            cb_verbose=args.cb_verbose,
+            cb_early_stopping=args.cb_early_stopping,
+            original_class=args.original_class,
+            n_workers=args.workers,
+            random_seed=args.seed,
+            log_level=args.log_level,
+        )
+        return
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Stage 1: dataset creation
+    # ─────────────────────────────────────────────────────────────────────────
     if len(args.years) == 1:
-        # Single year: run in the current process to avoid fork/spawn overhead.
         year = args.years[0]
         logger.info("── Year %d ──────────────────────────────────────────", year)
         try:
@@ -373,6 +926,7 @@ def main() -> None:
                 random_seed=args.seed,
                 data_dir=args.data_dir,
                 keep_columns=keep_columns,
+                states_label=states_label,
             )
             logger.info(
                 "Year %d complete → train=%d rows, test=%d rows.",
@@ -382,9 +936,38 @@ def main() -> None:
             logger.error("Error processing year %d: %s", year, exc)
             raise
 
+        # ── Stage 2 (single year) ─────────────────────────────────────────────
+        if run_stage2:
+            if args.test_size <= 0.0:
+                logger.error(
+                    "Stage 2 skipped: no test split was created "
+                    "(--test-size is 0.0).  Re-run with --test-size > 0."
+                )
+                sys.exit(1)
+            train_path, test_path = _infer_split_paths(
+                args.data_dir, year, states, args.threshold,
+                args.horizon, args.survey, keep_columns,
+                states_label=states_label,
+            )
+            _run_feature_importance(
+                train_path=train_path,
+                test_path=test_path,
+                output_dir=xai_output_dir,
+                k=args.k,
+                percentile=args.percentile,
+                cb_iterations=args.cb_iterations,
+                cb_lr=args.cb_lr,
+                cb_depth=args.cb_depth,
+                cb_verbose=args.cb_verbose,
+                cb_early_stopping=args.cb_early_stopping,
+                original_class=args.original_class,
+                n_workers=args.workers,
+                random_seed=args.seed,
+                log_level=args.log_level,
+            )
+
     else:
         # Multiple years: one process per year (CPU-bound + independent I/O).
-        # ProcessPoolExecutor bypasses the GIL and exploits separate CPU cores.
         workers = min(args.workers, len(args.years))
         logger.info(
             "Starting parallel execution: %d years across %d worker(s).",
@@ -401,6 +984,7 @@ def main() -> None:
             data_dir=args.data_dir,
             keep_columns=keep_columns,
             log_level=args.log_level,
+            states_label=states_label,
         )
 
         completed: dict[int, tuple[int, int]] = {}
@@ -427,6 +1011,39 @@ def main() -> None:
         if failed:
             logger.error("The following years encountered errors: %s", sorted(failed))
             sys.exit(1)
+
+        # ── Stage 2 (multi-year: one run per year, sequential) ────────────────
+        if run_stage2:
+            if args.test_size <= 0.0:
+                logger.error(
+                    "Stage 2 skipped: no test split was created "
+                    "(--test-size is 0.0).  Re-run with --test-size > 0."
+                )
+                sys.exit(1)
+            for year in sorted(completed):
+                logger.info("── Stage 2: year %d ─────────────────────────────────", year)
+                train_path, test_path = _infer_split_paths(
+                    args.data_dir, year, states, args.threshold,
+                    args.horizon, args.survey, keep_columns,
+                    states_label=states_label,
+                )
+                year_output_dir = xai_output_dir / str(year)
+                _run_feature_importance(
+                    train_path=train_path,
+                    test_path=test_path,
+                    output_dir=year_output_dir,
+                    k=args.k,
+                    percentile=args.percentile,
+                    cb_iterations=args.cb_iterations,
+                    cb_lr=args.cb_lr,
+                    cb_depth=args.cb_depth,
+                    cb_verbose=args.cb_verbose,
+                    cb_early_stopping=args.cb_early_stopping,
+                    original_class=args.original_class,
+                    n_workers=args.workers,
+                    random_seed=args.seed,
+                    log_level=args.log_level,
+                )
 
     logger.info("═" * 62)
     logger.info("  Pipeline completed successfully.")

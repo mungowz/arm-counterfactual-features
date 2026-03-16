@@ -1,1889 +1,1241 @@
 """
-feature_importance.py
-=====================
-Identifies boundary-crossing feature drivers via a categorical adaptation of
-BoCSoR (Boundary Crossing Solo Ratio) built on top of CatBoost and BallTree
-nearest-neighbour search.
+src/feature_importance.py
+─────────────────────────
+Stage 2 of the ACS Income pipeline: Boundary Crossing Solo Ratio (BoCSoR) XAI.
 
-Algorithm overview
-------------------
-1. Train a CatBoost classifier on the encoded feature matrix.
-2. For each class, identify *boundary instances*: samples whose minimum
-   Hamming distance to the nearest opposite-class sample falls within the
-   bottom `perc_threshold`-th percentile.  These are the instances closest
-   to the decision boundary.
-3. Retain only boundary instances that the model predicts correctly
-   (mirrors the paper's consistency check — an incorrectly classified
-   boundary instance is already on the wrong side of the boundary).
-4. For each surviving boundary instance, query k nearest opposite-class
-   neighbours (real data points, not interpolated midpoints).
-5. For each (boundary_instance, CF_neighbour) pair, test all features where
-   the two instances differ: inject the CF's feature value into the original
-   instance and run a model prediction.  If the prediction flips to the CF's
-   class, that feature value is recorded as a counterfactual driver.
-6. Drivers are grouped by (sample_id, cf_neighbour_id) and written as
-   transaction rows for FP-Growth association-rule mining.
+Adapted from:
+  Alfeo et al. (2023) "From local counterfactuals to global feature importance:
+  efficient, robust, and model-agnostic explanations for brain connectivity networks"
+  Computer Methods and Programs in Biomedicine 236, 107550.
 
-Differences from the original BoCSoR paper (all intentional)
--------------------------------------------------------------
-- Hamming distance instead of Euclidean (appropriate for categorical data).
-- No midpoint interpolation (midpoints between categorical values are
-  meaningless; real opposite-class instances are used as CFs instead).
-- Inverted swap direction: the CF's feature value is injected into the
-  original instance rather than the reverse.  This captures the actual CF
-  values that trigger a prediction switch, which are more informative for
-  downstream ARM itemsets.
-- All k neighbours retained per boundary instance (not just the nearest one).
+Adaptations for fully-categorical data
+───────────────────────────────────────
+* Analysis runs on the TRAINING SET.  The classifier has full knowledge of
+  training instances, so boundary instances found there are the most
+  informative for explaining the model's decision surface.  The test set is
+  used only to compute a held-out accuracy estimate.
 
-Parallelisation strategy (M1 Ultra — 20 cores)
------------------------------------------------
-Five independent parallelism layers are exploited:
+* No interpolation of intermediate points (not meaningful for categorical
+  features).  Counterfactuals are the K nearest neighbours of the opposite
+  class in rank-encoded Manhattan space.
 
-1. CatBoost thread_count = N_PHYSICAL_CORES (all 20 cores for training —
-   work-stealing pool, no E-core straggler risk).
+* Rank-based encoding:
+    - Ordinal columns (AGEP, SCHL, WKHP) use the declared semantic order.
+    - All other columns use lexicographic (alphabetical) order — consistent
+      but arbitrary, no semantic meaning for nominal features.
 
-2. _get_boundary_state() — flat parallel BallTree query:
-   A single ThreadPoolExecutor(N_PHYSICAL_CORES) processes all per-class
-   chunks as independent tasks.  This avoids nested executor creation which
-   on macOS/Apple Silicon causes GCD to spawn additional internal threads,
-   multiplying the live thread count and stalling the scheduler (observed
-   freeze after "Computing boundary state...").  One flat pool,
-   N_PHYSICAL_CORES workers, each task is one independent chunk query.
+* Manhattan distance normalised to [0, 2]:
+      dist(a,b) = 2 x sum|rank_i(a) - rank_i(b)| / sum(max_rank_i)
 
-3. explain() — class loops run sequentially per k-thread.
-   The outer k-parallel pool (ThreadPoolExecutor in run_for_k_values) already
-   saturates all cores.  A nested per-class executor here would trigger the
-   same GCD thread explosion as the two-level design in _get_boundary_state.
+* Multi-k evaluation via --k:
+      Single value K  -> auto-expanded to all odd integers 1..K (plus K if
+                         even).  --k 11 -> [1, 3, 5, 7, 9, 11]
+      Multiple values -> used as-is.  --k 1 5 11 -> [1, 5, 11]
 
-4. run_for_k_values() — k values are processed in parallel via
-   ThreadPoolExecutor(min(n_k, N_PHYSICAL_CORES)).
-   CatBoost thread_count is reduced to max(1, N_PHYSICAL_CORES // pool_size)
-   so total CatBoost threads stay within the core budget.
+* Itemset output: one row per boundary instance per k value.  All relevant
+  features are on the same row.  Columns: k_value, instance_index,
+  features (space-separated names), itemset (space-separated FEATURE=value
+  tokens, ARM-ready).  One combined file plus one file per k value.
 
-5. main() — regions are processed in parallel via ProcessPoolExecutor
-   (one process per region, up to N_PHYSICAL_CORES // 4 processes).
-   Each process is isolated and applies the same thread_count reduction
-   independently.
-
-Mega-batch performance strategy
---------------------------------
-The workload is split across two methods:
-
-_get_boundary_state() — called once per (X, y) pair, result cached across k:
-  (a) One batch predict to apply the model-prediction filter on boundary
-      candidates.  Cached for all k values; n_k values → 1 call instead of n_k.
-
-explain() — called once per k, uses the cached boundary state:
-  (b) One chunked predict to verify all B×k CF candidates at once.
-  (c) One chunked predict on all perturbations across all valid CFs at once.
-
-The perturbation matrix is built entirely via NumPy broadcasting — no Python
-inner loops over samples or features.  Driver strings are constructed via
-np.char.add (vectorised over ≤11 feature slots).  Grouping is done with
-pandas groupby instead of a Python dict loop.
-
-Pipeline position
------------------
-    create_dataset.py  →  [feature_importance.py]  →  macroscopic_experiment_association_rules.py
-
-Input  : data/acs_income_{region}_{year}.csv  (written by create_dataset.py)
-Outputs: results/{region}/important_features/k_{k}/*.csv  (read by macroscopic_...)
-
-Invocation
-----------
-This module is designed to be called exclusively via main.py (Step 2).
-Do not invoke it directly.
+Parallelism and performance
+────────────────────────────
+* Start method: multiprocessing uses "fork" so worker processes inherit the
+  parent's memory (rank maps, encoded arrays, model) without reimporting.
+* BallTree (sklearn, Manhattan metric): built once on the cf-class instances
+  and inherited by workers via fork.  Used for both boundary selection
+  (O(N log N) instead of O(N²)) and k-NN queries in each worker (O(k log N)).
+* Batch predict: for each boundary instance the relevance check builds a
+  batch of all modified instances (one per differing feature, across all k
+  counterfactuals) and calls model.predict() once, instead of one call per
+  feature per counterfactual.
+* Boundary instance processing: chunks dispatched via ProcessPoolExecutor.
+* CatBoost inference uses thread_count=1 per worker to avoid competing pools.
+* Worker count defaults to (cpu_count - 2), capped at 14.
 """
 
-import ast
-import copy
-import io
-import json
-import os
-import platform
-import sys
-import subprocess
-import threading
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
-from pathlib import Path
+from __future__ import annotations
 
+import argparse
+import logging
+import math
+import os
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
+from typing import Optional
+
+import multiprocessing
 import numpy as np
 import pandas as pd
 from catboost import CatBoostClassifier
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import OrdinalEncoder, LabelEncoder
 from sklearn.neighbors import BallTree
 
-try:
-    from pynndescent import NNDescent
-    _PYNNDESCENT_AVAILABLE = True
-except ImportError:
-    _PYNNDESCENT_AVAILABLE = False
+logger = logging.getLogger("src.feature_importance")
+
+_DEFAULT_WORKERS = max(1, min(14, (os.cpu_count() or 4) - 2))
 
 
-# ---------------------------------------------------------------------------
-# Hardware detection — core count, GPU and CPU thread count
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Ordered category definitions
+# ─────────────────────────────────────────────────────────────────────────────
 
-def _physical_core_count() -> int:
+ORDERED_CATEGORIES: dict[str, list[str]] = {
+    "AGEP": [
+        "Young", "Young-Adult", "Mid-Career",
+        "Experienced", "Late-Career", "Retirement-Age",
+    ],
+    "SCHL": [
+        "No-Schooling-Completed", "Nursery-School-Preschool", "Kindergarten",
+        "Grade-1", "Grade-2", "Grade-3", "Grade-4", "Grade-5", "Grade-6",
+        "Grade-7", "Grade-8", "Grade-9", "Grade-10", "Grade-11",
+        "Grade-12-No-Diploma", "Regular-HS-Diploma", "GED-Or-Alt-Credential",
+        "Some-College-Less-Than-1yr", "Some-College-1yr-Or-More-No-Degree",
+        "Associates-Degree", "Bachelors-Degree", "Masters-Degree",
+        "Professional-Degree-Beyond-Bachelors", "Doctorate-Degree",
+    ],
+    "WKHP": [
+        "Part-Time-Low", "Part-Time", "Near-Full-Time",
+        "Full-Time", "Over-Full-Time", "Extended-Hours",
+    ],
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Rank encoding
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_rank_maps(df: pd.DataFrame) -> dict[str, dict[str, int]]:
     """
-    Return the number of *physical* CPU cores on this machine.
+    Build {column -> {category_label -> rank}} from the training DataFrame.
 
-    On Apple Silicon the logical count (os.cpu_count()) already equals the
-    physical count (no SMT/HyperThreading).  M1 Ultra has 20 physical cores
-    (16 P-cores + 4 E-cores) and reports 20 logical cores.
-
-    On x86 with HyperThreading, os.cpu_count() returns 2× the physical count;
-    we halve it so we don't over-subscribe the scheduler with pure-Python threads
-    on top of CatBoost's internal thread pool.
+    Ordinal columns use the semantic order in ORDERED_CATEGORIES (rank 1 =
+    lowest, rank N = highest).  All other columns use lexicographic order.
+    Ranks are 1-based.  Must be built from training data only.
     """
-    logical = os.cpu_count() or 1
-    if platform.system() == 'Darwin' and platform.machine() == 'arm64':
-        # Apple Silicon: logical == physical (no SMT)
-        return logical
-    # Conservative default for x86: assume HyperThreading is on.
-    return max(1, logical // 2)
+    rank_maps: dict[str, dict[str, int]] = {}
+    for col in df.columns:
+        present = set(df[col].dropna().unique())
+        if col in ORDERED_CATEGORIES:
+            ordered = [c for c in ORDERED_CATEGORIES[col] if c in present]
+            ordered += sorted(present - set(ordered))
+        else:
+            ordered = sorted(present)
+        rank_maps[col] = {cat: rank for rank, cat in enumerate(ordered, start=1)}
+    return rank_maps
 
 
-# Number of physical cores — used to size all thread / process pools.
-N_PHYSICAL_CORES: int = _physical_core_count()
-
-
-def _catboost_task_type() -> str:
+def encode_ranks(
+    df: pd.DataFrame,
+    rank_maps: dict[str, dict[str, int]],
+) -> np.ndarray:
     """
-    Detect the best available compute device for CatBoost and return the
-    corresponding task_type string.
+    Convert a categorical DataFrame to a (n_samples, n_features) int32 matrix.
 
-    Priority
-    --------
-    1. CUDA GPU (Linux / Windows):  nvidia-smi probe.
-    2. Apple Silicon (Darwin):      CatBoost does not support Metal/MPS.
-                                    Falls back to CPU with a clear message.
-    3. CPU fallback:                all other cases.
-
-    Returns 'GPU' or 'CPU'.
+    Values absent from the rank map fall back to the median rank of that
+    column (neutral fallback, avoids NaN in distance calculations).
     """
-    # ── CUDA probe ────────────────────────────────────────────────────
-    try:
-        subprocess.run(
-            ['nvidia-smi'],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=True,
+    result = np.empty((len(df), len(df.columns)), dtype=np.int32)
+    for j, col in enumerate(df.columns):
+        rmap     = rank_maps[col]
+        fallback = int(np.median(list(rmap.values())))
+        result[:, j] = (
+            df[col].map(lambda v, rm=rmap, fb=fallback: rm.get(v, fb)).to_numpy()
         )
-        print("  > CUDA GPU detected — CatBoost will use task_type='GPU'")
-        return 'GPU'
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        pass
+    return result
 
-    # ── Apple Silicon note ────────────────────────────────────────────
-    if platform.system() == 'Darwin' and platform.machine() == 'arm64':
-        print(
-            "  > Apple Silicon detected — CatBoost does not support Metal/MPS. "
-            "Using CPU with all available threads."
+
+def max_rank_per_column(rank_maps: dict[str, dict[str, int]]) -> np.ndarray:
+    """Return a (F,) float64 array of maximum rank for each column."""
+    return np.array([max(rm.values()) for rm in rank_maps.values()], dtype=np.float64)
+
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# k-value expansion
+# ─────────────────────────────────────────────────────────────────────────────
+
+def expand_k(k_values: list[int]) -> list[int]:
+    """
+    Convert the raw --k argument into the list of neighbourhood sizes to use.
+
+    Single value K  ->  all odd integers from 1 to K, plus K if even.
+        --k 11  ->  [1, 3, 5, 7, 9, 11]
+        --k 4   ->  [1, 3, 4]
+        --k 1   ->  [1]
+
+    Multiple values  ->  deduplicated, sorted, used as-is.
+        --k 1 5 11  ->  [1, 5, 11]
+
+    Raises ValueError if any value < 1.
+    """
+    invalid = [v for v in k_values if v < 1]
+    if invalid:
+        raise ValueError(f"--k values must be >= 1.  Invalid: {invalid}.")
+    if len(k_values) == 1:
+        k_max    = k_values[0]
+        expanded = list(range(1, k_max + 1, 2))
+        if k_max % 2 == 0 and k_max not in expanded:
+            expanded.append(k_max)
+        return expanded
+    seen: dict[int, None] = {}
+    for v in k_values:
+        seen[v] = None
+    return sorted(seen.keys())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Boundary instance selection (computed once, shared across all k values)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_balltree(X_enc: np.ndarray, max_ranks: np.ndarray) -> BallTree:
+    """
+    Build a BallTree on rank-encoded data using normalised Manhattan distance.
+
+    The tree is built once in the main process and inherited by worker
+    processes via fork — no serialisation overhead.
+
+    We use the "chebyshev" leaf_size default and Manhattan (L1) metric.
+    The normalisation (divide by norm_factor, multiply by 2) is applied to
+    the input before building so that the tree returns distances in [0, 2],
+    consistent with the formula: dist(a,b) = 2 × Σ|rank_i(a)-rank_i(b)| / Σmax_rank_i.
+    """
+    norm_factor = float(max_ranks.sum())
+    X_norm = X_enc.astype(np.float32) / norm_factor * 2.0
+    return BallTree(X_norm, metric="manhattan", leaf_size=40)
+
+
+def select_boundary_instances(
+    X_enc: np.ndarray,
+    y_true: np.ndarray,
+    y_pred_train: np.ndarray,
+    max_ranks: np.ndarray,
+    percentile_th: float,
+    original_class: int,
+    cf_class: int,
+    model: object,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, BallTree]:
+    """
+    Compute boundary instances and counterfactual indices once using a BallTree.
+
+    Mirrors the authors' original approach (CounterfactualExplainerByProximity):
+    1. Separate instances by TRUE label (y_true), not model predictions, so
+       that the class pools are stable and independent of the model.
+    2. Keep only orig-class instances that the model ALSO predicts as
+       original_class (i.e. correctly classified).  Misclassified instances
+       would lie on the wrong side of the decision boundary and their
+       counterfactual direction would be semantically inverted.
+    3. Select boundary instances as those whose distance to the nearest
+       true-cf-class neighbour is <= the percentile_th-th percentile.
+       (Original authors use <=; we align with that convention.)
+
+    The BallTree is built on the counterfactual-class instances and returned
+    so that worker processes can reuse it for the k-NN step (Algorithm 1).
+
+    Parameters
+    ----------
+    y_true        : True class labels (used to separate class pools).
+    y_pred_train  : Model predictions on the training set (used to filter
+                    misclassified instances from the boundary candidates).
+    model         : Trained classifier (used for the correct-prediction filter).
+
+    Returns
+    -------
+    (boundary_indices, cf_indices, X_enc_cf, cf_tree)
+      boundary_indices : row indices in X_enc of boundary instances.
+      cf_indices       : row indices in X_enc of true-cf-class instances.
+      X_enc_cf         : rank-encoded submatrix for cf-class instances.
+      cf_tree          : BallTree built on cf-class instances (normalised).
+    """
+    # Separate by TRUE label — same as the original authors.
+    orig_indices_true = np.where(y_true == original_class)[0]
+    cf_indices        = np.where(y_true == cf_class)[0]
+
+    if len(orig_indices_true) == 0 or len(cf_indices) == 0:
+        empty_tree = BallTree(np.zeros((1, X_enc.shape[1]), dtype=np.float32),
+                              metric="manhattan")
+        return (np.array([], dtype=int), cf_indices,
+                np.empty((0, X_enc.shape[1]), dtype=np.int32), empty_tree)
+
+    # Keep only correctly classified orig-class instances.
+    # A misclassified instance would already be on the CF side of the
+    # decision boundary; its counterfactual direction is inverted and
+    # its relevant features would be meaningless.
+    correct_mask  = y_pred_train[orig_indices_true] == original_class
+    orig_indices  = orig_indices_true[correct_mask]
+
+    if len(orig_indices) == 0:
+        empty_tree = BallTree(np.zeros((1, X_enc.shape[1]), dtype=np.float32),
+                              metric="manhattan")
+        return (np.array([], dtype=int), cf_indices,
+                np.empty((0, X_enc.shape[1]), dtype=np.int32), empty_tree)
+
+    X_enc_orig = X_enc[orig_indices]
+    X_enc_cf   = X_enc[cf_indices]
+
+    # Build BallTree on the true-cf-class instances (normalised coordinates).
+    cf_tree = build_balltree(X_enc_cf, max_ranks)
+
+    # For each correctly-classified orig-class instance find its nearest
+    # true-cf-class neighbour (k=1).  Instances below the distance threshold
+    # are the boundary instances.
+    norm_factor = float(max_ranks.sum())
+    X_orig_norm = X_enc_orig.astype(np.float32) / norm_factor * 2.0
+    min_dists, _ = cf_tree.query(X_orig_norm, k=1)   # (N_orig, 1)
+    min_dists    = min_dists[:, 0]                     # (N_orig,)
+
+    # Use <= to match the original authors' convention.
+    threshold = float(np.percentile(min_dists, percentile_th))
+    b_local   = np.where(min_dists <= threshold)[0]
+
+    boundary_indices = orig_indices[b_local]
+    return boundary_indices, cf_indices, X_enc_cf, cf_tree
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Worker function — runs in a subprocess, uses batched predict
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _process_boundary_chunk(
+    chunk_indices: list[int],
+    X_enc: np.ndarray,
+    X_enc_cf: np.ndarray,
+    cf_global_indices: np.ndarray,
+    X_train_values: np.ndarray,
+    feature_cols: list[str],
+    model: CatBoostClassifier,
+    k: int,
+    original_class: int,
+    norm_factor: float,
+    cf_tree: BallTree,
+) -> tuple[dict[str, int], list[dict]]:
+    """
+    Process one chunk of boundary instances in a worker process.
+
+    For each boundary instance:
+      1. Find k nearest neighbours from the counterfactual class
+         (Algorithm 1 — no interpolation for categorical data).
+      2. Build a batch of all modified instances needed for the relevance
+         check across all k counterfactuals, then call model.predict() once
+         on the entire batch (batched Algorithm 2).
+      3. Take the UNION of relevant features across all k counterfactuals
+         and emit one row per boundary instance with all relevant features.
+
+    The model is inherited from the parent process via fork — no disk I/O.
+
+    Parameters
+    ----------
+    chunk_indices     : Row indices (in X_enc / X_train_values) to process.
+    X_enc             : Full rank-encoded training matrix (read-only).
+    X_enc_cf          : Rank-encoded submatrix of counterfactual-class rows.
+    cf_global_indices : Maps position in X_enc_cf -> row in X_enc.
+    X_train_values    : (n_train, n_features) object array of string labels.
+    feature_cols      : Ordered feature column names.
+    model             : CatBoostClassifier inherited from parent via fork.
+    k                 : Number of nearest counterfactuals to consider.
+    original_class    : Class label of the boundary instances.
+    norm_factor       : sum(max_rank_i), precomputed for distance normalisation.
+    cf_tree           : BallTree built on cf-class instances (normalised coords).
+                        Inherited via fork — used for O(k log N) k-NN queries.
+
+    Returns
+    -------
+    (importance_counts, itemset_rows)
+      importance_counts : {feature -> count of boundary instances in this
+                           chunk for which the feature is in the relevant union}.
+      itemset_rows      : one dict per (instance, relevant_feature).
+    """
+    n_features = len(feature_cols)
+    importance_counts: dict[str, int] = {f: 0 for f in feature_cols}
+    itemset_rows: list[dict] = []
+
+    n_cf = len(cf_global_indices)
+
+    for b_idx in chunk_indices:
+        # ── Algorithm 1: k-NN via BallTree — O(k log N_cf) ───────────────────
+        query_norm = (X_enc[b_idx].astype(np.float32)
+                      / norm_factor * 2.0).reshape(1, -1)
+        k_act      = min(k, n_cf)
+        _, top_local = cf_tree.query(query_norm, k=k_act)   # (1, k_act)
+        cf_idxs = [int(cf_global_indices[i]) for i in top_local[0]]
+
+        if not cf_idxs:
+            continue
+
+        instance_vals = X_train_values[b_idx]
+
+        # ── Algorithm 2: batched relevance check ─────────────────────────────
+        # Build one modified instance per (counterfactual, differing_feature)
+        # pair, collect their (cf_idx, fi) metadata, then call predict once.
+        batch_rows:  list[np.ndarray] = []
+        batch_meta:  list[tuple[int, int]] = []   # (cf_idx, feature_index)
+
+        for cf_idx in cf_idxs:
+            cf_vals = X_train_values[cf_idx]
+            for fi in range(n_features):
+                if cf_vals[fi] == instance_vals[fi]:
+                    continue
+                modified    = cf_vals.copy()
+                modified[fi] = instance_vals[fi]
+                batch_rows.append(modified)
+                batch_meta.append((cf_idx, fi))
+
+        if not batch_rows:
+            continue
+
+        # Single predict call for all (counterfactual, feature) pairs.
+        batch_array = np.array(batch_rows, dtype=object)
+        preds       = model.predict(batch_array, thread_count=1).ravel()
+
+        # Collect relevant features (union across all k counterfactuals).
+        relevant_union: set[str] = set()
+        for pred, (_, fi) in zip(preds, batch_meta):
+            if int(pred) == original_class:
+                relevant_union.add(feature_cols[fi])
+
+        if relevant_union:
+            # One row per boundary instance — all relevant features on the same
+            # record.  "itemset" is a space-separated string of FEATURE=value
+            # tokens (sorted for reproducibility), ready for ARM.
+            items_str = " ".join(
+                f"{feat}={instance_vals[feature_cols.index(feat)]}"
+                for feat in sorted(relevant_union)
+            )
+            itemset_rows.append({
+                "instance_index": int(b_idx),
+                "features":       " ".join(sorted(relevant_union)),
+                "itemset":        items_str,
+            })
+            for feat in relevant_union:
+                importance_counts[feat] += 1
+
+    return importance_counts, itemset_rows
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BoCSoR — single k, parallel over boundary chunks
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_bocsor_single_k(
+    model: CatBoostClassifier,
+    X_train: pd.DataFrame,
+    X_enc: np.ndarray,
+    X_train_values: np.ndarray,
+    boundary_indices: np.ndarray,
+    cf_indices: np.ndarray,
+    X_enc_cf: np.ndarray,
+    cf_tree: BallTree,
+    feature_cols: list[str],
+    rank_maps: dict[str, dict[str, int]],
+    k: int,
+    original_class: int,
+    n_workers: int,
+) -> tuple[pd.DataFrame, pd.Series]:
+    """
+    Run BoCSoR for a single k value.
+
+    Boundary instances and counterfactual indices are passed in (precomputed
+    by the caller) so that the expensive boundary distance computation is not
+    recomputed for every k.
+
+    Returns
+    -------
+    (itemsets_df, feature_importance)
+    """
+    norm_factor = float(max_rank_per_column(rank_maps).sum())
+
+    logger.info(
+        "  k=%d | boundary instances: %d (class %d)",
+        k, len(boundary_indices), original_class,
+    )
+    if len(boundary_indices) == 0:
+        return (
+            pd.DataFrame(columns=["instance_index", "features", "itemset"]),
+            pd.Series(0.0, index=feature_cols, name="BoCSoR_importance"),
+        )
+
+    # ── Chunk and dispatch ────────────────────────────────────────────────────
+    n_chunks   = min(n_workers, len(boundary_indices))
+    chunk_size = math.ceil(len(boundary_indices) / n_chunks)
+    chunks     = [
+        boundary_indices[i : i + chunk_size].tolist()
+        for i in range(0, len(boundary_indices), chunk_size)
+    ]
+
+    total_importance: dict[str, int] = {f: 0 for f in feature_cols}
+    all_rows: list[dict]             = []
+    n_with_cf = 0
+
+    _fork_ctx = multiprocessing.get_context("fork")
+    with ProcessPoolExecutor(max_workers=n_chunks, mp_context=_fork_ctx) as executor:
+        futures = {
+            executor.submit(
+                _process_boundary_chunk,
+                chunk,
+                X_enc,
+                X_enc_cf,
+                cf_indices,
+                X_train_values,
+                feature_cols,
+                model,
+                k,
+                original_class,
+                norm_factor,
+                cf_tree,
+            ): chunk
+            for chunk in chunks
+        }
+        for future in as_completed(futures):
+            imp_c, rows_c = future.result()
+            for feat, cnt in imp_c.items():
+                total_importance[feat] += cnt
+            all_rows.extend(rows_c)
+            n_with_cf += len({r["instance_index"] for r in rows_c})
+
+    logger.info(
+        "  k=%d | instances with >=1 counterfactual: %d / %d",
+        k, n_with_cf, len(boundary_indices),
+    )
+
+    feat_imp = (
+        pd.Series(total_importance, name="BoCSoR_importance")
+        / max(n_with_cf, 1)
+    ).sort_values(ascending=False)
+
+    return pd.DataFrame(all_rows), feat_imp
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BoCSoR — multi-k entry point
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_bocsor_multi_k(
+    model: CatBoostClassifier,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    y_pred_train: np.ndarray,
+    rank_maps: dict[str, dict[str, int]],
+    feature_cols: list[str],
+    k_values: list[int],
+    percentile_th: float = 20.0,
+    original_class: int = 0,
+    cf_class: int = 1,
+    n_workers: int = _DEFAULT_WORKERS,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[int, pd.DataFrame]]:
+    """
+    Run BoCSoR once per value in k_values on the training set.
+
+    Key optimisations vs. the naive loop:
+    - Rank encoding of X_train: computed once, reused for all k values.
+    - Boundary selection via BallTree: O(N log N) instead of O(N²).
+      Pools separated by TRUE label; only correctly-classified orig-class
+      instances are candidates.  Built once, reused for all k values.
+    - k-NN (Algorithm 1) in workers: BallTree query O(k log N_cf)
+      instead of a linear scan O(N_cf) per boundary instance.
+    - Workers inherit the BallTree from the main process via fork.
+    - If zero boundary instances are found, all k values are skipped
+      immediately without any tree query per k.
+    - Relevance check uses batched model.predict() instead of one call
+      per (counterfactual, feature) pair.
+
+    Returns
+    -------
+    (all_itemsets_df, importance_df)
+      all_itemsets_df : columns [k_value, instance_index, features, itemset].
+      importance_df   : features x k_values wide table (columns k_1, k_3, ...).
+    """
+    logger.info(
+        "BoCSoR on TRAINING SET: k=%s  class %d->%d  "
+        "percentile=%.1f  workers=%d",
+        k_values, original_class, cf_class, percentile_th, n_workers,
+    )
+
+    max_ranks = max_rank_per_column(rank_maps)
+    X_enc     = encode_ranks(X_train[feature_cols], rank_maps)
+    X_train_values = (
+        X_train[feature_cols].reset_index(drop=True).to_numpy(dtype=object)
+    )
+
+    # ── Compute boundary instances once for all k ─────────────────────────────
+    t0 = time.perf_counter()
+    boundary_indices, cf_indices, X_enc_cf, cf_tree = select_boundary_instances(
+        X_enc=X_enc,
+        y_true=y_train.to_numpy().astype(int),
+        y_pred_train=y_pred_train,
+        max_ranks=max_ranks,
+        percentile_th=percentile_th,
+        original_class=original_class,
+        cf_class=cf_class,
+        model=model,
+    )
+    t_boundary = time.perf_counter() - t0
+    logger.info(
+        "Boundary selection: %d instances  (class %d, pct=%.1f, %.1fs)",
+        len(boundary_indices), original_class, percentile_th, t_boundary,
+    )
+
+    if len(boundary_indices) == 0:
+        logger.warning(
+            "No boundary instances for class %d -> %d.  "
+            "All k values skipped.",
+            original_class, cf_class,
+        )
+        empty_imp = pd.Series(0.0, index=feature_cols, name="BoCSoR_importance")
+        empty_df  = pd.DataFrame(columns=["k_value", "instance_index", "features", "itemset"])
+        imp_df    = pd.DataFrame(
+            {f"k_{k}": empty_imp for k in k_values}
+        ).rename_axis("feature")
+        return empty_df, imp_df, {k: empty_df.copy() for k in k_values}
+
+    # ── Run once per k (boundary instances reused) ────────────────────────────
+    all_itemsets:    list[pd.DataFrame]   = []
+    importance_dict: dict[int, pd.Series] = {}
+
+    for k in k_values:
+        logger.info("── k=%d ──────────────────────────────────────────────", k)
+        t_k = time.perf_counter()
+        itemsets_df, feat_imp = run_bocsor_single_k(
+            model=model,
+            X_train=X_train,
+            X_enc=X_enc,
+            X_train_values=X_train_values,
+            boundary_indices=boundary_indices,
+            cf_indices=cf_indices,
+            X_enc_cf=X_enc_cf,
+            cf_tree=cf_tree,
+            feature_cols=feature_cols,
+            rank_maps=rank_maps,
+            k=k,
+            original_class=original_class,
+            n_workers=n_workers,
+        )
+        logger.info("  k=%d | elapsed: %.1fs", k, time.perf_counter() - t_k)
+        if not itemsets_df.empty:
+            itemsets_df.insert(0, "k_value", k)
+        all_itemsets.append(itemsets_df)
+        importance_dict[k] = feat_imp
+
+    combined = pd.concat(all_itemsets, ignore_index=True)
+    imp_df   = pd.DataFrame(importance_dict).rename_axis("feature")
+    imp_df.columns = [f"k_{k}" for k in imp_df.columns]
+
+    # per_k_itemsets: {k -> itemset DataFrame for that k only}
+    per_k_itemsets: dict[int, pd.DataFrame] = {
+        k: df for k, df in zip(k_values, all_itemsets)
+    }
+    return combined, imp_df, per_k_itemsets
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Data loading
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _infer_target_column(df: pd.DataFrame) -> str:
+    candidates = [c for c in df.columns if c.startswith("income_over_")]
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        raise ValueError(f"Multiple target-like columns: {candidates}.")
+    raise ValueError(
+        "No 'income_over_*' column found. "
+        "Ensure the file was produced by stage 1 (src/main.py)."
+    )
+
+
+def load_split_data(
+    train_path: Optional[Path],
+    test_path: Optional[Path],
+    dataset_path: Optional[Path],
+    test_size: float = 0.2,
+    random_seed: int = 42,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, str]:
+    """
+    Return (X_train, X_test, y_train, y_test, target_col).
+
+    Pre-split files are preferred.  A single dataset file is split internally
+    with a warning recommending stage-1 regeneration.
+    """
+    if dataset_path is not None:
+        logger.warning(
+            "Single dataset file '%s' provided. An internal %d/%d stratified "
+            "split will be performed (seed=%d). For reproducible results, "
+            "regenerate via stage 1 with --test-size %.2f and pass the "
+            "resulting files with --train / --test.",
+            dataset_path.name,
+            int((1 - test_size) * 100), int(test_size * 100),
+            random_seed, test_size,
+        )
+        df           = pd.read_csv(dataset_path, dtype=str)
+        target_col   = _infer_target_column(df)
+        feature_cols = [c for c in df.columns if c != target_col]
+        X = df[feature_cols]
+        y = df[target_col].astype(int)
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=test_size, stratify=y, random_state=random_seed,
+        )
+        return X_train, X_test, y_train, y_test, target_col
+
+    if train_path is None or test_path is None:
+        raise ValueError("Provide either --dataset or both --train and --test.")
+
+    train_df = pd.read_csv(train_path, dtype=str)
+    test_df  = pd.read_csv(test_path,  dtype=str)
+    target_col  = _infer_target_column(train_df)
+    feat_train  = [c for c in train_df.columns if c != target_col]
+    feat_test   = [c for c in test_df.columns  if c != target_col]
+    if set(feat_train) != set(feat_test):
+        raise ValueError(
+            "Train and test files have different feature columns.\n"
+            f"  Train only: {sorted(set(feat_train) - set(feat_test))}\n"
+            f"  Test only : {sorted(set(feat_test) - set(feat_train))}"
+        )
+    return (
+        train_df[feat_train],
+        test_df[feat_test],
+        train_df[target_col].astype(int),
+        test_df[target_col].astype(int),
+        target_col,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Model training
+# ─────────────────────────────────────────────────────────────────────────────
+
+def train_catboost(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    cat_features: list[str],
+    random_seed: int = 42,
+    iterations: int = 500,
+    learning_rate: float = 0.05,
+    depth: int = 6,
+    verbose: bool = False,
+    early_stopping_rounds: int | None = None,
+) -> CatBoostClassifier:
+    """
+    Train a CatBoostClassifier on the (fully categorical) training set.
+
+    CatBoost is the right classifier here because:
+    - It accepts raw string-valued categorical columns with no manual encoding,
+      avoiding the dimensionality explosion of one-hot encoding on columns
+      such as OCCP (23 values) or POBP (80+ values).
+    - Its ordered target statistics handle high-cardinality categories robustly
+      without introducing target leakage.
+    - Alfeo et al. (2023) found CatBoost to be the most accurate of the
+      three classifiers they tested on the HCP benchmark tasks.
+
+    Parameters
+    ----------
+    early_stopping_rounds : If set, training stops when the validation loss
+                            does not improve for this many consecutive rounds.
+                            An internal 80/20 stratified split is used as the
+                            eval set.  None = disabled (train for all iterations).
+    """
+    model = CatBoostClassifier(
+        iterations=iterations,
+        learning_rate=learning_rate,
+        depth=depth,
+        cat_features=cat_features,
+        random_seed=random_seed,
+        verbose=verbose,
+        eval_metric="Accuracy",
+        task_type="CPU",
+    )
+    logger.info(
+        "Training CatBoost: iterations=%d, lr=%.4f, depth=%d, "
+        "cat_features=%d, early_stopping=%s.",
+        iterations, learning_rate, depth, len(cat_features),
+        early_stopping_rounds if early_stopping_rounds else "disabled",
+    )
+
+    if early_stopping_rounds is not None:
+        # Hold out 20% of training data as an internal validation set so
+        # CatBoost can monitor the eval metric and stop early.
+        #
+        # Note for BoCSoR: y_pred_train is computed on all of X_train
+        # (including this 20% eval split) after training completes, so
+        # boundary instances are selected from the full training set.
+        # The 20% eval rows are technically slightly less "known" to the
+        # model than the 80% training rows, but this is a minor effect
+        # and standard practice for early-stopped gradient boosting.
+        from sklearn.model_selection import train_test_split as _tts
+        X_tr, X_val, y_tr, y_val = _tts(
+            X_train, y_train,
+            test_size=0.2,
+            stratify=y_train,
+            random_state=random_seed,
+        )
+        model.fit(
+            X_tr, y_tr,
+            eval_set=(X_val, y_val),
+            early_stopping_rounds=early_stopping_rounds,
         )
     else:
-        print("  > No CUDA GPU detected — CatBoost will use task_type='CPU'")
-
-    return 'CPU'
-
-
-def _catboost_thread_count() -> int:
-    """
-    Return the number of CPU threads CatBoost should use.
-
-    On Apple Silicon, use ALL physical cores (P-cores + E-cores).
-    CatBoost's internal work-stealing thread pool avoids the E-core straggler
-    problem that plagues joblib's process pool.
-    On all other platforms, -1 tells CatBoost to auto-detect.
-    """
-    if platform.system() == 'Darwin' and platform.machine() == 'arm64':
-        n = N_PHYSICAL_CORES
-        print(f'  > CatBoost thread_count set to {n} (all Apple Silicon cores)')
-        return n
-    return -1   # CatBoost auto-detect on other platforms
+        model.fit(X_train, y_train)
+    return model
 
 
-# ---------------------------------------------------------------------------
-# Prediction helpers
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
 
-# Optimal CatBoost predict batch size on Apple Silicon.
-# M1 Ultra has 32 MB of L2 cache (per cluster) and a 64 MB System Level Cache (SLC).
-# 500 K rows × 11 int32 features ≈ 21 MB — fits in the SLC without pressure on
-# the unified memory bus, giving ~2.5× throughput vs the previous 200 K limit.
-# On non-Ultra chips the SLC is smaller (8–32 MB); the chunking still protects them
-# because the OS will spill gracefully to LPDDR5 rather than stalling.
-_PREDICT_CHUNK_SIZE = 500_000
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m src.feature_importance",
+        description=(
+            "ACS Income pipeline — stage 2: BoCSoR feature importance\n"
+            "Global feature importance from local counterfactuals on the\n"
+            "TRAINING SET of a fully-categorical ACS dataset."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Input (choose one):
+  Pre-split (recommended):
+    --train data/train_2024_ALL_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv \\
+    --test  data/test_2024_ALL_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv
+
+  Single file (split internally -- not recommended):
+    --dataset data/dataset_2024_ALL_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv
+
+Examples:
+  python -m src.feature_importance \\
+      --train data/train_2024_NY_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv \\
+      --test  data/test_2024_NY_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv
+
+  python -m src.feature_importance \\
+      --train data/train_2024_ALL_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv \\
+      --test  data/test_2024_ALL_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv \\
+      --k 11 --percentile 20 --output-dir results/
+
+  python -m src.feature_importance \\
+      --train data/train_2024_ALL_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv \\
+      --test  data/test_2024_ALL_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv \\
+      --k 1 5 11 --explain-both-classes --workers 12
+        """,
+    )
+
+    inp = parser.add_argument_group("Input")
+    inp.add_argument("--train",      type=Path, default=None, metavar="CSV")
+    inp.add_argument("--test",       type=Path, default=None, metavar="CSV")
+    inp.add_argument("--dataset",    type=Path, default=None, metavar="CSV",
+                     help="Single unsplit CSV (prefer --train/--test).")
+    inp.add_argument("--split-size", type=float, default=0.2, metavar="FRACTION",
+                     help="Test fraction when --dataset is used.  Default: 0.2.")
+
+    boc = parser.add_argument_group("BoCSoR hyperparameters")
+    boc.add_argument(
+        "--k", nargs="+", type=int, default=[11], metavar="K",
+        help=(
+            "Neighbourhood size(s). Single value K -> auto-expand to all odd "
+            "integers 1..K (e.g. --k 11 -> 1 3 5 7 9 11). Multiple values "
+            "used as-is (e.g. --k 1 5 11). Default: 11."
+        ),
+    )
+    boc.add_argument(
+        "--percentile", type=float, default=20.0, metavar="PCT",
+        help=(
+            "Percentile for boundary instance selection (0-100). Training "
+            "instances whose distance to their nearest opposite-class neighbour "
+            "is below this percentile are treated as boundary instances. "
+            "Default: 20."
+        ),
+    )
+    boc.add_argument(
+        "--original-class", nargs="+", type=int, default=[0],
+        choices=[0, 1], metavar="C",
+        help=(
+            "Class(es) whose boundary instances to explain.  "
+            "0 = income <= threshold (default).  "
+            "1 = income > threshold.  "
+            "0 1 = both classes (produces separate output files per class).  "
+            "Default: 0."
+        ),
+    )
+
+    cb = parser.add_argument_group("CatBoost hyperparameters")
+    cb.add_argument("--cb-iterations", type=int,   default=500,  metavar="N",
+                    help="Boosting rounds (epochs).  Default: 500.")
+    cb.add_argument("--cb-lr",         type=float, default=0.05, metavar="LR",
+                    help="Learning rate.  Default: 0.05.")
+    cb.add_argument("--cb-depth",      type=int,   default=6,    metavar="D",
+                    help="Tree depth.  Default: 6.")
+    cb.add_argument("--cb-early-stopping", type=int, default=0, metavar="N",
+                    help=(
+                        "Stop training if the eval loss does not improve for N "
+                        "consecutive rounds.  0 disables early stopping.  "
+                        "When enabled, 20%% of the training data is held out as "
+                        "an internal validation split.  Default: 0 (disabled)."
+                    ))
+    cb.add_argument("--cb-verbose",    action="store_true",
+                    help="Print CatBoost training progress.")
+
+    out = parser.add_argument_group("Output and performance")
+    out.add_argument("--output-dir", type=Path, default=Path("results"), metavar="DIR",
+                     help="Output directory (created if absent).  Default: results/.")
+    out.add_argument(
+        "--workers", type=int, default=_DEFAULT_WORKERS, metavar="N",
+        help=(
+            f"Worker processes for parallel boundary processing.  "
+            f"Default: {_DEFAULT_WORKERS}."
+        ),
+    )
+    out.add_argument("--seed", type=int, default=42,
+                     help="Random seed.  Default: 42.")
+    parser.add_argument(
+        "--log-level",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        default="INFO",
+        help="Logging verbosity.  Default: INFO.",
+    )
+    return parser
 
 
-def _chunked_predict(model: CatBoostClassifier, matrix: np.ndarray) -> np.ndarray:
-    """
-    Run CatBoost batch prediction in fixed-size chunks.
+def main() -> None:
+    multiprocessing.set_start_method("fork", force=True)
 
-    Motivation
-    ----------
-    When the perturbation matrix P is very large (e.g. 1 M+ rows on k=7 with
-    a large dataset), a single predict() call allocates the full result buffer
-    at once, stressing the unified memory bus on Apple Silicon.  Chunking keeps
-    each allocation within _PREDICT_CHUNK_SIZE rows, improving memory-locality
-    and allowing the OS to reclaim intermediate buffers between chunks.
+    parser = build_parser()
+    args   = parser.parse_args()
 
-    For matrices smaller than _PREDICT_CHUNK_SIZE the function is a thin
-    wrapper with no overhead.
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+        datefmt="%H:%M:%S",
+    )
 
-    Thread safety
-    -------------
-    CatBoostClassifier.predict() is thread-safe for read-only inference
-    (the model weights are not mutated).  Multiple threads may call this
-    function concurrently on the same model object without a lock.
+    if args.dataset is None and (args.train is None or args.test is None):
+        parser.error("Provide either --dataset OR both --train and --test.")
+    if args.dataset is not None and (args.train is not None or args.test is not None):
+        parser.error("--dataset is mutually exclusive with --train / --test.")
+    if args.workers < 1:
+        parser.error("--workers must be >= 1.")
 
-    Parameters
-    ----------
-    model  : fitted CatBoostClassifier
-    matrix : C-contiguous int32 NumPy array of shape (N, F)
+    try:
+        k_values = expand_k(args.k)
+    except ValueError as exc:
+        parser.error(str(exc))
 
-    Returns
-    -------
-    1-D NumPy array of predictions, length N.
-    """
-    if len(matrix) <= _PREDICT_CHUNK_SIZE:
-        return model.predict(matrix).ravel()
-    return np.concatenate([
-        model.predict(matrix[i : i + _PREDICT_CHUNK_SIZE]).ravel()
-        for i in range(0, len(matrix), _PREDICT_CHUNK_SIZE)
-    ])
+    logger.info("=" * 62)
+    logger.info("  ACS INCOME PIPELINE  --  stage 2: BoCSoR feature importance")
+    logger.info("=" * 62)
+    logger.info("  Analysis on      : TRAINING SET")
+    logger.info("  k values         : %s  (from --k %s)", k_values, args.k)
+    logger.info("  Percentile       : %.1f%%", args.percentile)
+    logger.info("  Classes          : %s", args.original_class)
+    logger.info("  Workers          : %d", args.workers)
+    logger.info("  Output dir       : %s", args.output_dir.resolve())
+    logger.info("=" * 62)
 
+    t_start = time.perf_counter()
 
-# ---------------------------------------------------------------------------
-# CategoricalBoCSoR
-# ---------------------------------------------------------------------------
+    X_train, X_test, y_train, y_test, target_col = load_split_data(
+        train_path=args.train,
+        test_path=args.test,
+        dataset_path=args.dataset,
+        test_size=args.split_size,
+        random_seed=args.seed,
+    )
+    feature_cols = list(X_train.columns)
+    logger.info("Train: %d rows  |  Test: %d rows  |  Features: %d",
+                len(X_train), len(X_test), len(feature_cols))
+    logger.info("Target: %s  |  Features: %s", target_col, feature_cols)
 
-class CategoricalBoCSoR:
-    """
-    Categorical adaptation of BoCSoR (Boundary Crossing Solo Ratio).
+    logger.info("Building rank maps ...")
+    rank_maps = build_rank_maps(X_train)
 
-    Differences from the original paper (all deliberate):
+    model = train_catboost(
+        X_train=X_train,
+        y_train=y_train,
+        cat_features=feature_cols,
+        random_seed=args.seed,
+        iterations=args.cb_iterations,
+        learning_rate=args.cb_lr,
+        depth=args.cb_depth,
+        verbose=args.cb_verbose,
+        early_stopping_rounds=(
+            args.cb_early_stopping if args.cb_early_stopping > 0 else None
+        ),
+    )
 
-    1. Hamming distance instead of Euclidean
-       Appropriate for categorical features where no ordinal relationship
-       between values exists.
+    y_pred_train = model.predict(X_train).astype(int).ravel()
+    y_pred_test  = model.predict(X_test).astype(int).ravel()
+    train_acc = (y_pred_train == y_train.values).mean()
+    test_acc  = (y_pred_test  == y_test.values).mean()
+    logger.info(
+        "CatBoost accuracy -- train: %.4f  |  test (held-out): %.4f",
+        train_acc, test_acc,
+    )
 
-    2. No midpoint interpolation
-       Midpoints between two categorical instances are not meaningful.
-       Following the authors' suggestion, only real instances from the
-       opposite class are used as counterfactuals.  Every candidate CF is
-       verified against the model before use (see explain()).
+    args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    3. Inverted swap direction
-       Instead of injecting the original feature value into the CF, the CF
-       feature value is injected into the original instance.  If this causes
-       the prediction to switch to the CF class, the feature with that CF
-       value is recorded as a driver.  This direction is more informative
-       for association-rule mining because the stored itemset contains the
-       actual CF values that trigger the switch, not just the feature names.
-
-    4. All k neighbours considered
-       All k nearest opposite-class neighbours are retained.  Each produces
-       a separate transaction row, enabling FP-Growth to detect patterns
-       across different CF contexts for the same boundary instance.
-
-    Performance design
-    ------------------
-    explain() uses a mega-batch strategy (2 model.predict() calls per class):
-    - One batched predict for all B×k CF candidates.
-    - One batched predict for all perturbations across all valid CFs.
-    - Perturbation matrix built via NumPy broadcasting (no Python inner loops).
-    - Per-class global indices pre-cached in fit() to avoid redundant np.where calls.
-    - X_enc stored as C-contiguous int32 for optimal cache behaviour.
-
-    Parallel design (M1 Ultra)
-    --------------------------
-    - _get_boundary_state(): serial BallTree query per class.
-      All ThreadPoolExecutor-based parallelism for BallTree was removed because
-      sklearn's BallTree calls into vecLib/Accelerate on Apple Silicon, which
-      uses Grand Central Dispatch (GCD) internally.  Any Python thread pool
-      around BallTree triggers GCD thread accumulation that stalls macOS's
-      scheduler — observed as a hard freeze after "Computing boundary state...".
-      The query over ~130K points takes ~2–5 s serially, negligible vs training.
-    - explain(): each k-value runs independently in the k-parallel thread pool
-      from run_for_k_values.  CatBoost and NumPy release the GIL so the pool
-      gives real parallelism for the predict and broadcasting steps.
-    - The boundary-state cache is protected by a threading.Lock so that
-      concurrent explain() calls from run_for_k_values()'s thread pool
-      do not trigger redundant recomputation.
-    """
-
-    def __init__(self, k_neighbors: int = 10, perc_threshold: int = 10) -> None:
-        """
-        Parameters
-        ----------
-        k_neighbors    : number of nearest opposite-class neighbours to query
-                         for each boundary instance during explain().
-        perc_threshold : boundary filter percentile.  Only instances whose
-                         minimum Hamming distance to the opposite class falls
-                         within this percentile are considered boundary
-                         instances.  Smaller values → fewer, more extreme
-                         boundary instances.
-        """
-        self.k_neighbors     = k_neighbors
-        self.perc_threshold  = perc_threshold
-        self.model           = None                    # set in fit()
-        self.feature_encoder = OrdinalEncoder(dtype=int)  # str categories → int codes
-        self.label_encoder   = LabelEncoder()          # target class labels → 0/1
-        self.trees: dict     = {}                      # one BallTree per class
-        self._task_type      = _catboost_task_type()   # 'GPU' or 'CPU'
-        self._thread_count   = _catboost_thread_count()  # CPU threads for CatBoost
-        # Boundary-state cache: populated on the first explain() call and
-        # reused for every subsequent call with the same (X, y) objects.
-        # Keyed by (id(X), id(y)) which is stable within run_for_k_values().
-        self._boundary_cache_key: tuple | None = None
-        self._boundary_cache: tuple | None     = None
-        # Lock protecting the boundary-state cache against concurrent access
-        # from the k-parallel thread pool in run_for_k_values().
-        self._boundary_cache_lock = threading.Lock()
-
-    # ------------------------------------------------------------------
-    # fit
-    # ------------------------------------------------------------------
-
-    def fit(self, X: pd.DataFrame, y: pd.Series) -> None:
-        """
-        Train CatBoost on (X, y) and build one Hamming-metric BallTree per class.
-
-        Why BallTrees on the training split only?
-        ------------------------------------------
-        fit() receives X / y = the training split provided by run_for_k_values().
-        Both BallTrees and explain() operate exclusively on this same split.
-        Using test instances as CF candidates would be data leakage: the boundary
-        search could pull in samples the model has never seen during training,
-        giving unreliable CF distances and invalid perturbation results.
-        Keeping everything on the training split ensures full consistency between
-        training, boundary identification, and counterfactual extraction.
-
-        Why C-contiguous int32?
-        -----------------------
-        NumPy fancy-indexing and slicing are fastest on C-contiguous (row-major)
-        arrays.  int32 halves memory vs int64 without precision loss for ordinal
-        codes (typically < 500 categories per column).
-
-        BallTree parallelism
-        --------------------
-        The two per-class BallTrees are built in a ThreadPoolExecutor(2).
-        BallTree construction is dominated by distance computations which
-        release the GIL, so both trees build truly concurrently.
-
-        Parameters
-        ----------
-        X : feature matrix — all columns must be categorical or integer.
-        y : binary target series (0/1 or any two-class labels).
-        """
-        print('  > Training CatBoost and building BallTrees...')
-        self.feature_names = X.columns.tolist()
-
-        # Encode target labels to integer class indices 0 and 1.
-        y_enc = self.label_encoder.fit_transform(y)
-
-        # OrdinalEncoder maps each category string to an integer code.
-        # C-contiguous int32 layout for optimal NumPy cache performance.
-        X_enc = np.ascontiguousarray(
-            self.feature_encoder.fit_transform(X), dtype=np.int32
+    # ── Skip-if-exists check ───────────────────────────────────────────────
+    # Determine which classes still need to be processed.  For each requested
+    # class, check whether feature_importance[_classN].csv already exists.
+    # If all requested outputs are present, skip stage 2 entirely.
+    orig_classes_requested = sorted(set(args.original_class))
+    suffix_map = {
+        c: (f"_class{c}" if len(orig_classes_requested) > 1 else "")
+        for c in orig_classes_requested
+    }
+    orig_classes_todo = [
+        c for c in orig_classes_requested
+        if not (args.output_dir / f"feature_importance{suffix_map[c]}.csv").exists()
+    ]
+    if not orig_classes_todo:
+        logger.info(
+            "Skipping stage 2: all output files already exist in %s.",
+            args.output_dir.resolve(),
+        )
+        return
+    skipped = set(orig_classes_requested) - set(orig_classes_todo)
+    if skipped:
+        logger.info(
+            "Skipping class(es) %s: output files already exist.",
+            sorted(skipped),
         )
 
-        # Inner 80/20 stratified split used ONLY for CatBoost early stopping.
-        # X_cb_tr / X_cb_val are numpy arrays derived from X_enc; they are never
-        # stored on self and do not affect the boundary search or explain().
-        X_cb_tr, X_cb_val, y_cb_tr, y_cb_val = train_test_split(
-            X_enc, y_enc, test_size=0.2, random_state=42, stratify=y_enc
+    # Deduplicate and sort the requested classes; for each, the counterfactual
+    # class is the other one (binary classification: 0 <-> 1).
+    orig_classes = orig_classes_todo
+
+    # Collect results for the summary report.
+    summary_data: list[dict] = []
+
+    for orig_cls in orig_classes:
+        cf_cls = 1 - orig_cls
+        # When only one class is requested the files have no suffix;
+        # when both are requested each file gets a _class<N> suffix so
+        # results don't overwrite each other.
+        suffix = f"_class{orig_cls}" if len(orig_classes) > 1 else ""
+
+        logger.info(
+            "== BoCSoR: class %d boundary (counterfactual class %d) ==",
+            orig_cls, cf_cls,
         )
-
-        self.model = CatBoostClassifier(
-            iterations            = 1000,   # M1 Ultra CPU throughput justifies more rounds
-            depth                 = 8,      # tree depth (balanced accuracy/speed)
-            learning_rate         = 0.05,   # shrinkage; lower = more robust
-            verbose               = 100,    # print progress every 100 iterations
-            allow_writing_files   = False,  # suppress CatBoost's local snapshot files
-            task_type             = self._task_type,     # 'GPU' or 'CPU'
-            thread_count          = self._thread_count,  # all cores on Apple Silicon
-            boosting_type         = 'Plain',  # faster than Ordered on large CPU datasets
-            use_best_model        = True,   # restore best iteration on early stopping
-            od_type               = 'Iter', # overfitting detector: count stagnant rounds
+        t_dir = time.perf_counter()
+        all_itemsets_df, importance_df, per_k_itemsets = run_bocsor_multi_k(
+            model=model,
+            X_train=X_train,
+            y_train=y_train,
+            y_pred_train=y_pred_train,
+            rank_maps=rank_maps,
+            feature_cols=feature_cols,
+            k_values=k_values,
+            percentile_th=args.percentile,
+            original_class=orig_cls,
+            cf_class=cf_cls,
+            n_workers=args.workers,
         )
-        self.model.fit(
-            X_cb_tr, y_cb_tr,
-            cat_features          = list(range(X_enc.shape[1])),
-            eval_set              = (X_cb_val, y_cb_val),
-            early_stopping_rounds = 50,
-        )
-
-        # Store the full encoded training matrix and labels.
-        # fit() receives X / y = the training split from run_for_k_values().
-        # X_enc / y_enc are the encoded versions of that same split.
-        # explain() also receives X / y (same objects) and will reuse these
-        # via the re-encoding shortcut in _get_boundary_state().
-        self.X_enc = X_enc
-        self.y_enc = y_enc
-
-        # Record the Python object ids of X / y (the training-split DataFrames
-        # passed by run_for_k_values to both fit() and explain()).
-        # _get_boundary_state() matches on these ids to skip redundant encoding.
-        self._fit_X_id = id(X)
-        self._fit_y_id = id(y)
-
-        # ── Build per-class ANN index for CF neighbour queries ────────────
-        # Used in _get_boundary_state: for each boundary instance find its k
-        # nearest neighbours in the OPPOSITE class.
-        #
-        # Backend selection (automatic):
-        #
-        #   pynndescent (preferred, install with: pip install pynndescent)
-        #   ---------------------------------------------------------------
-        #   Graph-based approximate nearest neighbour index optimised for
-        #   Hamming metric on high-cardinality categorical data.  Build is
-        #   O(N log N) and query is O(log N) — 50-100× faster than BallTree
-        #   at N=850K.  Approximation error is negligible for the percentile
-        #   boundary filter (±1 Hamming step affects <1% of boundary set).
-        #   With n_jobs=-1 it uses all available cores without spawning GCD
-        #   threads, so it is safe on macOS/Apple Silicon.
-        #
-        #   BallTree fallback (sklearn, always available)
-        #   ---------------------------------------------------------------
-        #   Exact but slow at large N: Hamming distances cluster in a narrow
-        #   range so the tree cannot prune branches; queries degrade to near-
-        #   O(N) per point.  At 850K/class this takes ~10h — use only for
-        #   small datasets or if pynndescent is not installed.
-        unique_labels = np.unique(y_enc)
-        if _PYNNDESCENT_AVAILABLE:
-            print(f'  > Building pynndescent ANN indices (Hamming, n_jobs=-1)...')
-        else:
-            print(f'  > pynndescent not found — falling back to BallTree (serial).')
-            print(f'    Install with: pip install pynndescent')
-            print(f'  > Building BallTrees (full class, serial, Hamming)...')
-
-        if not hasattr(self, '_tree_sample_idx'):
-            self._tree_sample_idx = {}
-
-        for label in unique_labels:
-            idx = np.where(y_enc == label)[0]
-            lbl = int(label)
-            # Store ALL class indices for global index mapping (no subsample)
-            self._tree_sample_idx[lbl] = idx
-
-            if _PYNNDESCENT_AVAILABLE:
-                # NNDescent.query() is called later in _get_boundary_state.
-                # We build with n_neighbors=30 (> max_k=15) so the internal
-                # graph has enough neighbours for any k we might query.
-                # n_jobs=-1 uses all cores via numba/joblib (not GCD threads).
-                index = NNDescent(
-                    X_enc[idx].astype(np.float32),
-                    metric   = 'hamming',
-                    n_neighbors = 30,
-                    n_jobs   = -1,
-                    random_state = 42,
-                )
-                index.prepare()   # pre-build search structure
-                self.trees[lbl] = index
-            else:
-                leaf_size = max(40, len(idx) // 200)
-                self.trees[lbl] = BallTree(
-                    X_enc[idx], metric='hamming', leaf_size=leaf_size
-                )
-
-        # Pre-cache per-class index arrays (into X_enc / y_enc) so explain() can
-        # directly index self.X_enc without recomputing np.where for every class.
-        self.class_indices = {
-            int(label): np.where(y_enc == label)[0]
-            for label in unique_labels
-        }
-
-    # ------------------------------------------------------------------
-    # _get_boundary_state  (called by explain; cached across k values)
-    # ------------------------------------------------------------------
-
-    def _get_boundary_state(
-        self,
-        X: pd.DataFrame,
-        y: pd.Series,
-        max_k: int | None = None,
-    ) -> tuple:
-        """
-        Encode X/y, compute boundary indices per class, and cache the result.
-
-        Why cache?
-        ----------
-        run_for_k_values() calls explain(X_tr, y_tr) once per k value.  The
-        boundary filter (NumPy Hamming distance + percentile threshold) and the
-        model-prediction filter are identical for every k — only the CF
-        neighbourhood size changes.  Without caching these two O(N) steps are
-        repeated for each k, which is pure wasted compute:
-
-            k_values = [1, 3, 5, 7, 9, 11, 13, 15]  →  8× redundant distance compute + predict
-
-        Cache key: (id(X), id(y)) — these are the *same* Python objects for
-        every explain() call within a single run_for_k_values() invocation, so
-        the id check is both correct and O(1).
-
-        Thread safety
-        -------------
-        Protected by self._boundary_cache_lock.  When multiple k-threads call
-        explain() simultaneously (run_for_k_values' thread pool), only the first
-        thread computes the boundary state; all others block on the lock, then
-        find the cache hot and return immediately.
-
-        Re-encoding optimisation
-        ------------------------
-        When X/y are the same Python objects passed to fit() as X_tr/y_tr
-        (the standard use-case: explain on the training split), self.X_enc and
-        self.y_enc are reused directly, avoiding a redundant O(N×F) transform.
-        If different objects are passed (e.g. a held-out explanation set), the
-        encoder is applied normally.
-
-        Parallelism
-        -----------
-        The boundary distance computation uses NumPy broadcasting (no Python
-        threads) so Apple's BLAS/vecLib accelerates it automatically across
-        all available cores without spawning GCD threads.
-
-        Returns
-        -------
-        (X_enc, y_enc, all_classes, state_by_label) where state_by_label maps
-        each class label to a dict with keys:
-            boundary_idx  — indices of boundary instances that pass both filters
-            pos_idx       — indices of all instances with this label
-            opp_label     — the single opposite class label (binary problem)
-        or None if the class has no usable boundary instances.
-        """
-        cache_key = (id(X), id(y))
-
-        # ── Fast path (no lock) ──────────────────────────────────────────
-        # After the cache is warmed by run_for_k_values, all k-threads will
-        # reach this point with the cache already populated.  Reading two
-        # plain Python references without a lock is safe: Python's GIL
-        # guarantees atomic reads of object references.  If the key matches
-        # we return immediately without ever contending on the lock.
-        if self._boundary_cache_key == cache_key:
-            return self._boundary_cache
-
-        # ── Slow path (with lock) ────────────────────────────────────────
-        # Cache miss on the fast path: acquire the lock, then re-check in
-        # case another thread computed the state between our fast-path read
-        # and acquiring the lock (classic double-checked locking pattern).
-        with self._boundary_cache_lock:
-            if self._boundary_cache_key == cache_key:
-                return self._boundary_cache
-            # Cache miss confirmed under the lock.
-            # Either this is the very first call, or X/y objects changed.
-            if self._boundary_cache_key is not None:
-                print(
-                    '  > WARNING: boundary state cache invalidated — X/y object ids '
-                    'changed between explain() calls.  Boundary filter will be '
-                    're-computed (expected only on the first call).'
-                )
-
-            print('  > Computing boundary state (cached for all k values)...')
-
-            # Reuse the already-encoded matrix from fit() when X/y are the same
-            # Python objects (standard XAI use-case: explain on training data).
-            # This avoids a redundant O(N×F) OrdinalEncoder.transform() call.
-            if hasattr(self, '_fit_X_id') and id(X) == self._fit_X_id:
-                X_enc = self.X_enc
-            else:
-                X_enc = np.ascontiguousarray(
-                    self.feature_encoder.transform(X), dtype=np.int32
-                )
-
-            if hasattr(self, '_fit_y_id') and id(y) == self._fit_y_id:
-                y_enc = self.y_enc
-            else:
-                y_enc = self.label_encoder.transform(y)
-
-            all_classes = np.unique(y_enc)
-
-            # ── Nearest-neighbour boundary detection ──────────────────────
-            # For each sample of class C find its minimum Hamming distance to
-            # the nearest sample of the OPPOSITE class; select the bottom
-            # perc_threshold percentile as boundary instances (paper Eq. 1).
-            #
-            # Backend: pynndescent if available, BallTree otherwise.
-            # self.trees[opp_label] holds whichever was built in fit().
-
-            def _query_k1(index, query_X):
-                """Return (N,) float array of min Hamming distances."""
-                if _PYNNDESCENT_AVAILABLE and isinstance(index, NNDescent):
-                    ind, dist = index.query(query_X.astype(np.float32), k=1)
-                    return dist.ravel()
-                else:
-                    dist, _ = index.query(query_X, k=1)
-                    return dist.ravel()
-
-            state: dict = {}
-            for label in all_classes:
-                lbl       = int(label)
-                pos_idx   = np.where(y_enc == lbl)[0]
-                if len(pos_idx) == 0:
-                    state[lbl] = None
-                    continue
-                opp_label = int(all_classes[all_classes != label][0])
-                if opp_label not in self.trees:
-                    state[lbl] = None
-                    continue
-
-                backend = 'pynndescent' if _PYNNDESCENT_AVAILABLE else 'BallTree'
-                print(f'    - class {lbl}: querying {len(pos_idx):,} pts '
-                      f'against opp index ({len(self._tree_sample_idx[opp_label]):,} pts, {backend})...')
-                dist = _query_k1(self.trees[opp_label], X_enc[pos_idx])
-
-                threshold     = np.percentile(dist, self.perc_threshold)
-                candidate_idx = pos_idx[dist <= threshold]
-                print(f'      → {len(candidate_idx):,} boundary candidates '
-                      f'(dist ≤ {threshold:.4f})')
-                state[lbl] = {
-                    'candidate_idx': candidate_idx,
-                    'pos_idx':       pos_idx,
-                    'opp_label':     opp_label,
-                }
-
-            # ── Model-prediction filter (one batched predict, all classes) ─
-            # Single-pass normalisation: separate classes into three buckets:
-            #   (A) None          → no pos_idx or no opposite-class tree
-            #   (B) 0 candidates  → boundary distance filter eliminated all
-            #   (C) >0 candidates → need the model-prediction filter
-            # After this block every entry in state has 'boundary_idx' as key,
-            # never 'candidate_idx' — _explain_one_class always sees a uniform
-            # dict shape regardless of which bucket the class fell into.
-            labels_with_candidates = []   # bucket C
-            for lbl, s in list(state.items()):
-                if s is None:
-                    # bucket A — leave as None (handled by _explain_one_class)
-                    continue
-                if len(s['candidate_idx']) == 0:
-                    # bucket B — no candidates survived the distance filter
-                    state[lbl] = {
-                        'boundary_idx': np.empty(0, dtype=np.int64),
-                        'pos_idx':      s['pos_idx'],
-                        'opp_label':    s['opp_label'],
-                    }
-                else:
-                    # bucket C — has candidates, needs model-prediction filter
-                    labels_with_candidates.append(lbl)
-
-            if labels_with_candidates:
-                # Concatenate all candidate rows into one mega-batch predict so
-                # CatBoost uses its full thread pool in a single call.
-                all_candidate_idx = np.concatenate([
-                    state[lbl]['candidate_idx'] for lbl in labels_with_candidates
-                ])
-                split_sizes = [
-                    len(state[lbl]['candidate_idx']) for lbl in labels_with_candidates
-                ]
-
-                all_preds   = _chunked_predict(self.model, X_enc[all_candidate_idx])
-                split_preds = np.split(all_preds, np.cumsum(split_sizes)[:-1])
-
-                for lbl, preds in zip(labels_with_candidates, split_preds):
-                    s            = state[lbl]
-                    boundary_idx = s['candidate_idx'][preds == lbl]
-                    if len(boundary_idx) == 0:
-                        print(
-                            f'    - class {lbl}: 0 boundary samples pass the '
-                            f'model-prediction filter — skipping.'
-                        )
-                    # Overwrite with normalised dict — 'candidate_idx' removed.
-                    state[lbl] = {
-                        'boundary_idx': boundary_idx,
-                        'pos_idx':      s['pos_idx'],
-                        'opp_label':    s['opp_label'],
-                    }
-
-            # ── Pre-compute CF neighbours for all boundary instances ──────
-            # The BallTree query is by far the most expensive step (~5-15 min
-            # per class at South scale).  Since boundary_idx is identical for
-            # every k value, querying once with k=max_k and slicing [:k] inside
-            # _explain_one_class eliminates 7 of 8 redundant queries when
-            # k_values=[1,3,5,7,9,11,13,15].
-            #
-            # max_k is passed in by run_for_k_values; defaults to self.k_neighbors
-            # if called standalone (e.g. unit tests).
-            effective_max_k = max_k if max_k is not None else self.k_neighbors
-            backend = 'pynndescent' if _PYNNDESCENT_AVAILABLE else 'BallTree'
-            print(f'  > Querying CF neighbours '
-                  f'(k={effective_max_k}, {backend}, once for all k values)...')
-            for lbl, s in state.items():
-                if s is None or len(s['boundary_idx']) == 0:
-                    continue
-                opp_label    = s['opp_label']
-                boundary_idx = s['boundary_idx']
-                index        = self.trees[opp_label]
-                tree_idx     = self._tree_sample_idx[opp_label]
-                boundary_X   = X_enc[boundary_idx].astype(np.float32)
-                print(f'    - class {lbl}: querying {len(boundary_idx):,} '
-                      f'boundary pts for k={effective_max_k}...')
-                if _PYNNDESCENT_AVAILABLE and isinstance(index, NNDescent):
-                    ind, _ = index.query(boundary_X, k=effective_max_k)  # (B, max_k)
-                else:
-                    _, ind = index.query(boundary_X, k=effective_max_k)  # (B, max_k)
-                # Store (B, max_k) global index array in the state dict.
-                # _explain_one_class slices [:, :self.k_neighbors] to get its k.
-                s['cf_ind_global'] = tree_idx[ind]   # (B, max_k) global positions
-
-            result = (X_enc, y_enc, all_classes, state)
-            self._boundary_cache_key = cache_key
-            self._boundary_cache     = result
-            return result
-
-    # ------------------------------------------------------------------
-    # _explain_one_class  (called by explain in parallel)
-    # ------------------------------------------------------------------
-
-    def _explain_one_class(
-        self,
-        label: int,
-        state: dict,
-        X_enc: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
-        """
-        Run the counterfactual analysis for a single class.
-
-        CF neighbours are pre-computed in _get_boundary_state (once, with
-        k=max_k).  This method slices the first self.k_neighbors columns so
-        each k-clone works on its own neighbourhood size without repeating
-        the expensive BallTree query.
-
-        Returns
-        -------
-        (b_idx_global, cf_gidx, driver_strs) arrays if any drivers were found,
-        or None if the class should be skipped.
-        """
-        if state is None:
-            return None
-
-        boundary_idx = state['boundary_idx']
-        opp_label    = state['opp_label']
-        pos_idx      = state['pos_idx']
-
-        if len(boundary_idx) == 0:
-            return None
-
-        print(
-            f'    - class {label}: {len(boundary_idx)}/{len(pos_idx)} '
-            f'boundary samples, k={self.k_neighbors} '
-            f'(perc_threshold={self.perc_threshold})'
-        )
-
-        B          = len(boundary_idx)
-        boundary_X = X_enc[boundary_idx]   # (B, F)
-
-        # ── Retrieve pre-computed CF neighbours, slice to current k ───────
-        # cf_ind_global was populated in _get_boundary_state with k=max_k.
-        # Slicing [:, :self.k_neighbors] is O(1) (view, no copy).
-        cf_global_all = state['cf_ind_global'][:, :self.k_neighbors]  # (B, k)
-        cf_X_all      = self.X_enc[cf_global_all.ravel()]      # (B*k, F)
-        cf_preds      = _chunked_predict(self.model, cf_X_all).reshape(B, -1)
-        valid_mask    = cf_preds == opp_label                   # (B, k) bool
-
-        n_valid = int(valid_mask.sum())
-        if n_valid == 0:
-            print(f'    - class {label}: 0 valid CF neighbours — skipping.')
-            return None
-
-        # ── (b) Build perturbation matrix via NumPy broadcasting ──────
-        valid_b, valid_cf_pos = np.where(valid_mask)
-        cf_gidx_valid = cf_global_all[valid_b, valid_cf_pos]   # global CF idx
-
-        orig_valid  = boundary_X[valid_b]                      # (n_valid, F)
-        cf_valid    = self.X_enc[cf_gidx_valid]                # (n_valid, F)
-        diff_matrix = cf_valid != orig_valid                   # (n_valid, F)
-
-        pair_idx, feat_idx = np.where(diff_matrix)
-        P = len(pair_idx)
-        if P == 0:
-            return None
-
-        # Build perturbation matrix: start from the original rows, then
-        # overwrite the single differing feature per row with the CF value.
-        # np.ascontiguousarray guarantees C-contiguous layout for CatBoost.
-        perturb_matrix = np.ascontiguousarray(orig_valid[pair_idx], dtype=np.int32)
-        perturb_matrix[np.arange(P), feat_idx] = \
-            cf_valid[pair_idx, feat_idx]
-
-        print(
-            f'    - class {label}: {n_valid:,} valid CFs, '
-            f'{P:,} perturbations — predicting...'
-        )
-
-        # ── (c) Chunked-predict all P perturbations ───────────────────
-        all_preds = _chunked_predict(self.model, perturb_matrix)   # (P,)
-
-        # ── (d) Identify drivers ──────────────────────────────────────
-        driver_indices = np.where(all_preds != label)[0]
-        if len(driver_indices) == 0:
-            return None
-
-        driver_b      = valid_b[pair_idx[driver_indices]]
-        driver_cf_idx = cf_gidx_valid[pair_idx[driver_indices]]
-        driver_feat   = feat_idx[driver_indices]
-        driver_cf_val = cf_valid[
-            pair_idx[driver_indices], feat_idx[driver_indices]
-        ].astype(np.int32)
-
-        # ── (e) Vectorized driver string construction ─────────────────
-        # Loop over unique feature indices (≤ 11 for ACS) instead of
-        # over individual driver rows (potentially millions).
-        driver_strs = np.empty(len(driver_feat), dtype=object)
-        for f_idx in np.unique(driver_feat):
-            mask   = driver_feat == f_idx
-            cats   = self.feature_encoder.categories_[f_idx]
-            prefix = self.feature_names[f_idx] + '='
-            driver_strs[mask] = np.char.add(prefix, cats[driver_cf_val[mask]])
-
-        # ── (f) Group drivers by (b_idx, cf_gidx) ────────────────────
-        # Build a structured key array for sorting, then use np.unique to
-        # find group boundaries — avoids the pandas groupby overhead of
-        # constructing a lambda and calling sorted() on each group
-        # separately (which becomes expensive with millions of driver rows).
-        #
-        # Encoding: pack (b_idx, cf_gidx) into a single int64 key so that
-        # np.unique operates on a 1-D array (much faster than sorting a
-        # structured array or a DataFrame).
-        # Both arrays are int32 (max value ~ 2^31); shift b_idx left by 32
-        # bits so the composite key is unique for any valid pair.
-        # Mask the lower 32 bits of cf_idx before OR-ing to prevent
-        # sign-extension of large positive int32 values corrupting the key.
-        keys = (driver_b.astype(np.int64) << 32) | (driver_cf_idx.astype(np.int64) & 0xFFFF_FFFF)
-        sort_order  = np.argsort(keys, kind='stable')
-        keys_sorted = keys[sort_order]
-        strs_sorted = driver_strs[sort_order]
-        b_sorted    = driver_b[sort_order]
-        cf_sorted   = driver_cf_idx[sort_order]
-
-        # np.unique returns the index of the first occurrence of each key —
-        # use those as group boundaries.
-        _, first_occurrence = np.unique(keys_sorted, return_index=True)
-        group_starts = first_occurrence
-
-        n_groups      = len(group_starts)
-        out_b_idx     = b_sorted[group_starts]
-        out_cf_gidx   = cf_sorted[group_starts]
-        # np.split avoids the enumerate/zip Python overhead; each group slice
-        # is ≤ 11 items so sorted() on the .tolist() is essentially free.
-        groups   = np.split(strs_sorted, group_starts[1:])
-        # Use an explicit object array filled via index assignment to prevent
-        # numpy from promoting equal-length groups into a 2D ndarray.
-        # When all groups have the same length, np.array([list, list, ...]) would
-        # produce shape (N, L) with ndarray elements instead of (N,) with list
-        # elements — making downstream json.dumps fail with "ndarray not serializable".
-        _sorted_groups = [sorted(g.tolist()) for g in groups]
-        out_strs = np.empty(len(_sorted_groups), dtype=object)
-        for _i, _sg in enumerate(_sorted_groups):
-            out_strs[_i] = _sg
-
-        return (
-            boundary_idx[out_b_idx],
-            out_cf_gidx,
-            out_strs,
-        )
-
-    # ------------------------------------------------------------------
-    # explain
-    # ------------------------------------------------------------------
-
-    def explain(self, X: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
-        """
-        Run the boundary-crossing counterfactual analysis on (X, y).
-
-        For each class in turn:
-          1. Retrieve pre-computed boundary indices from _get_boundary_state()
-             (cached — the expensive O(N) boundary filter and model-prediction
-             filter are computed only once across all k values).
-          2. For each surviving boundary instance, query k nearest CF
-             neighbours from the opposite class.
-          3. Build the full perturbation matrix via NumPy broadcasting:
-             for every (boundary_instance, CF_neighbour, differing_feature)
-             triple, create a perturbed copy of the boundary instance with
-             that feature replaced by the CF's value.
-          4. Chunked-predict all perturbations (_chunked_predict).
-          5. Vectorized driver string construction: loop over unique feature
-             indices (≤ 11 on ACS) rather than over individual drivers.
-          6. Vectorized grouping via pandas groupby instead of a Python dict.
-
-        Parallelism
-        -----------
-        The per-class workloads are dispatched to a ThreadPoolExecutor(n_classes).
-        NumPy broadcasting, BallTree.query(), and CatBoostClassifier.predict()
-        all release the GIL, so the two class threads run with genuine
-        parallelism on M1 Ultra P-cores.
-
-        Parameters
-        ----------
-        X : feature matrix (same columns as fit(); already seen by the encoder)
-        y : target series (same classes as fit())
-
-        Returns
-        -------
-        pd.DataFrame with columns:
-            Sample_ID             — original index from X (row label)
-            CF_Neighbor_ID        — positional index of the CF in self.X_enc
-            Counterfactual_Values — sorted list of 'FEATURE=cf_value' strings
-        """
-        print('  > Extracting counterfactuals '
-              '(parallel per-class, vectorised per-feature swap)...')
-
-        # Retrieve (or compute + cache) boundary state.
-        # Pass self.k_neighbors as max_k so standalone explain() calls also
-        # pre-compute CF neighbours at the right k (no-op if already cached).
-        X_enc, y_enc, all_classes, boundary_state = self._get_boundary_state(
-            X, y, max_k=self.k_neighbors
-        )
-
-        # NumPy array for O(1) index-based lookup of original row labels.
-        original_indices = np.asarray(X.index)
-
-        all_rows_b_idx   = []
-        all_rows_cf_gidx = []
-        all_rows_strs    = []
-
-        # ── Process each class serially ───────────────────────────────
-        # _explain_one_class calls tree.query() which hits vecLib/GCD on
-        # Apple Silicon — same thread-accumulation issue as _get_boundary_state.
-        # The k-parallel pool in run_for_k_values already provides parallelism
-        # across k values; within a single k the per-class serial loop is fine.
-        for label in all_classes:
-            result = self._explain_one_class(
-                int(label),
-                boundary_state.get(int(label)),
-                X_enc,
+        elapsed_dir = time.perf_counter() - t_dir
+
+        # ── Save itemsets ──────────────────────────────────────────────────
+        # Combined file: all k merged.  Columns: [k_value, instance_index,
+        # features, itemset].  One row per boundary instance per k value.
+        itemsets_path = args.output_dir / f"feature_importance_itemsets{suffix}.csv"
+        all_itemsets_df.to_csv(itemsets_path, index=False)
+        logger.info("Itemsets (all k) -> %s  (%d rows)", itemsets_path, len(all_itemsets_df))
+
+        # Per-k files: feature_importance_itemsets_k<N>[_class<C>].csv
+        # Columns: [k_value, instance_index, features, itemset].
+        for k_val, k_df in per_k_itemsets.items():
+            k_path = args.output_dir / f"feature_importance_itemsets_k{k_val}{suffix}.csv"
+            k_df.to_csv(k_path, index=False)
+            logger.info("  k=%d -> %s  (%d rows)", k_val, k_path.name, len(k_df))
+
+        # ── Save feature importance table ──────────────────────────────────
+        # Columns: [feature, k_1, k_3, …, k_N].  One row per feature.
+        imp_path = args.output_dir / f"feature_importance{suffix}.csv"
+        importance_df.reset_index().to_csv(imp_path, index=False)
+        logger.info("Importance -> %s", imp_path)
+
+        logger.info("Feature importance summary (class %d):", orig_cls)
+        for k_col in importance_df.columns:
+            top = importance_df[k_col].sort_values(ascending=False)
+            logger.info("  %s:", k_col)
+            for feat, score in top.items():
+                logger.info("    %-40s %.4f", feat, score)
+
+        if not all_itemsets_df.empty:
+            logger.info(
+                "\nItemset preview class %d (first 10 rows):\n%s",
+                orig_cls, all_itemsets_df.head(10).to_string(index=False),
             )
-            if result is not None:
-                b_idx_global, cf_gidx, driver_strs = result
-                all_rows_b_idx.append(b_idx_global)
-                all_rows_cf_gidx.append(cf_gidx)
-                all_rows_strs.append(driver_strs)
 
-        if not all_rows_b_idx:
-            print('    - done: 0 (sample, CF-neighbour) pairs with at least one driver\n')
-            return pd.DataFrame(columns=['Sample_ID', 'CF_Neighbor_ID', 'Counterfactual_Values'])
-
-        # Concatenate results from all classes into a single output DataFrame.
-        all_b_idx   = np.concatenate(all_rows_b_idx)
-        all_cf_gidx = np.concatenate(all_rows_cf_gidx)
-        all_strs    = np.concatenate(all_rows_strs)
-
-        result_df = pd.DataFrame({
-            'Sample_ID':             original_indices[all_b_idx],
-            'CF_Neighbor_ID':        all_cf_gidx.astype(int),
-            # Serialise as JSON strings so downstream readers can use
-            # json.loads (C-accelerated, GIL-releasing) instead of the
-            # slow pure-Python ast.literal_eval.
-            # map() is slightly faster than a list-comprehension for a
-            # pure-Python per-element call on large arrays.
-            'Counterfactual_Values': np.array(
-                list(map(
-                    lambda lst: json.dumps(lst.tolist() if isinstance(lst, np.ndarray) else lst),
-                    all_strs,
-                )),
-                dtype=object,
-            ),
+        summary_data.append({
+            "orig_cls":      orig_cls,
+            "importance_df": importance_df,
+            "elapsed_dir":   elapsed_dir,
         })
 
-        print(
-            f'    - done: {len(result_df)} (sample, CF-neighbour) pairs '
-            f'with at least one driver\n'
-        )
-        return result_df
-
-
-# ---------------------------------------------------------------------------
-# Post-processing helpers
-# ---------------------------------------------------------------------------
-
-def extract_labels_and_values(results_dir: Path, parse_workers: int = None) -> None:
-    """
-    Parse transactions_values.csv and write four derived CSV files used by
-    the association-rule mining step.
-
-    Output files
-    ------------
-    labels_only.csv
-        One row per (sample, CF) pair.  'Labels' column contains all driver
-        feature *names* (e.g. ['SCHL', 'OCCP', 'SCHL']).  Duplicates kept.
-
-    labels_only_unique.csv
-        Same as above but deduplicated on (feature_name, cf_value) pairs
-        jointly so that labels_only_unique and values_only_unique remain
-        positionally aligned after deduplication.
-
-    values_only.csv
-        One row per (sample, CF) pair.  'Values' column contains the CF
-        category values (e.g. ['Bachelors-Degree', 'Software-Developers']).
-
-    values_only_unique.csv
-        Deduplicated version of values_only.csv (same dedup key as above).
-
-    Why joint deduplication?
-    ------------------------
-    If we deduplicated labels and values independently, a feature that appears
-    twice with two different values would have the duplicate label removed but
-    both values kept, breaking the positional alignment between the two files.
-    Joint deduplication on (label, value) pairs prevents this.
-
-    Parallelism
-    -----------
-    The ast.literal_eval parse step is parallelised over CPU cores using a
-    ThreadPoolExecutor.  Parsing is CPU-bound (pure Python) but the GIL is
-    briefly released between cells, and the overhead of process-based
-    parallelism is too high for this step.  Thread-based batching still gives
-    a meaningful speedup on large transaction files (≥ 50 K rows).
-
-    Parameters
-    ----------
-    results_dir : directory containing transactions_values.csv; output files
-                  are written to the same directory.
-    """
-    print('  > Extracting labels and values from counterfactual drivers...')
-    input_file = results_dir / 'transactions_values.csv'
-
-    # Guard against missing or malformed input files gracefully.
-    if not input_file.exists():
-        print('    - WARNING: transactions file not found, skipping.')
-        return
-    try:
-        df = pd.read_csv(input_file)
-    except (pd.errors.EmptyDataError, pd.errors.ParserError) as exc:
-        print(f'    - WARNING: could not read transactions file ({exc}), skipping.')
-        return
-    if df.empty:
-        print('    - WARNING: no transactions found, skipping.')
-        return
-
-    base_cols = ['Sample_ID']
-    if 'CF_Neighbor_ID' in df.columns:
-        base_cols.append('CF_Neighbor_ID')
-
-    # ── Vectorized parsing — eliminates iterrows() ────────────────────
-    # ── ast.literal_eval fallback counter (thread-safe) ─────────────
-    # json.loads is C-accelerated and releases the GIL — genuine thread
-    # parallelism.  ast.literal_eval is pure-Python and holds the GIL for
-    # its entire duration, serialising any thread that enters the fallback.
-    # We count legacy cells so the caller can warn and prompt conversion.
-    _legacy_count = [0]
-    _legacy_lock  = threading.Lock()
-
-    def _parse_items(cell: str) -> tuple[list, list]:
-        """Parse one Counterfactual_Values cell → (labels, values) lists.
-
-        Tries json.loads first (C-accelerated, GIL-releasing, 5–10× faster
-        than ast.literal_eval) and falls back to ast.literal_eval for any
-        legacy files written before the JSON serialisation change.
-
-        WARNING: the ast.literal_eval fallback holds the GIL for its full
-        duration, negating all thread-parallelism gains on that cell.  If
-        many cells hit this path the ThreadPoolExecutor is effectively serial.
-        Run the one-off conversion below to eliminate the fallback:
-
-            df['Counterfactual_Values'] = df['Counterfactual_Values'].apply(
-                lambda c: json.dumps(ast.literal_eval(c))
-            )
-            df.to_csv(input_file, index=False)
-        """
-        nonlocal _legacy_count
-        try:
-            items = json.loads(cell)
-        except (json.JSONDecodeError, TypeError, ValueError):
-            try:
-                items = ast.literal_eval(str(cell))
-                with _legacy_lock:
-                    _legacy_count[0] += 1
-            except (ValueError, SyntaxError):
-                return [], []
-        labels, values = [], []
-        for item in items:
-            s = str(item)
-            if '=' in s:
-                lbl, val = s.split('=', 1)
-                labels.append(lbl.strip())
-                values.append(val.strip())
-        return labels, values
-
-    def _dedup_pairs(labels: list, values: list) -> tuple[list, list]:
-        """Deduplicate on (label, value) pairs jointly to preserve alignment."""
-        seen: set = set()
-        ul: list  = []
-        uv: list  = []
-        for lbl, val in zip(labels, values):
-            pair = (lbl, val)
-            if pair not in seen:
-                seen.add(pair)
-                ul.append(lbl)
-                uv.append(val)
-        return ul, uv
-
-    # ── Parallel parse + dedup over chunks ───────────────────────────
-    # Each chunk thread parses AND deduplicates its slice so that the main
-    # thread only needs to concatenate flat lists — zero serial Python loops
-    # over individual rows after the pool returns.
-    # For large files (> 50 K rows) this is measurably faster than a
-    # single-threaded apply() for both parse and dedup.
-    cells = df['Counterfactual_Values'].tolist()
-    n_workers  = min(parse_workers or N_PHYSICAL_CORES, len(cells))
-    chunk_size = max(1, len(cells) // n_workers)
-    chunks = [cells[i : i + chunk_size] for i in range(0, len(cells), chunk_size)]
-
-    def _parse_and_dedup_chunk(chunk):
-        """Parse and deduplicate every cell in one chunk — runs in a thread."""
-        labels_raw, values_raw, labels_uniq, values_uniq = [], [], [], []
-        for c in chunk:
-            lbl, val = _parse_items(c)
-            ul, uv   = _dedup_pairs(lbl, val)
-            labels_raw.append(lbl);  values_raw.append(val)
-            labels_uniq.append(ul);  values_uniq.append(uv)
-        return labels_raw, values_raw, labels_uniq, values_uniq
-
-    labels_list        = []
-    values_list        = []
-    labels_unique_list = []
-    values_unique_list = []
-
-    with ThreadPoolExecutor(max_workers=n_workers) as pool:
-        for lr, vr, lu, vu in pool.map(_parse_and_dedup_chunk, chunks):
-            labels_list.extend(lr);        values_list.extend(vr)
-            labels_unique_list.extend(lu); values_unique_list.extend(vu)
-
-    if _legacy_count[0] > 0:
-        pct = _legacy_count[0] / len(cells) * 100
-        print(
-            f'    - WARNING: {_legacy_count[0]:,} / {len(cells):,} cells '
-            f'({pct:.1f}%) used ast.literal_eval fallback (GIL held). '
-            f'Auto-converting {input_file.name} to JSON format...'
-        )
-        try:
-            df['Counterfactual_Values'] = df['Counterfactual_Values'].apply(
-                lambda c: json.dumps(ast.literal_eval(c))
-                if not str(c).startswith('[\"') else c
-            )
-            df.to_csv(input_file, index=False)
-            print(f'    - Converted {input_file.name} to JSON format. '
-                  f'Future runs will use json.loads (faster, parallel).')
-        except Exception as exc:
-            print(f'    - WARNING: auto-conversion failed ({exc}). '
-                  f'Next run will still use ast.literal_eval fallback.')
-
-    base_data = {col: df[col] for col in base_cols}
-
-    # ── Write all four output files in parallel ───────────────────────
-    # Each to_csv() is an independent I/O operation; running them
-    # concurrently halves wall-clock time on large files.
-    def _write_csv(args):
-        filename, col_name, data = args
-        pd.DataFrame({**base_data, col_name: data}).to_csv(
-            results_dir / filename, index=False
-        )
-        print(f'    - saved {filename}')
-
-    write_tasks = [
-        ('labels_only.csv',        'Labels', labels_list),
-        ('labels_only_unique.csv', 'Labels', labels_unique_list),
-        ('values_only.csv',        'Values', values_list),
-        ('values_only_unique.csv', 'Values', values_unique_list),
-    ]
-    with ThreadPoolExecutor(max_workers=len(write_tasks)) as pool:
-        list(pool.map(_write_csv, write_tasks))
-
-
-def aggregate_drivers_by_sample(results_dir: Path, parse_workers: int = None) -> None:
-    """
-    Collapse all (sample, CF-neighbour) rows into one transaction per sample
-    and write two aggregated CSV files used as the primary FP-Growth input.
-
-    Output files
-    ------------
-    aggregated_labels_by_sample.csv  (preferred by macroscopic_experiment_association_rules.py)
-        One row per unique sample.  'Labels' is the *union* of all unique driver
-        feature names across every CF neighbour for that sample.  Duplicates
-        removed.  This format treats each sample as a single transaction and
-        is the recommended input for association-rule mining.
-
-    aggregated_labels_duplicates_by_sample.csv
-        One row per unique sample.  'Labels' contains all driver feature names
-        concatenated across CFs, *with* duplicates.  A feature that drove
-        predictions for three different CFs of the same sample appears three
-        times.  Useful for frequency-weighted analysis.
-
-    Both files include:
-        Num_Labels       — cardinality of the Labels list for that row
-        Num_CF_Neighbors — number of CF neighbours that contributed drivers
-
-    Parameters
-    ----------
-    results_dir : directory containing labels_only.csv.
-    """
-    print('  > Aggregating labels by sample...')
-
-    labels_path = results_dir / 'labels_only.csv'
-    out_unique  = results_dir / 'aggregated_labels_by_sample.csv'
-    out_dupl    = results_dir / 'aggregated_labels_duplicates_by_sample.csv'
-
-    if not labels_path.exists():
-        print(f'    - WARNING: {labels_path.name} not found, skipping.')
-        return
-    try:
-        df = pd.read_csv(labels_path)
-    except (pd.errors.EmptyDataError, pd.errors.ParserError) as exc:
-        print(f'    - WARNING: could not read labels file ({exc}), skipping.')
-        return
-    if df.empty:
-        print('    - WARNING: labels file is empty, skipping.')
-        return
-
-    # Guard against malformed cells: a single bad cell would otherwise crash
-    # the entire aggregation step with an unhandled ValueError/SyntaxError.
-    _agg_legacy_count = [0]
-    _agg_legacy_lock  = threading.Lock()
-
-    def _safe_literal_eval(cell):
-        # json.loads is C-accelerated and GIL-releasing — much faster than
-        # ast.literal_eval for cells written by the new JSON serialiser.
-        # ast fallback handles any legacy files with Python-repr strings.
-        # WARNING: ast.literal_eval holds the GIL — thread parallelism is
-        # lost for any cell that enters this branch.  See extract_labels_and_values
-        # for the one-off conversion command.
-        try:
-            return json.loads(cell)
-        except (json.JSONDecodeError, TypeError, ValueError):
-            try:
-                result = ast.literal_eval(str(cell))
-                with _agg_legacy_lock:
-                    _agg_legacy_count[0] += 1
-                return result
-            except (ValueError, SyntaxError):
-                return []
-
-    # ── Parallel parse of stringified lists ──────────────────────────
-    # df['Labels'].apply(_safe_literal_eval) is a serial Python loop —
-    # on a large labels_only.csv (100 K+ rows) this is the dominant cost
-    # of aggregate_drivers_by_sample().  Chunking over N_PHYSICAL_CORES
-    # threads parallelises the json.loads work across P-cores.
-    # Note: cells that fall through to ast.literal_eval hold the GIL and
-    # do NOT gain parallelism — see _safe_literal_eval above.
-    cells      = df['Labels'].tolist()
-    n_workers  = min(parse_workers or N_PHYSICAL_CORES, len(cells))
-    chunk_size = max(1, len(cells) // n_workers)
-    chunks     = [cells[i : i + chunk_size] for i in range(0, len(cells), chunk_size)]
-
-    def _parse_labels_chunk(chunk):
-        return [_safe_literal_eval(c) for c in chunk]
-
-    parsed: list = []
-    with ThreadPoolExecutor(max_workers=n_workers) as pool:
-        for chunk_result in pool.map(_parse_labels_chunk, chunks):
-            parsed.extend(chunk_result)
-
-    if _agg_legacy_count[0] > 0:
-        pct = _agg_legacy_count[0] / len(cells) * 100
-        print(
-            f'    - WARNING: {_agg_legacy_count[0]:,} / {len(cells):,} cells '
-            f'({pct:.1f}%) used ast.literal_eval fallback (GIL held). '
-            f'Auto-converting {labels_path.name} to JSON format...'
-        )
-        try:
-            df['Labels'] = df['Labels'].apply(
-                lambda c: json.dumps(ast.literal_eval(c))
-                if not str(c).startswith('["') else c
-            )
-            df.to_csv(labels_path, index=False)
-            print(f'    - Converted {labels_path.name} to JSON format. '
-                  f'Future runs will use json.loads (faster, parallel).')
-        except Exception as exc:
-            print(f'    - WARNING: auto-conversion failed ({exc}).')
-
-    df['Labels'] = parsed
-
-    # ── Single-pass aggregation via explode + native pandas ops ──────
-    # groupby().apply(_agg_one_sample) calls a Python function once per
-    # unique Sample_ID — expensive at 100 K+ samples.  explode() flattens
-    # the list column into individual rows so pandas can aggregate on a
-    # plain string Series using its C-level internals, which is
-    # significantly faster.
-    #
-    # n_cf (Num_CF_Neighbors) = number of original (sample, CF) rows,
-    # which must be computed *before* exploding to avoid counting labels.
-    n_cf_map = df.groupby('Sample_ID', sort=False).size()   # Series: sid → count
-
-    df_exp = (
-        df[['Sample_ID', 'Labels']]
-        .explode('Labels')
-        .dropna(subset=['Labels'])
-    )
-    # Exclude empty strings that may appear after exploding empty lists.
-    df_exp = df_exp[df_exp['Labels'] != '']
-
-    unique_series = (
-        df_exp.groupby('Sample_ID', sort=False)['Labels']
-        .agg(lambda s: sorted(set(s)))
-    )
-    dupl_series = (
-        df_exp.groupby('Sample_ID', sort=False)['Labels']
-        .agg(lambda s: sorted(s.tolist()))
+    # ── Write summary report ──────────────────────────────────────────────────
+    total_elapsed = time.perf_counter() - t_start
+    _write_summary(
+        output_dir=args.output_dir,
+        train_path=args.train or args.dataset,
+        test_path=args.test,
+        target_col=target_col,
+        feature_cols=feature_cols,
+        n_train=len(X_train),
+        n_test=len(X_test),
+        train_acc=train_acc,
+        test_acc=test_acc,
+        k_values=k_values,
+        percentile_th=args.percentile,
+        summary_data=summary_data,
+        total_elapsed=total_elapsed,
+        cb_iterations=args.cb_iterations,
+        cb_lr=args.cb_lr,
+        cb_depth=args.cb_depth,
+        cb_early_stopping=args.cb_early_stopping,
+        n_workers=args.workers,
     )
 
-    sample_ids    = unique_series.index.values
-    unique_labels = unique_series.tolist()
-    dupl_labels   = dupl_series.tolist()
-    n_cf_vals     = n_cf_map.loc[sample_ids].tolist()
-
-    unique_df = pd.DataFrame({
-        'Sample_ID':        sample_ids,
-        'Labels':           unique_labels,
-        'Num_Labels':       [len(v) for v in unique_labels],
-        'Num_CF_Neighbors': n_cf_vals,
-    })
-
-    dupl_df = pd.DataFrame({
-        'Sample_ID':        sample_ids,
-        'Labels':           dupl_labels,
-        'Num_Labels':       [len(v) for v in dupl_labels],
-        'Num_CF_Neighbors': n_cf_vals,
-    })
-
-    # ── Write both output files in parallel ───────────────────────────
-    def _write_agg(args):
-        frame, path = args
-        frame.to_csv(path, index=False)
-
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        list(pool.map(_write_agg, [(unique_df, out_unique), (dupl_df, out_dupl)]))
-
-    n_samples = len(unique_df)
-    print(
-        f'    - {len(df)} (sample, CF) pairs collapsed into '
-        f'{n_samples} unique samples'
-    )
-
-    # Print a per-label-count breakdown for diagnostics.
-    for tag, frame in [('unique labels', unique_df), ('labels with duplicates', dupl_df)]:
-        print(f'    [{tag} per sample]')
-        for n_labels, count in frame['Num_Labels'].value_counts().sort_index().items():
-            pct = count / n_samples * 100
-            print(f'      {n_labels} label(s): {count} samples ({pct:.1f}%)')
-
-    print(f'    - saved {out_unique.name}')
-    print(f'    - saved {out_dupl.name}')
+    logger.info("=" * 62)
+    logger.info("  Stage 2 complete.  Outputs: %s", args.output_dir.resolve())
+    logger.info("  Total elapsed: %.1fs", total_elapsed)
+    logger.info("=" * 62)
 
 
-# ---------------------------------------------------------------------------
-# Experiment runner
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Summary report
+# ─────────────────────────────────────────────────────────────────────────────
 
-def run_for_k_values(
-    k_values: list[int],
-    data_path: Path,
-    output_base_dir: Path,
+def _write_summary(
+    output_dir: Path,
+    train_path,
+    test_path,
     target_col: str,
-    perc_threshold: int,
-    metadata_cols: list[str],
-) -> dict[int, Path]:
-    """
-    Train CategoricalBoCSoR once and run counterfactual extraction for each k
-    in parallel.
-
-    The model and BallTrees are fitted on the training split and shared across
-    all k values; only the neighbourhood query size (k_neighbors) changes per
-    iteration.  This avoids retraining for each k, saving the dominant cost.
-
-    Parallelism
-    -----------
-    After the model is fitted and the boundary state is pre-warmed (one serial
-    explain() call to populate the cache), all k values are dispatched to a
-    ThreadPoolExecutor.  Each thread owns a shallow clone of the explainer
-    (different k_neighbors, same shared model/X_enc/trees/cache) and calls
-    explain() independently.
-
-    Why threads rather than processes here?
-    - The model weights and X_enc are large read-only structures; sharing them
-      via threads avoids the multiprocessing serialisation overhead.
-    - NumPy and CatBoost release the GIL during heavy computation, so threads
-      give real parallelism for the compute-bound parts.
-    - The boundary-state cache is protected by a threading.Lock and is already
-      hot when threads start, so there is no contention risk.
-
-    Pool size: min(len(k_values), N_PHYSICAL_CORES) — during the explain()
-    phase CatBoost runs inference only (not training), so its internal thread
-    pool is idle between predict() calls.  Using all available cores for the
-    k-parallel pool maximises throughput without over-subscribing the scheduler.
-
-    Parameters
-    ----------
-    k_values        : list of neighbourhood sizes to evaluate
-                      (e.g. [1, 3, 5, 7, 9, 11, 13, 15]).
-    data_path       : path to the input CSV produced by create_dataset.py.
-    output_base_dir : root directory; per-k subdirectories (k_1/, k_3/, …) are
-                      created automatically.
-    target_col      : name of the binary target column in the CSV.
-    perc_threshold  : boundary filter percentile (see CategoricalBoCSoR).
-    metadata_cols   : columns to exclude from the feature matrix X.
-                      Data-provenance columns that must not enter the model or
-                      appear as CF drivers (e.g. ['YEAR']).
-
-                      Rationale for YEAR:
-                      The survey year is injected by create_dataset.py as the
-                      first CSV column to support longitudinal multi-year
-                      analysis.  It must NOT enter the feature matrix because
-                      "changing the survey year" is not a valid individual-level
-                      counterfactual driver — a person cannot change what year
-                      they were surveyed.
-
-                      ST is intentionally NOT in metadata_cols:
-                      State of residence is a legitimate geographic CF driver
-                      ("if this person lived in TX instead of NY, would their
-                      predicted income change?").
-
-    Returns
-    -------
-    dict mapping k → Path of labels_only_unique.csv for that k.
-    """
-    output_base_dir = Path(output_base_dir)
-    output_base_dir.mkdir(parents=True, exist_ok=True)
-
-    n_k = len(k_values)
-    # pool_size = min(n_k, N_PHYSICAL_CORES): never spawn more k-threads than
-    # physical cores, regardless of how many k values are passed from main.py.
-    # The inference thread_count reduction below ensures the nested thread
-    # layers (pool_size × 2 class-threads × thread_count) stay within budget.
-    pool_size = max(1, min(n_k, N_PHYSICAL_CORES))
-
-    print(f'\n{"=" * 70}')
-    print(f'K-VARIATION EXPERIMENT — {n_k} k values  '
-          f'(parallel pool size: {pool_size})')
-    print(f'{"=" * 70}')
-    print(f'  > k values        : {k_values}')
-    print(f'  > perc_threshold  : {perc_threshold}')
-    print(f'  > target column   : {target_col}')
-    if metadata_cols:
-        print(f'  > metadata cols   : {metadata_cols} (excluded from X)')
-    print('-' * 50)
-
-    print('  > Loading dataset and splitting...')
-    df = pd.read_csv(data_path)
-
-    if target_col != 'target':
-        df = df.rename(columns={target_col: 'target'})
-
-    cols_to_drop = ['target'] + [c for c in metadata_cols if c in df.columns]
-    X, y = df.drop(columns=cols_to_drop), df['target']
-
-    X_tr, X_te, y_tr, y_te = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
-    )
-    print(f'    - train: {len(X_tr):,} samples  |  test: {len(X_te):,} samples')
-    # X_te / y_te are not used after this point (the model is evaluated via
-    # CatBoost's internal eval_set inside fit(); the test split is only created
-    # here to honour the 80/20 stratified split contract).  Free them immediately
-    # so the ~13 MB they occupy on the USA dataset does not linger for the full
-    # duration of fit() + explain() (which can take hours).
-    del X_te, y_te
-
-    # ── Fit the shared model once ─────────────────────────────────────
-    print('\n  > Fitting model (shared across all k values)...')
-    base_explainer = CategoricalBoCSoR(
-        k_neighbors=k_values[0], perc_threshold=perc_threshold
-    )
-    base_explainer.fit(X_tr, y_tr)
-
-    # ── Pre-warm the boundary-state cache (serial, once) ─────────────
-    # Passes max(k_values) so _get_boundary_state queries the BallTree
-    # once with k=max_k and caches all CF neighbours.  Each k-clone then
-    # slices [:, :k] — no repeated BallTree queries across k values.
-    backend_name = 'pynndescent' if _PYNNDESCENT_AVAILABLE else 'BallTree'
-    print(f'  > Pre-warming boundary state cache '
-          f'({backend_name}, k={max(k_values)}, once for all k values)...')
-    base_explainer._get_boundary_state(X_tr, y_tr, max_k=max(k_values))
-
-    # ── Reduce CatBoost thread_count for inference ────────────────────
-    # During explain(), multiple nested thread layers run concurrently:
-    #   pool_size  k-parallel threads  (this pool, = min(n_k, N_PHYSICAL_CORES))
-    #   × N        CatBoost threads    (thread_count set here)
-    #
-    # The inner per-class ThreadPoolExecutor(2) is NOT multiplied here because
-    # the two class threads do heterogeneous work (BallTree + NumPy vs CatBoost
-    # predict) and are not simultaneously calling predict() at the same time.
-    # Counting them doubles the denominator unnecessarily and drops CatBoost
-    # to 1 thread when pool_size ≥ 10, which is the dominant bottleneck on
-    # large datasets with many k values (e.g. 8 k-values on M1 Ultra → 1 thread).
-    #
-    # Revised formula: thread_count = max(1, N_PHYSICAL_CORES // pool_size)
-    # This keeps total CatBoost threads ≤ N_PHYSICAL_CORES and restores
-    # multi-threaded inference on large k-value sets.
-    inference_thread_count = max(1, N_PHYSICAL_CORES // pool_size)
-    # set_params() raises CatBoostError on fitted models in recent CatBoost
-    # versions.  Use the internal _init_params dict instead, which controls
-    # the thread count passed to the C++ prediction backend at inference time.
-    try:
-        base_explainer.model.set_params(thread_count=inference_thread_count)
-    except Exception:
-        # Fallback: patch the thread_count that CatBoost reads at predict time
-        base_explainer.model._init_params['thread_count'] = inference_thread_count
-    print(
-        f'  > CatBoost thread_count for inference → {inference_thread_count} '
-        f'(training used {base_explainer._thread_count}; '
-        f'n_k={n_k}, pool_size={pool_size}, '
-        f'effective={pool_size * inference_thread_count} / {N_PHYSICAL_CORES} cores)'
-    )
-
-    # ── Build per-k explainer clones ──────────────────────────────────
-    # Each clone shares the model, trees, X_enc, class_indices, and cache
-    # via shallow copy.  Only k_neighbors differs.  The _boundary_cache_lock
-    # is shared via the shallow copy, which is correct — we want exactly one
-    # lock protecting the shared cache.
-    def _make_clone(k: int) -> CategoricalBoCSoR:
-        clone = copy.copy(base_explainer)
-        clone.k_neighbors = k
-        return clone
-
-    k_labels_map: dict[int, Path] = {}
-
-    # ── Run k values in parallel ──────────────────────────────────────
-    def _run_one_k(k: int) -> tuple[int, pd.DataFrame]:
-        explainer = _make_clone(k)
-        transactions = explainer.explain(X_tr, y_tr)
-        return k, transactions
-
-    print(f'\n  > Running {n_k} k values in parallel '
-          f'(pool_size={pool_size})...')
-
-    # ── Phase 1: collect all explain() results without blocking ──────────
-    # Post-processing (CSV I/O, ast.literal_eval, groupby) must NOT run
-    # inside the as_completed loop: doing so would block the main thread
-    # while other k-threads are still computing, serialising the pipeline
-    # and wasting idle P-cores.  Collect all results first, then post-process.
-    transactions_by_k: dict[int, pd.DataFrame] = {}
-    with ThreadPoolExecutor(max_workers=pool_size) as pool:
-        futures = {pool.submit(_run_one_k, k): k for k in k_values}
-        for i, future in enumerate(as_completed(futures), start=1):
-            k, transactions = future.result()
-            transactions_by_k[k] = transactions
-            print(f'  [{i}/{n_k}] k = {k} — explain() done '
-                  f'({len(transactions):,} transactions)')
-
-    # ── Phase 2: post-process all k results in parallel ──────────────────
-    # extract_labels_and_values + aggregate_drivers_by_sample are I/O-bound
-    # (CSV write) and CPU-light (ast.literal_eval, pandas groupby).  Running
-    # them in a thread pool keeps all cores busy while CatBoost is idle.
-    #
-    # Over-subscription guard: each _post_process_k thread spawns its own
-    # internal ThreadPoolExecutors (for parse + CSV write).  With n_k threads
-    # running simultaneously we cap each inner pool at
-    # max(1, N_PHYSICAL_CORES // n_k) workers so the total thread count stays
-    # within the physical core budget and avoids context-switch overhead.
-    inner_workers = max(1, N_PHYSICAL_CORES // n_k)
-    print(f'\n  > Post-processing {n_k} k results in parallel '
-          f'(inner_workers per k: {inner_workers})...')
-
-    def _post_process_k(k: int) -> tuple[int, Path | None]:
-        transactions = transactions_by_k[k]
-        k_dir = output_base_dir / f'k_{k}'
-        k_dir.mkdir(parents=True, exist_ok=True)
-
-        if transactions.empty:
-            print(f'    [k={k}] 0 transactions — skipping downstream steps.')
-            return k, None
-
-        transactions_path = k_dir / 'transactions_values.csv'
-        transactions.to_csv(transactions_path, index=False)
-        print(f'    [k={k}] {len(transactions):,} transactions saved to '
-              f'{transactions_path.name}')
-
-        extract_labels_and_values(k_dir, parse_workers=inner_workers)
-        aggregate_drivers_by_sample(k_dir, parse_workers=inner_workers)
-
-        labels_path = k_dir / 'labels_only_unique.csv'
-        if labels_path.exists() and labels_path.stat().st_size > 0:
-            return k, labels_path
-        print(f'    [k={k}] WARNING: labels_only_unique.csv is empty — skipping.')
-        return k, None
-
-    with ThreadPoolExecutor(max_workers=n_k) as pool:
-        for k, path in pool.map(_post_process_k, sorted(transactions_by_k)):
-            if path is not None:
-                k_labels_map[k] = path
-
-    print(f'\n{"=" * 70}')
-    print('  > All k values completed.')
-    print(f'{"=" * 70}\n')
-
-    return k_labels_map
-
-
-# ---------------------------------------------------------------------------
-# Log capturing utility
-# ---------------------------------------------------------------------------
-
-class _TeeWriter:
-    """
-    Dual-output writer that simultaneously writes to the original stdout and
-    accumulates output in an in-memory StringIO buffer.
-
-    Used in main() to capture the full execution log without suppressing
-    console output.  The captured buffer is written to disk as
-    feature_importance_log.txt at the end of the run.
-
-    Thread safety
-    -------------
-    All write() and flush() calls are protected by a threading.Lock so that
-    interleaved output from parallel region processes does not corrupt the
-    buffer.
-
-    Why not logging.Logger?
-    -----------------------
-    print() calls inside CatBoost and sklearn write directly to sys.stdout.
-    Replacing sys.stdout with _TeeWriter captures those calls too, without
-    requiring changes to third-party library code.
-    """
-
-    def __init__(self, original_stdout):
-        self._orig = original_stdout
-        self._buf  = io.StringIO()
-        self._lock = threading.Lock()
-
-    def write(self, text: str) -> None:
-        with self._lock:
-            self._orig.write(text)
-            self._buf.write(text)
-
-    def flush(self) -> None:
-        with self._lock:
-            self._orig.flush()
-            self._buf.flush()
-
-    def getvalue(self) -> str:
-        """Return the full accumulated log as a single string."""
-        with self._lock:
-            return self._buf.getvalue()
-
-
-# ---------------------------------------------------------------------------
-# Per-region worker (used by ProcessPoolExecutor in main)
-# ---------------------------------------------------------------------------
-
-def _run_region(
-    region: str,
-    data_path: Path,
-    results_dir: Path,
+    feature_cols: list[str],
+    n_train: int,
+    n_test: int,
+    train_acc: float,
+    test_acc: float,
     k_values: list[int],
-    target_col: str,
-    perc_threshold: int,
-    metadata_cols: list[str],
-) -> tuple[str, dict[int, Path], str]:
-    """
-    Top-level function for a single region — runs in a child process.
-
-    Returns (region, k_labels_map, captured_log_text).
-    """
-    # Capture stdout inside the child process so we can relay it back.
-    import io as _io, sys as _sys
-    buf = _io.StringIO()
-
-    class _LocalTee:
-        """Mirrors _TeeWriter but lives inside the child process.
-
-        run_for_k_values() spawns a ThreadPoolExecutor for k-values; those
-        threads call print() -> sys.stdout.write() concurrently.  Without a
-        lock the writes to both self._orig and self._buf can interleave,
-        producing garbled lines in the parent's captured log.
-        The lock matches the behaviour of _TeeWriter in the parent process.
-        """
-        def __init__(self, orig):
-            import threading as _threading
-            self._orig = orig
-            self._buf  = buf
-            self._lock = _threading.Lock()
-        def write(self, t):
-            with self._lock:
-                self._orig.write(t)
-                self._buf.write(t)
-        def flush(self):
-            with self._lock:
-                self._orig.flush()
-
-    orig_stdout = _sys.stdout
-    _sys.stdout = _LocalTee(orig_stdout)
-
-    try:
-        output_dir = results_dir / region / 'important_features'
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        print('\n' + '=' * 70)
-        print(f'COUNTERFACTUAL EXTRACTION — {region.upper()}')
-        print('=' * 70 + '\n')
-
-        if not Path(data_path).exists():
-            print(f'  > Error: {data_path} not found — run create_dataset.py first.')
-            return region, {}, buf.getvalue()
-
-        k_labels_map = run_for_k_values(
-            k_values        = k_values,
-            data_path       = data_path,
-            output_base_dir = output_dir,
-            target_col      = target_col,
-            perc_threshold  = perc_threshold,
-            metadata_cols   = metadata_cols,
-        )
-
-        print('  > k_labels_map ready:')
-        for k, path in k_labels_map.items():
-            print(f'    k={k:>2} -> {path}')
-
-        return region, k_labels_map, buf.getvalue()
-
-    finally:
-        _sys.stdout = orig_stdout
-
-
-# ---------------------------------------------------------------------------
-# Entry point — called exclusively by main.py (Step 2)
-# ---------------------------------------------------------------------------
-
-def main(
-    regions: dict,
-    k_values: list[int],
-    perc_threshold: int,
-    target_col: str,
-    metadata_cols: list[str],
-    base_dir: Path,
+    percentile_th: float,
+    summary_data: list[dict],
+    total_elapsed: float,
+    cb_iterations: int,
+    cb_lr: float,
+    cb_depth: int,
+    cb_early_stopping: int,
+    n_workers: int,
 ) -> None:
     """
-    Run counterfactual extraction for all specified regions and k values.
-
-    Called by main.py run_step2() with all parameters resolved from CLI
-    arguments.  All parameters are required — there are no internal defaults.
-
-    Parallelism
-    -----------
-    Regions are processed in parallel via ProcessPoolExecutor.
-    Each region spawns a child process that runs run_for_k_values() with its
-    own thread pool internally.  The number of region-level processes is
-    capped at min(n_regions, N_PHYSICAL_CORES // 4) to avoid over-subscribing
-    the M1 Ultra's P-cores across nested thread pools.
-
-    Thread budget per process (C = N_PHYSICAL_CORES, n_k = len(k_values)):
-      pool_size       = min(n_k, C)
-      thread_count    = max(1, C // pool_size)
-      active threads  ≤ C  (k-threads × CatBoost threads per predict)
-
-    Note: the inner per-class ThreadPoolExecutor(2) inside explain() is not
-    counted in the denominator because its two class threads do heterogeneous
-    work (BallTree query vs NumPy/CatBoost) and are never simultaneously
-    calling CatBoost.predict().  Counting them halved thread_count unnecessarily
-    and serialised inference on large k-value sets (e.g. 8 k-values → 1 thread).
-
-    Parameters
-    ----------
-    regions       : dict mapping region name → Path to input CSV.
-                    Built by main.py from --regions and --output-dir.
-    k_values      : neighbourhood sizes for BoCSoR, from --k-values.
-    perc_threshold: boundary filter percentile, from --perc-threshold.
-    target_col    : name of the binary target column, from --target-col.
-    metadata_cols : non-feature columns to exclude from X, from --metadata-cols.
-    base_dir      : project root; results/ is resolved as base_dir/results/.
-                    Passed by main.py as _HERE.parent (project root).
+    Write a human-readable Markdown summary of the BoCSoR run to
+    results/bocsor_summary.md.
     """
-    base_dir    = Path(base_dir)
-    results_dir = base_dir / 'results'
-    results_dir.mkdir(parents=True, exist_ok=True)
+    from datetime import datetime
 
-    tee = _TeeWriter(sys.stdout)
-    sys.stdout = tee
+    lines: list[str] = []
+    a = lines.append
 
-    # Cap region-level processes: each process will use its own thread pool
-    # internally; over-subscribing would starve CatBoost's per-process threads.
-    n_region_workers = max(1, min(len(regions), N_PHYSICAL_CORES // 4))
+    a("# BoCSoR Feature Importance — Run Summary")
+    a("")
+    a(f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    a(f"**Total runtime:** {total_elapsed:.1f}s")
+    a("")
 
-    print(f'  > Physical cores detected: {N_PHYSICAL_CORES}')
-    print(f'  > Region parallelism: {n_region_workers} process(es) for '
-          f'{len(regions)} region(s)')
+    # ── Dataset ───────────────────────────────────────────────────────────────
+    a("## Dataset")
+    a("")
+    a(f"| | |")
+    a(f"|---|---|")
+    a(f"| Train file | `{Path(train_path).name if train_path else 'n/a'}` |")
+    a(f"| Test file  | `{Path(test_path).name  if test_path  else 'n/a'}` |")
+    a(f"| Train rows | {n_train:,} |")
+    a(f"| Test rows  | {n_test:,} |")
+    a(f"| Target     | `{target_col}` |")
+    a(f"| Features   | {', '.join(f'`{f}`' for f in feature_cols)} |")
+    a("")
 
-    try:
-        if n_region_workers > 1 and len(regions) > 1:
-            # ── Parallel region processing ────────────────────────────
-            with ProcessPoolExecutor(max_workers=n_region_workers) as pool:
-                futures = {
-                    pool.submit(
-                        _run_region,
-                        region,
-                        Path(data_path),
-                        results_dir,
-                        k_values,
-                        target_col,
-                        perc_threshold,
-                        metadata_cols,
-                    ): region
-                    for region, data_path in regions.items()
-                }
-                for future in as_completed(futures):
-                    region, k_labels_map, region_log = future.result()
-                    # Relay the child's captured output to the parent's TeeWriter.
-                    sys.stdout.write(region_log)
-                    sys.stdout.flush()
-                    print('  > k_labels_map ready:')
-                    for k, path in k_labels_map.items():
-                        print(f'    k={k:>2} -> {path}')
+    # ── Classifier ────────────────────────────────────────────────────────────
+    a("## CatBoost Classifier")
+    a("")
+    a(f"| | |")
+    a(f"|---|---|")
+    a(f"| Iterations      | {cb_iterations} |")
+    a(f"| Learning rate   | {cb_lr} |")
+    a(f"| Tree depth      | {cb_depth} |")
+    a(f"| Early stopping  | {'disabled' if cb_early_stopping == 0 else f'{cb_early_stopping} rounds'} |")
+    a(f"| Train accuracy  | {train_acc:.4f} |")
+    a(f"| Test accuracy   | {test_acc:.4f} |")
+    a("")
+
+    # ── BoCSoR configuration ──────────────────────────────────────────────────
+    a("## BoCSoR Configuration")
+    a("")
+    a(f"| | |")
+    a(f"|---|---|")
+    a(f"| k values    | {k_values} |")
+    a(f"| Percentile  | {percentile_th}% |")
+    a(f"| Workers     | {n_workers} |")
+    a("| Boundaries  | class 0 → class 1 |")
+    a("")
+    a("")
+
+    # ── Feature importance per boundary direction ─────────────────────────────
+    a("## Feature Importance Results")
+    a("")
+    a("> BoCSoR score = fraction of boundary instances for which the feature")
+    a("> appears in the union of relevant features across all k counterfactuals.")
+    a("> Values in [0, 1]. Higher = more important for crossing the decision boundary.")
+    a("")
+
+    # Group summary_data by direction (each direction appears once in summary_data
+    # with its importance_df; we de-duplicate).
+    for entry in summary_data[:1]:   # single direction: class 0 -> class 1
+        imp_df      = entry["importance_df"]
+        elapsed_dir = entry["elapsed_dir"]
+
+        a(f"### Class 0 → Class 1  *(elapsed: {elapsed_dir:.1f}s)*")
+        a("")
+
+        # Table header
+        header = "| Feature |" + "".join(f" {col} |" for col in imp_df.columns)
+        sep    = "|---|" + "---|" * len(imp_df.columns)
+        a(header)
+        a(sep)
+
+        # Sort features by the last (largest) k column for stable display.
+        last_col = imp_df.columns[-1]
+        for feat in imp_df[last_col].sort_values(ascending=False).index:
+            row = f"| `{feat}` |"
+            for col in imp_df.columns:
+                row += f" {imp_df.loc[feat, col]:.4f} |"
+            a(row)
+        a("")
+
+        # Stability note: flag features whose rank changes across k values.
+        ranks = imp_df.rank(ascending=False, method="min")
+        unstable = [
+            feat for feat in imp_df.index
+            if ranks.loc[feat].max() - ranks.loc[feat].min() > 1
+        ]
+        if unstable:
+            a(f"⚠ **Rank-unstable features** (rank varies across k values): "
+              f"{', '.join(f'`{f}`' for f in unstable)}")
+            a("")
         else:
-            # ── Serial path (single region or single core) ────────────
-            for region, data_path in regions.items():
-                output_dir = results_dir / region / 'important_features'
-                output_dir.mkdir(parents=True, exist_ok=True)
+            a("✓ All features maintain a consistent rank across all k values.")
+            a("")
 
-                print('\n' + '=' * 70)
-                print(f'COUNTERFACTUAL EXTRACTION — {region.upper()}')
-                print('=' * 70 + '\n')
+    # ── Output files ──────────────────────────────────────────────────────────
+    a("## Output Files")
+    a("")
+    a("| File | Description |")
+    a("|---|---|")
+    a("| `feature_importance.csv` | BoCSoR scores — rows: features, columns: k_1…k_N |")
+    a("| `feature_importance_itemsets.csv` | Itemsets for all k merged — columns: k_value, instance_index, features, itemset |")
+    for k in k_values:
+        a(f"| `feature_importance_itemsets_k{k}.csv` | Itemsets for k={k} only |")
+    a("| `bocsor_summary.md` | This file |")
+    a("")
 
-                if not Path(data_path).exists():
-                    print(f'  > Error: {data_path} not found — run Step 1 first.')
-                    continue
+    summary_path = output_dir / "bocsor_summary.md"
+    summary_path.write_text("\n".join(lines), encoding="utf-8")
+    logger.info("Summary -> %s", summary_path)
 
-                k_labels_map = run_for_k_values(
-                    k_values        = k_values,
-                    data_path       = data_path,
-                    output_base_dir = output_dir,
-                    target_col      = target_col,
-                    perc_threshold  = perc_threshold,
-                    metadata_cols   = metadata_cols,
-                )
 
-                print('  > k_labels_map ready:')
-                for k, path in k_labels_map.items():
-                    print(f'    k={k:>2} -> {path}')
-
-        print('\n' + '=' * 70)
-        print('Done.')
-        print('=' * 70 + '\n')
-
-        # ── Save logs ──────────────────────────────────────────────────
-        full_log = tee.getvalue()
-
-        global_log = results_dir / 'feature_importance_log.txt'
-        global_log.write_text(full_log, encoding='utf-8')
-        print(f'  > Full log saved to {global_log}')
-
-        for region in regions:
-            region_dir = results_dir / region / 'important_features'
-            if region_dir.exists():
-                marker = f'COUNTERFACTUAL EXTRACTION — {region.upper()}'
-                start  = full_log.find(marker)
-                if start != -1:
-                    next_start = full_log.find(
-                        'COUNTERFACTUAL EXTRACTION', start + len(marker)
-                    )
-                    snippet = (
-                        full_log[start:next_start]
-                        if next_start != -1
-                        else full_log[start:]
-                    )
-                    (region_dir / 'feature_importance_log.txt').write_text(
-                        snippet, encoding='utf-8'
-                    )
-                    print(
-                        f'  > Region log saved to '
-                        f'{region_dir / "feature_importance_log.txt"}'
-                    )
-
-    finally:
-        sys.stdout = tee._orig
+if __name__ == "__main__":
+    main()

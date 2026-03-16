@@ -406,6 +406,7 @@ def create_dataset(
     random_seed: int,
     data_dir: Path,
     keep_columns: list[str] | None = DEFAULT_COLUMNS,
+    states_label: str | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Execute the full dataset-creation pipeline for a single survey year.
@@ -428,6 +429,11 @@ def create_dataset(
     keep_columns : Feature columns retained in the output CSV.
                    Defaults to DEFAULT_COLUMNS = ["COW", "SCHL", "WKHP"].
                    Pass None to retain all feature columns.
+    states_label : Optional human-readable label for the states scope used
+                   in the output filename instead of the full list of codes.
+                   Pass the group/region/division name (e.g. "northeast") so
+                   that the filename reads train_2024_northeast_… rather than
+                   train_2024_CT_MA_ME_….  If None the codes are used.
 
     Returns
     -------
@@ -437,6 +443,55 @@ def create_dataset(
     """
     data_dir = Path(data_dir)
     raw_dir  = data_dir / "raw"
+
+    # ── Pre-flight: skip if output files already exist ────────
+    # Reconstruct the expected output filename using the same logic
+    # as step 8 below.  If the file(s) already exist, load and
+    # return them directly, skipping download + encoding entirely.
+    if states_label is not None:
+        _states_tag = states_label
+    elif states is None:
+        _states_tag = "ALL"
+    else:
+        _states_tag = "_".join(sorted(states))
+    _horizon_tag = horizon.replace("-", "").replace("Year", "Y")
+    _cols_tag    = "-".join(keep_columns) if keep_columns else "ALL"
+    _stem = (
+        f"{survey_year}_{_states_tag}"
+        f"_{_horizon_tag}_{survey}"
+        f"_thr{int(threshold)}"
+        f"_cols{_cols_tag}"
+    )
+    if test_size > 0.0:
+        _train_path = data_dir / f"train_{_stem}.csv"
+        _test_path  = data_dir / f"test_{_stem}.csv"
+        if _train_path.exists() and _test_path.exists():
+            logger.info(
+                "Skipping stage 1: output files already exist.\n"
+                "  Train → %s\n  Test  → %s",
+                _train_path, _test_path,
+            )
+            train_df = pd.read_csv(_train_path, dtype=str)
+            test_df  = pd.read_csv(_test_path,  dtype=str)
+            # Re-cast the target column to int8 to match normal pipeline output.
+            _col_target = f"income_over_{int(threshold)}"
+            if _col_target in train_df.columns:
+                train_df[_col_target] = train_df[_col_target].astype(np.int8)
+                test_df[_col_target]  = test_df[_col_target].astype(np.int8)
+            return train_df, test_df
+    else:
+        _dataset_path = data_dir / f"dataset_{_stem}.csv"
+        if _dataset_path.exists():
+            logger.info(
+                "Skipping stage 1: output file already exists.\n"
+                "  Dataset → %s",
+                _dataset_path,
+            )
+            train_df = pd.read_csv(_dataset_path, dtype=str)
+            _col_target = f"income_over_{int(threshold)}"
+            if _col_target in train_df.columns:
+                train_df[_col_target] = train_df[_col_target].astype(np.int8)
+            return train_df, pd.DataFrame()
 
     # ── Step 1: Download raw PUMS data ────────────────────────
     acs_data = download_data(survey_year, horizon, survey, states, raw_dir)
@@ -490,15 +545,25 @@ def create_dataset(
     # so runs with different configurations never overwrite each other.
     #
     # Pattern:
-    #   {prefix}_{year}_{states}_{horizon}_{survey}_thr{threshold}_cols{cols}.csv
+    #   {prefix}_{year}_{states_tag}_{horizon_tag}_{survey}_thr{threshold}_cols{cols_tag}.csv
+    #
+    # {states_tag} is states_label when supplied (e.g. 'northeast'),
+    # 'ALL' when states is None, or sorted state codes joined by '_'.
     #
     # Examples:
-    #   dataset_2024_CA_NY_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv
-    #   dataset_2024_ALL_1Y_person_thr75000_colsALL.csv
+    #   train_2024_NY_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv
     #   train_2024_northeast_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv
-    #   test_2024_northeast_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv
+    #   dataset_2024_ALL_1Y_person_thr75000_colsALL.csv
 
-    states_tag  = "_".join(sorted(states)) if states else "ALL"
+    # Use the caller-supplied label (e.g. a group/region/division name) when
+    # available so the filename reads train_2024_northeast_… rather than
+    # train_2024_CT_MA_ME_NH_NJ_NY_PA_RI_VT_…
+    if states_label is not None:
+        states_tag = states_label
+    elif states is None:
+        states_tag = "ALL"
+    else:
+        states_tag = "_".join(sorted(states))
     horizon_tag = horizon.replace("-", "").replace("Year", "Y")   # "1-Year" → "1Y"
     cols_tag    = (
         "-".join(keep_columns) if keep_columns else "ALL"
