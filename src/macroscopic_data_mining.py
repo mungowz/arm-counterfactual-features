@@ -803,6 +803,9 @@ def _lift_bins(
     Build lift bin edges that always include the independence window boundaries
     as explicit edges, so the filtered band is clearly visible in the heatmap.
 
+    Handles degenerate cases where all rules have similar lift values by
+    reducing bin count and increasing label precision until all labels are unique.
+
     Returns (edges, tick_labels).
     """
     if all_rules.empty or "lift" not in all_rules.columns:
@@ -815,8 +818,34 @@ def _lift_bins(
         extra = [lift_independence_low, lift_independence_high]
         edges = np.unique(np.sort(np.concatenate([raw_edges, extra])))
 
-    labels = [f"{edges[i]:.2f}–{edges[i+1]:.2f}" for i in range(len(edges) - 1)]
-    return edges, labels
+    # Try increasing label precision (2 → 3 → 4 decimals) until all labels
+    # are unique.  If still not unique, reduce bin count until they are.
+    for precision in (2, 3, 4):
+        labels = [
+            f"{edges[i]:.{precision}f}–{edges[i+1]:.{precision}f}"
+            for i in range(len(edges) - 1)
+        ]
+        if len(labels) == len(set(labels)):
+            return edges, labels
+
+    # Last resort: keep halving the number of bins until labels are unique.
+    lift_min = float(edges[0])
+    lift_max = float(edges[-1])
+    n = _LIFT_N_BINS
+    while n >= 2:
+        candidate = np.unique(np.sort(np.concatenate([
+            np.linspace(lift_min, lift_max, n + 1),
+            [lift_independence_low, lift_independence_high],
+        ])))
+        labels = [f"{candidate[i]:.4f}–{candidate[i+1]:.4f}"
+                  for i in range(len(candidate) - 1)]
+        if len(labels) == len(set(labels)):
+            return candidate, labels
+        n //= 2
+
+    # Absolute fallback: single bin covering the full range.
+    edges = np.array([lift_min, lift_max])
+    return edges, [f"{lift_min:.4f}–{lift_max:.4f}"]
 
 
 def _make_heatmap(
@@ -1060,14 +1089,43 @@ def generate_heatmaps(
     )
 
     def _bin_axis(series: pd.Series, n_bins: int = 20) -> tuple[list[str], pd.Series]:
-        """Bin a continuous series into n_bins equal-width bins, return labels and binned series."""
+        """
+        Bin a continuous series into equal-width bins with guaranteed unique labels.
+
+        Uses the same adaptive strategy as _lift_bins: try increasing label
+        precision (3 → 4 → 6 decimals) then reduce bin count until labels
+        are unique.  Falls back to a single bin if the series is constant.
+        """
         lo, hi = float(series.min()), float(series.max())
         if lo == hi:
             edges = np.array([lo - 0.01, hi + 0.01])
         else:
             edges = np.linspace(lo, hi, n_bins + 1)
-        edges = np.round(edges, 4)
-        labels = [f"{edges[i]:.3f}–{edges[i+1]:.3f}" for i in range(len(edges) - 1)]
+        edges = np.unique(np.round(edges, 6))
+
+        for precision in (3, 4, 6):
+            labels = [f"{edges[i]:.{precision}f}–{edges[i+1]:.{precision}f}"
+                      for i in range(len(edges) - 1)]
+            if len(labels) == len(set(labels)):
+                binned = pd.cut(series, bins=edges, labels=labels,
+                                include_lowest=True).astype(str)
+                return labels, binned
+
+        # Reduce bin count progressively.
+        n = n_bins
+        while n >= 2:
+            candidate = np.unique(np.linspace(lo, hi, n + 1))
+            labels = [f"{candidate[i]:.6f}–{candidate[i+1]:.6f}"
+                      for i in range(len(candidate) - 1)]
+            if len(labels) == len(set(labels)):
+                binned = pd.cut(series, bins=candidate, labels=labels,
+                                include_lowest=True).astype(str)
+                return labels, binned
+            n //= 2
+
+        # Absolute fallback: single bin.
+        edges = np.array([lo - 0.01, hi + 0.01])
+        labels = [f"{lo:.6f}–{hi:.6f}"]
         binned = pd.cut(series, bins=edges, labels=labels,
                         include_lowest=True).astype(str)
         return labels, binned
@@ -1563,18 +1621,28 @@ def run_macroscopic_mining(
                 k_sentinel     = k_out / f".arm{suffix}_done"
 
                 if k_rules_path.exists():
-                    logger.info("  Skipping k=%d: output already exists.", k_val)
-                    # Safe reload: skip empty files (0-row k runs).
+                    # Safe reload: treat 0-row files as non-existing so the
+                    # k is reprocessed (can happen if a previous run crashed
+                    # after _save_rules but before generate_heatmaps).
                     try:
                         existing = pd.read_csv(k_rules_path)
                         existing_summary = pd.read_csv(k_summary_path)
-                        if not existing.empty:
-                            all_rules_list.append(existing)
+                    except pd.errors.EmptyDataError:
+                        existing = pd.DataFrame()
+                        existing_summary = pd.DataFrame()
+
+                    if existing.empty:
+                        logger.info(
+                            "  k=%d: existing rules file is empty — reprocessing.",
+                            k_val,
+                        )
+                        # Fall through to _run_for_k below.
+                    else:
+                        logger.info("  Skipping k=%d: output already exists.", k_val)
+                        all_rules_list.append(existing)
                         if not existing_summary.empty:
                             all_summary_list.append(existing_summary)
-                    except pd.errors.EmptyDataError:
-                        pass   # truly empty file — nothing to aggregate
-                    continue
+                        continue
 
                 if k_sentinel.exists():
                     logger.info("  Skipping k=%d: previously processed, no rules found.", k_val)
@@ -1618,6 +1686,12 @@ def run_macroscopic_mining(
 
             except FileNotFoundError as exc:
                 logger.error("  %s", exc)
+                continue
+            except Exception as exc:
+                logger.error(
+                    "  Unexpected error processing k=%d: %s — skipping.", k_val, exc,
+                    exc_info=True,
+                )
                 continue
 
             if not rules_k.empty:
