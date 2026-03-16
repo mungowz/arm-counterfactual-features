@@ -73,7 +73,17 @@ from sklearn.neighbors import BallTree
 
 logger = logging.getLogger("src.feature_importance")
 
-_DEFAULT_WORKERS = max(1, min(14, (os.cpu_count() or 4) - 2))
+def _compute_default_workers() -> int:
+    """
+    Return the default number of worker processes for BoCSoR.
+
+    Formula: max(1, min(14, cpu_count - 2))
+    Reserves 2 logical CPUs for the OS and the main process, caps at 14
+    to avoid diminishing returns from CatBoost's internal thread pools.
+    """
+    return max(1, min(14, (os.cpu_count() or 4) - 2))
+
+_DEFAULT_WORKERS = _compute_default_workers()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

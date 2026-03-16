@@ -72,9 +72,11 @@ VALID_HORIZONS   = ("1-Year", "5-Year")
 VALID_SURVEYS    = ("person", "household")
 _ALL_STATE_CODES: set[str] = set(USA_STATES) | {"AK", "DC", "PR"}
 
-# Default number of worker processes for multi-year parallel execution.
-# Capped to avoid saturating the system with CPU-bound subprocesses.
-_DEFAULT_YEAR_WORKERS = min(4, os.cpu_count() or 2)
+# Default worker count used for both multi-year stage-1 parallelism and
+# BoCSoR stage-2 processing.  Formula: max(1, min(14, cpu_count - 2)).
+# Reserves 2 logical CPUs for the OS and the main process; caps at 14
+# to avoid competing CatBoost thread pools degrading throughput.
+_DEFAULT_WORKERS = max(1, min(14, (os.cpu_count() or 4) - 2))
 
 logger = logging.getLogger("src.main")
 
@@ -270,6 +272,7 @@ def _run_feature_importance(
         train_catboost,
         run_bocsor_multi_k,
         expand_k,
+        _compute_default_workers,
     )
 
     k_values = expand_k(k)
@@ -592,12 +595,12 @@ Examples:
     # ── Performance (stage 1) ─────────────────────────────────────────────────
     perf = parser.add_argument_group("Performance  (stage 1)")
     perf.add_argument(
-        "--workers", type=int, default=_DEFAULT_YEAR_WORKERS, metavar="N",
+        "--workers", type=int, default=_DEFAULT_WORKERS, metavar="N",
         help=(
             f"Number of parallel worker processes when processing multiple "
             f"years.  Each year runs as an independent process, bypassing "
             f"the GIL.  Ignored when a single year is specified.  "
-            f"Default: {_DEFAULT_YEAR_WORKERS}."
+            f"Default: {_DEFAULT_WORKERS}."
         ),
     )
 
@@ -831,7 +834,7 @@ def main() -> None:
         logger.info("  Threshold      : $%.0f", args.threshold)
         logger.info("  Output columns : %s", keep_columns or "ALL")
         logger.info("  Test split     : %.0f%%", args.test_size * 100)
-        logger.info("  Workers        : %d", args.workers if len(args.years) > 1 else 1)
+        logger.info("  Workers        : %d (auto-detected: %d)", args.workers, _DEFAULT_WORKERS)
         logger.info("  Data dir       : %s", args.data_dir.resolve())
     if run_stage2:
         if not run_stage1:

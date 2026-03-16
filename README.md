@@ -277,7 +277,7 @@ further cuts the number of boundary instances to process.
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `--workers` | int | `min(4, cpu_count)` | Parallel worker processes for multi-year runs and BoCSoR boundary processing. |
+| `--workers` | int | auto-detected | Worker processes for stage-1 multi-year parallelism and stage-2 BoCSoR boundary processing.  Auto-detected as `max(1, min(14, cpu_count - 2))`.  Can be overridden manually. |
 
 ### Logging
 
@@ -427,6 +427,11 @@ importance ranking is as the counterfactual search becomes broader.
   inherit the loaded model, encoded arrays, and BallTree without reimporting.
 - **CatBoost thread control**: each worker uses `thread_count=1` to avoid
   competing internal thread pools.
+- **Worker auto-detection**: `max(1, min(14, cpu_count - 2))` — reserves
+  2 logical CPUs for the OS and the main process, caps at 14 to avoid
+  diminishing returns from CatBoost's internal thread pools.  The same
+  formula is used for both stage-1 multi-year workers and stage-2 BoCSoR
+  boundary processing.  Override with `--workers N` if needed.
 
 ### Classifier
 
