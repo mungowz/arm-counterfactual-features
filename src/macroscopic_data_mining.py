@@ -102,6 +102,7 @@ Dependencies
 
 from __future__ import annotations
 
+import argparse
 import itertools
 import logging
 import os
@@ -1618,7 +1619,7 @@ def run_macroscopic_mining(
 # CLI argument definitions (consumed by main.py's build_parser)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def add_arm_arguments(parser: "argparse.ArgumentParser") -> None:
+def add_arm_arguments(parser: argparse.ArgumentParser) -> None:
     """
     Add stage-3 (ARM) arguments to an existing ArgumentParser.
 
