@@ -370,6 +370,7 @@ directory:
     ├── k<N>/                    ← one sub-folder per k value
     │   ├── arm[suffix]_rules.csv
     │   ├── arm[suffix]_grid_summary.csv
+    │   ├── arm[suffix]_frequent_itemsets.csv
     │   ├── heatmaps/
     │   │   ├── heatmap_support_confidence[suffix].png
     │   │   ├── heatmap_support_lift[suffix].png
@@ -492,7 +493,7 @@ fully self-describing — no external file is needed to interpret the thresholds
 | `confidence` | P(consequent \| antecedent) — actual rule metric |
 | `lift` | Observed / expected co-occurrence — actual rule metric |
 | `leverage` | P(A∪C) − P(A)·P(C) |
-| `conviction` | (1 − P(C)) / (1 − confidence) |
+| `conviction` | (1 − P(C)) / (1 − confidence) — written as empty cell when `confidence = 1.0` (mathematically ∞) |
 | `lift_type` | `positive_correlation` (lift > `arm_lift_high`) or `negative_correlation` (lift < `arm_lift_low`) |
 | `grid_min_support` | `min_support` threshold at which this rule was found |
 | `grid_min_confidence` | `min_confidence` threshold at which this rule was found |
@@ -504,8 +505,26 @@ fully self-describing — no external file is needed to interpret the thresholds
 | `filter_lift_kept_above` | Rules with lift above this are kept (positive correlation) |
 | `filter_lift_discarded` | Discarded lift interval, e.g. `[0.75, 1.25]` |
 
+All floating-point values are written with `%.6f` format (6 fixed decimal
+places).  This guarantees that values like `1.0` appear as `1.000000` and
+`0.625` as `0.625000` — never truncated to bare integers or missing the
+leading zero.  Infinities (`conviction` when `confidence = 1.0`) are replaced
+with an empty cell before writing.
+
 Columns removed (not informative for this analysis): `zhangs_metric`, `jaccard`,
 `certainty`, `kulczynski`, `representativity`.
+
+#### Frequent itemsets CSV (`arm[suffix]_frequent_itemsets.csv`)
+
+One file per k value containing the FP-Growth frequent itemsets at the lowest
+`min_support` threshold of the grid (i.e. the most permissive run, producing
+the maximum number of itemsets).  Sorted descending by support.
+
+| Column | Description |
+|---|---|
+| `k_value` | k value for this run |
+| `itemsets` | Frozenset serialised as tokens joined by ` & `, e.g. `SCHL & WKHP` |
+| `support` | Fraction of transactions containing this itemset |
 
 #### Grid summary CSV (`arm[suffix]_grid_summary.csv`)
 
@@ -571,14 +590,15 @@ macroscopic provenance before the standard metric columns:
 | `confidence` | P(consequent \| antecedent) |
 | `lift` | Observed / expected co-occurrence |
 | `leverage` | P(A∪C) − P(A)·P(C) |
-| `conviction` | (1 − P(C)) / (1 − confidence) |
+| `conviction` | (1 − P(C)) / (1 − confidence) — empty cell when `confidence = 1.0` (mathematically ∞) |
 | `lift_type` | `positive_correlation` or `negative_correlation` |
 | `grid_min_support` | min_support threshold that produced this rule |
 | `grid_min_confidence` | min_confidence threshold that produced this rule |
 | `filter_*` | Active filter thresholds (self-documenting) |
 
-All floating-point values are written with `%.6g` format (6 significant
-figures, compact notation — no spurious trailing decimals).
+All floating-point values are written with `%.6f` format (6 fixed decimal
+places — same as stage 3).  `conviction = inf` (when `confidence = 1.0`) is
+replaced with an empty cell.
 
 #### Microscopic grid summary CSV (`micro[suffix]_grid_summary.csv`)
 
@@ -601,8 +621,9 @@ Stage 4 shares all performance infrastructure with stage 3:
   Python loop over rows.
 - The grid search uses the same **adaptive strategy** (vectorised path for
   few items, threaded path for many items).
-- All floating-point values in CSV output use **`%.6g`** format to avoid
-  IEEE 754 representation noise (e.g. `0.276` instead of `0.27600000000000003`).
+- All floating-point values in CSV output use **`%.6f`** format (6 fixed
+  decimal places): `1.0` → `1.000000`, `0.625` → `0.625000`.  Infinities
+  (`conviction` when `confidence = 1.0`) are replaced with empty cells.
 
 ---
 

@@ -382,6 +382,20 @@ def _format_micro_rules_for_csv(
     _DROP = {"zhangs_metric", "jaccard", "certainty", "kulczynski", "representativity"}
     df = df.drop(columns=[c for c in _DROP if c in df.columns])
 
+    # Sanitise inf / -inf / NaN in numeric columns (e.g. conviction → inf
+    # when confidence = 1.0).  Replace infinities with NaN so to_csv()
+    # writes an empty cell rather than the string "inf".
+    _FLOAT_COLS = [
+        "antecedent support", "consequent support",
+        "support", "confidence", "lift", "leverage", "conviction",
+        "grid_min_support", "grid_min_confidence",
+    ]
+    for col in _FLOAT_COLS:
+        if col not in df.columns:
+            continue
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+        df[col] = df[col].replace([np.inf, -np.inf], np.nan)
+
     # Canonical column order — macro provenance columns come first.
     _ORDERED = [
         "macro_rule_id", "macro_antecedents", "macro_consequents",
@@ -426,7 +440,7 @@ def _save_micro_results(
         min_confidence=min_confidence,
         max_confidence=max_confidence,
     )
-    rules_csv.to_csv(rules_path, index=False, float_format="%.6g")
+    rules_csv.to_csv(rules_path, index=False, float_format="%.6f")
     logger.info("    Micro rules   → %s  (%d rows)", rules_path.name, len(rules_csv))
 
     gs = grid_summary.copy()
@@ -437,7 +451,7 @@ def _save_micro_results(
     gs["filter_lift_kept_below"] = lift_independence_low
     gs["filter_lift_kept_above"] = lift_independence_high
     gs["filter_lift_discarded"]  = f"[{lift_independence_low}, {lift_independence_high}]"
-    gs.to_csv(summary_path, index=False, float_format="%.6g")
+    gs.to_csv(summary_path, index=False, float_format="%.6f")
     logger.info("    Micro summary → %s  (%d cells)", summary_path.name, len(grid_summary))
 
 
@@ -486,7 +500,7 @@ def _run_micro_for_macro_rule(
 
     logger.info("      %d transactions selected for microscopic ARM.", len(transactions))
 
-    all_rules, grid_summary = run_grid_search(
+    all_rules, grid_summary, _freq_micro = run_grid_search(
         transactions=transactions,
         min_support=min_support,
         max_support=max_support,

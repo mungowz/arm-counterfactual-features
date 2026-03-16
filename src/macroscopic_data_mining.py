@@ -580,7 +580,9 @@ def run_grid_search(
     n_workers : Thread-pool size used in the parallel path only.
                 Ignored when the vectorised path is selected.
 
-    Returns (all_rules_df, grid_summary_df).
+    Returns (all_rules_df, grid_summary_df, freq_itemsets_at_min_support).
+    freq_itemsets_at_min_support is the FP-Growth result at the lowest support
+    threshold — used by callers to save the frequent itemsets CSV.
     """
     # ── Resolve data-driven steps if not explicitly provided ──────────────────
     if support_step is None or confidence_step is None:
@@ -781,7 +783,7 @@ def run_grid_search(
         )
 
     logger.info("  → %d unique rules found.", len(all_rules_df))
-    return all_rules_df, grid_summary
+    return all_rules_df, grid_summary, freq_cache[unique_supports[0]]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1233,6 +1235,21 @@ def _format_rules_for_csv(
     }
     df = df.drop(columns=[c for c in _DROP if c in df.columns])
 
+    # ── Sanitise inf / -inf / NaN in numeric columns ──────────────────────────
+    # conviction = (1-P(C))/(1-conf) → inf when confidence=1.0 (mathematically
+    # correct but unreadable in CSV).  Replace with a large finite sentinel and
+    # replace NaN with empty string equivalent for float columns.
+    _FLOAT_COLS = [
+        "antecedent support", "consequent support",
+        "support", "confidence", "lift", "leverage", "conviction",
+        "grid_min_support", "grid_min_confidence",
+    ]
+    for col in _FLOAT_COLS:
+        if col not in df.columns:
+            continue
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+        df[col] = df[col].replace([np.inf, -np.inf], np.nan)
+
     # ── Enforce canonical column order ────────────────────────────────────────
     _ORDERED = [
         "k_value",
@@ -1294,7 +1311,7 @@ def _save_rules(
         min_confidence=min_confidence,
         max_confidence=max_confidence,
     )
-    rules_csv.to_csv(rules_path, index=False, float_format="%.6g")
+    rules_csv.to_csv(rules_path, index=False, float_format="%.6f")
     logger.info("    Rules   → %s  (%d rows)", rules_path.name, len(rules_csv))
 
     gs = grid_summary.copy()
@@ -1305,13 +1322,53 @@ def _save_rules(
     gs["filter_lift_kept_below"]  = lift_independence_low
     gs["filter_lift_kept_above"]  = lift_independence_high
     gs["filter_lift_discarded"]   = f"[{lift_independence_low}, {lift_independence_high}]"
-    gs.to_csv(summary_path, index=False, float_format="%.6g")
+    gs.to_csv(summary_path, index=False, float_format="%.6f")
     logger.info("    Summary → %s  (%d cells)", summary_path.name, len(grid_summary))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Per-k runner
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _save_frequent_itemsets(
+    freq_itemsets: pd.DataFrame,
+    dest_dir: Path,
+    filename_stem: str,
+    k_val: int,
+    min_support: float,
+) -> None:
+    """
+    Save the frequent itemsets DataFrame (output of FP-Growth at min_support)
+    to a CSV file.
+
+    Columns written
+    ───────────────
+    k_value   — k value for this run
+    itemset   — frozenset serialised as " & "-joined sorted tokens
+    support   — itemset support (fraction of transactions)
+
+    Sorted descending by support so the most frequent itemsets appear first.
+    """
+    if freq_itemsets is None or freq_itemsets.empty:
+        logger.info("    Frequent itemsets: none at min_support=%.4f", min_support)
+        return
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    path = dest_dir / f"{filename_stem}_frequent_itemsets.csv"
+
+    df = freq_itemsets.copy()
+    if "itemsets" in df.columns:
+        df["itemsets"] = df["itemsets"].apply(
+            lambda x: " & ".join(sorted(x)) if isinstance(x, frozenset) else str(x)
+        )
+    df.insert(0, "k_value", k_val)
+    df = df.sort_values("support", ascending=False).reset_index(drop=True)
+    df.to_csv(path, index=False, float_format="%.6f")
+    logger.info(
+        "    Frequent itemsets → %s  (%d itemsets at min_support=%.4f)",
+        path.name, len(df), min_support,
+    )
+
 
 def _run_for_k(
     k_val: int,
@@ -1326,8 +1383,8 @@ def _run_for_k(
     Run the full grid search for a single k value.
 
     Loads transactions from the per-k itemset file, runs the grid search,
-    saves results + heatmaps into association_rules/k<N>/, and returns
-    (all_rules_df, grid_summary_df) for later aggregation.
+    saves results + heatmaps + frequent itemsets CSV into association_rules/k<N>/,
+    and returns (all_rules_df, grid_summary_df) for later aggregation.
     """
     logger.info("  ── k=%d ──────────────────────────────────────────", k_val)
 
@@ -1339,7 +1396,7 @@ def _run_for_k(
         empty_summary = pd.DataFrame(columns=["min_support", "min_confidence", "n_rules"])
         return empty_rules, empty_summary
 
-    all_rules, grid_summary = run_grid_search(
+    all_rules, grid_summary, freq_itemsets = run_grid_search(
         transactions=transactions,
         min_support=min_support, max_support=max_support, support_step=support_step,
         min_confidence=min_confidence, max_confidence=max_confidence,
@@ -1365,6 +1422,9 @@ def _run_for_k(
         lift_independence_high=lift_independence_high,
         min_support=min_support, max_support=max_support,
         min_confidence=min_confidence, max_confidence=max_confidence,
+    )
+    _save_frequent_itemsets(
+        freq_itemsets, k_output_dir, f"arm{suffix}", k_val, min_support,
     )
 
     generate_heatmaps(
@@ -1545,7 +1605,7 @@ def run_macroscopic_mining(
                     if not transactions:
                         logger.warning("  No transactions; skipping.")
                         continue
-                    rules_k, summary_k = run_grid_search(
+                    rules_k, summary_k, _freq_combined = run_grid_search(
                         transactions=transactions,
                         min_support=min_support, max_support=max_support,
                         support_step=support_step,
