@@ -322,14 +322,14 @@ further cuts the number of boundary instances to process.
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `--micro-min-support` | float | `0.05` | Minimum support threshold for microscopic FP-Growth. |
+| `--micro-min-support` | float | `0.01` | Minimum support for microscopic FP-Growth. Lower than macro (`0.05`) because filtered transaction sets are smaller (only transactions containing all labels of the anchor rule). |
 | `--micro-max-support` | float | `1.00` | Maximum support upper-bound filter. |
 | `--micro-support-step` | float | auto | Step size for the microscopic support grid (same auto-detection as `--arm-support-step`). |
-| `--micro-min-confidence` | float | `0.50` | Minimum confidence threshold for microscopic rule generation. |
+| `--micro-min-confidence` | float | `0.30` | Minimum confidence for microscopic rule generation. Lower than macro (`0.50`) to capture a wider range of value-level patterns in smaller subsets. |
 | `--micro-max-confidence` | float | `1.00` | Maximum confidence upper-bound filter. |
 | `--micro-confidence-step` | float | auto | Step size for the microscopic confidence grid. |
-| `--micro-lift-low` | float | `0.75` | Lower boundary of the lift independence interval for microscopic rules. |
-| `--micro-lift-high` | float | `1.25` | Upper boundary of the lift independence interval. |
+| `--micro-lift-low` | float | `0.75` | Lower boundary of the lift independence interval — same as macro. Rules with lift ∈ [`--micro-lift-low`, `--micro-lift-high`] are discarded. |
+| `--micro-lift-high` | float | `1.25` | Upper boundary of the lift independence interval — same as macro. |
 | `--micro-k` | int | `None` | If set, run microscopic ARM only for this k value. Default: all k values for which macroscopic rules exist. |
 | `--micro-workers` | int | auto-detected | Thread-pool size for the microscopic grid search (parallel path only). |
 
@@ -563,16 +563,34 @@ For each macroscopic rule `antecedent_labels → consequent_labels` produced by
 stage 3, the microscopic analysis:
 
 1. Extracts the set of feature labels that appear in the rule's antecedent
-   **or** consequent.
+   **and** consequent (their union).
 2. Filters the itemset CSV: retains only boundary instances whose itemset
-   contains **at least one token** whose label matches a label in the rule.
-   All tokens of each matching instance are kept (not just the matched ones),
-   preserving the full value context.
-3. Runs the same adaptive FP-Growth grid search on the filtered microscopic
-   transactions.
+   contains **at least one token for every label** in that set — i.e. the
+   transaction must have both a `SCHL=*` token and a `WKHP=*` token for a
+   macro rule `WKHP → SCHL`.  Transactions that contain only one of the two
+   labels are excluded.  Extra tokens whose label is not in the set are kept,
+   preserving the full value context of each instance.
+3. Runs an independent FP-Growth grid search on the filtered microscopic
+   transactions, using its own lower thresholds (`min_support=0.01`,
+   `min_confidence=0.30`) independent of the macroscopic grid parameters.
 4. Annotates every surviving microscopic rule with `macro_rule_id`,
    `macro_antecedents`, and `macro_consequents` so the value-level finding
    can always be traced back to its macroscopic anchor.
+
+**Why require all labels**: requiring all labels of the macro rule ensures that
+only instances where every feature in the rule is simultaneously discriminant
+are analysed.  With the old "at least one" filter, a transaction containing
+only `SCHL=Bachelors-Degree` (but no `WKHP` token) would be included in the
+`WKHP → SCHL` analysis — diluting the signal and producing itemsets unrelated
+to the joint WKHP/SCHL relationship identified at the macroscopic level.
+
+**Default thresholds vs macroscopic**
+
+| Parameter | Macro default | Micro default | Reason |
+|---|---|---|---|
+| `min_support` | `0.05` | `0.01` | Filtered subsets are smaller — lower threshold captures rare but real co-occurrences |
+| `min_confidence` | `0.50` | `0.30` | Smaller subsets need a wider confidence window to surface patterns |
+| lift window | `[0.75, 1.25]` | `[0.75, 1.25]` | Same independence criterion — discards near-independent rules |
 
 ### Output files
 

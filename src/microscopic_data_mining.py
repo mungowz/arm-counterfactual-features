@@ -154,19 +154,21 @@ logging.getLogger("PIL").setLevel(logging.WARNING)
 _FOLDER_MICRO = "micro"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Default parameters (inherit stage-3 defaults)
+# Default parameters — microscopic ARM uses lower thresholds than stage 3
+# because filtered transaction sets are smaller (only transactions containing
+# ALL labels of the anchor macro rule) and require finer granularity.
 # ─────────────────────────────────────────────────────────────────────────────
 
-DEFAULT_MICRO_MIN_SUPPORT         = DEFAULT_MIN_SUPPORT
+DEFAULT_MICRO_MIN_SUPPORT         = 0.01   # lower than macro (0.05) — smaller subsets
 DEFAULT_MICRO_MAX_SUPPORT         = DEFAULT_MAX_SUPPORT
 DEFAULT_MICRO_SUPPORT_STEP        = None   # data-driven
 
-DEFAULT_MICRO_MIN_CONFIDENCE      = DEFAULT_MIN_CONFIDENCE
+DEFAULT_MICRO_MIN_CONFIDENCE      = 0.3    # lower than macro (0.5) — smaller subsets need looser threshold
 DEFAULT_MICRO_MAX_CONFIDENCE      = DEFAULT_MAX_CONFIDENCE
 DEFAULT_MICRO_CONFIDENCE_STEP     = None   # data-driven
 
-DEFAULT_MICRO_LIFT_LOW  = DEFAULT_LIFT_INDEPENDENCE_LOW
-DEFAULT_MICRO_LIFT_HIGH = DEFAULT_LIFT_INDEPENDENCE_HIGH
+DEFAULT_MICRO_LIFT_LOW  = DEFAULT_LIFT_INDEPENDENCE_LOW    # same as macro: 0.75
+DEFAULT_MICRO_LIFT_HIGH = DEFAULT_LIFT_INDEPENDENCE_HIGH   # same as macro: 1.25
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -298,11 +300,22 @@ def _filter_transactions_for_rule(
     label_set: frozenset[str],
 ) -> list[list[str]]:
     """
-    From the exploded token DataFrame, select all transactions (rows) that
-    contain at least one token whose label is in *label_set*.
+    From the exploded token DataFrame, select all transactions that contain
+    **all** labels present in *label_set* (i.e. at least one token per label).
 
-    Returns microscopic transactions: each transaction is a sorted list of
-    unique "LABEL=value" tokens from the matching rows.
+    A transaction qualifies only if every label in the macroscopic rule's
+    antecedent ∪ consequent is represented by at least one token.  Extra
+    tokens whose label is not in the label_set are retained — they provide
+    additional microscopic context (e.g. a third feature co-occurring with
+    the two rule labels).
+
+    Example
+    -------
+    Macro rule  WKHP → SCHL  →  label_set = {"WKHP", "SCHL"}
+    A transaction qualifies only if it contains both a WKHP=* token AND a
+    SCHL=* token.  A transaction containing only SCHL=Bachelors-Degree is
+    excluded; one containing WKHP=Full-Time and SCHL=Bachelors-Degree is
+    included (with both tokens kept).
 
     Parameters
     ----------
@@ -313,21 +326,26 @@ def _filter_transactions_for_rule(
     if exploded.empty or not label_set:
         return []
 
-    # Vectorised mask: find transactions containing at least one matching label.
-    mask = exploded["label"].isin(label_set)
-    matching_txn_ids = set(exploded.loc[mask, "_txn_idx"].unique())
+    # For each label in the set, find the transaction IDs that contain it.
+    # The qualifying transactions are the INTERSECTION across all labels.
+    ids_all: Optional[set] = None
+    for lbl in label_set:
+        ids_with_lbl = set(
+            exploded.loc[exploded["label"] == lbl, "_txn_idx"].unique()
+        )
+        ids_all = ids_with_lbl if ids_all is None else ids_all & ids_with_lbl
 
-    if not matching_txn_ids:
+    if not ids_all:
         return []
 
-    # Keep ALL tokens of the matching transactions.
-    subset = exploded[exploded["_txn_idx"].isin(matching_txn_ids)]
+    # Keep ALL tokens of the qualifying transactions (not just the matched
+    # ones), so the full microscopic context of each instance is preserved.
+    subset = exploded[exploded["_txn_idx"].isin(ids_all)]
 
     if subset.empty:
         return []
 
-    # Build token lists using numpy lexsort+split — faster than groupby+apply
-    # for large subsets (~4× speedup on 43k+ transaction sets).
+    # Build token lists using numpy lexsort+split.
     idx_arr   = subset["_txn_idx"].values
     tok_arr   = subset["token"].values
     order     = np.lexsort((tok_arr, idx_arr))
