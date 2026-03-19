@@ -435,7 +435,17 @@ def _format_micro_rules_for_csv(
     ]
     present = [c for c in _ORDERED if c in df.columns]
     extra   = [c for c in df.columns if c not in present]
-    return df[present + extra]
+    df = df[present + extra]
+
+    # ── Sort rows alphabetically by macro rule then antecedents then consequents
+    # Makes symmetric rules (A→B and B→A) adjacent and easier to identify.
+    sort_cols = [c for c in (
+        "macro_antecedents", "macro_consequents", "antecedents", "consequents"
+    ) if c in df.columns]
+    if sort_cols:
+        df = df.sort_values(sort_cols).reset_index(drop=True)
+
+    return df
 
 
 def _save_micro_results(

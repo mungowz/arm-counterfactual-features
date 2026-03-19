@@ -1343,6 +1343,12 @@ def _format_rules_for_csv(
     extra   = [c for c in df.columns if c not in present]
     df = df[present + extra]
 
+    # ── Sort rows alphabetically by antecedents then consequents ─────────────
+    # Makes symmetric rules (A→B and B→A) adjacent and the CSV easier to scan.
+    sort_cols = [c for c in ("antecedents", "consequents") if c in df.columns]
+    if sort_cols:
+        df = df.sort_values(sort_cols).reset_index(drop=True)
+
     return df
 
 

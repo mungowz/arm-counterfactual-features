@@ -516,6 +516,11 @@ places).  This guarantees that values like `1.0` appear as `1.000000` and
 leading zero.  Infinities (`conviction` when `confidence = 1.0`) are replaced
 with an empty cell before writing.
 
+Rows are sorted **alphabetically** by `antecedents` then `consequents`.
+Within each cell (antecedents, consequents) tokens are joined in alphabetical
+order (e.g. `COW & SCHL`, never `SCHL & COW`).  This makes symmetric rule
+pairs (e.g. `SCHL → WKHP` and `WKHP → SCHL`) easy to identify by eye.
+
 Columns removed (not informative for this analysis): `zhangs_metric`, `jaccard`,
 `certainty`, `kulczynski`, `representativity`.
 
@@ -622,6 +627,11 @@ macroscopic provenance before the standard metric columns:
 All floating-point values are written with `%.6f` format (6 fixed decimal
 places — same as stage 3).  `conviction = inf` (when `confidence = 1.0`) is
 replaced with an empty cell.
+
+Rows are sorted **alphabetically** by `macro_antecedents`, `macro_consequents`,
+`antecedents`, `consequents` — rules from the same macroscopic anchor are
+grouped together, and within each group symmetric pairs (`A→B` / `B→A`) are
+adjacent for easy identification.
 
 #### Microscopic grid summary CSV (`micro[suffix]_grid_summary.csv`)
 
