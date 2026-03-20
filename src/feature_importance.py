@@ -319,7 +319,7 @@ def _process_boundary_chunk(
     original_class: int,
     norm_factor: float,
     cf_tree: BallTree,
-) -> tuple[dict[str, int], list[dict]]:
+) -> tuple[dict[str, int], list[dict], list[dict]]:
     """
     Process one chunk of boundary instances in a worker process.
 
@@ -354,11 +354,15 @@ def _process_boundary_chunk(
     (importance_counts, itemset_rows)
       importance_counts : {feature -> count of boundary instances in this
                            chunk for which the feature is in the relevant union}.
-      itemset_rows      : one dict per (instance, relevant_feature).
+      itemset_rows      : one dict per boundary instance with relevant features.
+      distance_rows     : one dict per (boundary_instance, k_neighbour) pair
+                          with fields instance_index, cf_index,
+                          k_neighbour_rank (1=closest), distance.
     """
     n_features = len(feature_cols)
     importance_counts: dict[str, int] = {f: 0 for f in feature_cols}
     itemset_rows: list[dict] = []
+    distance_rows: list[dict] = []
 
     n_cf = len(cf_global_indices)
 
@@ -366,14 +370,24 @@ def _process_boundary_chunk(
         # ── Algorithm 1: k-NN via BallTree — O(k log N_cf) ───────────────────
         query_norm = (X_enc[b_idx].astype(np.float32)
                       / norm_factor * 2.0).reshape(1, -1)
-        k_act      = min(k, n_cf)
-        _, top_local = cf_tree.query(query_norm, k=k_act)   # (1, k_act)
+        k_act          = min(k, n_cf)
+        dists, top_local = cf_tree.query(query_norm, k=k_act)   # (1, k_act)
         cf_idxs = [int(cf_global_indices[i]) for i in top_local[0]]
+        cf_dists = dists[0].tolist()   # normalised Manhattan distances
 
         if not cf_idxs:
             continue
 
         instance_vals = X_train_values[b_idx]
+
+        # Record one distance row per (boundary_instance, k_neighbour) pair.
+        for rank, (cf_idx, dist) in enumerate(zip(cf_idxs, cf_dists), start=1):
+            distance_rows.append({
+                "instance_index":    int(b_idx),
+                "cf_index":          cf_idx,
+                "k_neighbour_rank":  rank,   # 1 = closest, 2 = second closest, …
+                "distance":          round(float(dist), 6),
+            })
 
         # ── Algorithm 2: batched relevance check ─────────────────────────────
         # Build one modified instance per (counterfactual, differing_feature)
@@ -420,7 +434,7 @@ def _process_boundary_chunk(
             for feat in relevant_union:
                 importance_counts[feat] += 1
 
-    return importance_counts, itemset_rows
+    return importance_counts, itemset_rows, distance_rows
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -441,7 +455,7 @@ def run_bocsor_single_k(
     k: int,
     original_class: int,
     n_workers: int,
-) -> tuple[pd.DataFrame, pd.Series]:
+) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
     """
     Run BoCSoR for a single k value.
 
@@ -451,7 +465,7 @@ def run_bocsor_single_k(
 
     Returns
     -------
-    (itemsets_df, feature_importance)
+    (itemsets_df, feature_importance, distances_df)
     """
     norm_factor = float(max_rank_per_column(rank_maps).sum())
 
@@ -463,6 +477,8 @@ def run_bocsor_single_k(
         return (
             pd.DataFrame(columns=["instance_index", "features", "itemset"]),
             pd.Series(0.0, index=feature_cols, name="BoCSoR_importance"),
+            pd.DataFrame(columns=["instance_index", "cf_index",
+                                   "k_neighbour_rank", "distance"]),
         )
 
     # ── Chunk and dispatch ────────────────────────────────────────────────────
@@ -474,7 +490,8 @@ def run_bocsor_single_k(
     ]
 
     total_importance: dict[str, int] = {f: 0 for f in feature_cols}
-    all_rows: list[dict]             = []
+    all_rows:      list[dict] = []
+    all_dist_rows: list[dict] = []
     n_with_cf = 0
 
     _fork_ctx = multiprocessing.get_context("fork")
@@ -497,10 +514,11 @@ def run_bocsor_single_k(
             for chunk in chunks
         }
         for future in as_completed(futures):
-            imp_c, rows_c = future.result()
+            imp_c, rows_c, dist_c = future.result()
             for feat, cnt in imp_c.items():
                 total_importance[feat] += cnt
             all_rows.extend(rows_c)
+            all_dist_rows.extend(dist_c)
             n_with_cf += len({r["instance_index"] for r in rows_c})
 
     logger.info(
@@ -513,7 +531,10 @@ def run_bocsor_single_k(
         / max(n_with_cf, 1)
     ).sort_values(ascending=False)
 
-    return pd.DataFrame(all_rows), feat_imp
+    dist_df = pd.DataFrame(all_dist_rows) if all_dist_rows else pd.DataFrame(
+        columns=["instance_index", "cf_index", "k_neighbour_rank", "distance"]
+    )
+    return pd.DataFrame(all_rows), feat_imp, dist_df
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -532,7 +553,7 @@ def run_bocsor_multi_k(
     original_class: int = 0,
     cf_class: int = 1,
     n_workers: int = _DEFAULT_WORKERS,
-) -> tuple[pd.DataFrame, pd.DataFrame, dict[int, pd.DataFrame]]:
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[int, pd.DataFrame], pd.DataFrame]:
     """
     Run BoCSoR once per value in k_values on the training set.
 
@@ -551,9 +572,13 @@ def run_bocsor_multi_k(
 
     Returns
     -------
-    (all_itemsets_df, importance_df)
+    (all_itemsets_df, importance_df, per_k_itemsets, distances_df)
       all_itemsets_df : columns [k_value, instance_index, features, itemset].
       importance_df   : features x k_values wide table (columns k_1, k_3, ...).
+      per_k_itemsets  : {k -> itemset DataFrame for that k only}.
+      distances_df    : columns [k_value, instance_index, cf_index,
+                        k_neighbour_rank, distance] — one row per
+                        (boundary_instance, k_neighbour) pair.
     """
     logger.info(
         "BoCSoR on TRAINING SET: k=%s  class %d->%d  "
@@ -596,16 +621,21 @@ def run_bocsor_multi_k(
         imp_df    = pd.DataFrame(
             {f"k_{k}": empty_imp for k in k_values}
         ).rename_axis("feature")
-        return empty_df, imp_df, {k: empty_df.copy() for k in k_values}
+        empty_dist = pd.DataFrame(
+            columns=["k_value", "instance_index", "cf_index",
+                     "k_neighbour_rank", "distance"]
+        )
+        return empty_df, imp_df, {k: empty_df.copy() for k in k_values}, empty_dist
 
     # ── Run once per k (boundary instances reused) ────────────────────────────
     all_itemsets:    list[pd.DataFrame]   = []
+    all_distances:   list[pd.DataFrame]   = []
     importance_dict: dict[int, pd.Series] = {}
 
     for k in k_values:
         logger.info("── k=%d ──────────────────────────────────────────────", k)
         t_k = time.perf_counter()
-        itemsets_df, feat_imp = run_bocsor_single_k(
+        itemsets_df, feat_imp, dist_df = run_bocsor_single_k(
             model=model,
             X_train=X_train,
             X_enc=X_enc,
@@ -623,7 +653,10 @@ def run_bocsor_multi_k(
         logger.info("  k=%d | elapsed: %.1fs", k, time.perf_counter() - t_k)
         if not itemsets_df.empty:
             itemsets_df.insert(0, "k_value", k)
+        if not dist_df.empty:
+            dist_df.insert(0, "k_value", k)
         all_itemsets.append(itemsets_df)
+        all_distances.append(dist_df)
         importance_dict[k] = feat_imp
 
     combined = pd.concat(all_itemsets, ignore_index=True)
@@ -634,7 +667,12 @@ def run_bocsor_multi_k(
     per_k_itemsets: dict[int, pd.DataFrame] = {
         k: df for k, df in zip(k_values, all_itemsets)
     }
-    return combined, imp_df, per_k_itemsets
+
+    # distances_df: all k merged, columns [k_value, instance_index,
+    # cf_index, k_neighbour_rank, distance]
+    distances_df = pd.concat(all_distances, ignore_index=True)
+
+    return combined, imp_df, per_k_itemsets, distances_df
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1024,7 +1062,7 @@ def main() -> None:
             orig_cls, cf_cls,
         )
         t_dir = time.perf_counter()
-        all_itemsets_df, importance_df, per_k_itemsets = run_bocsor_multi_k(
+        all_itemsets_df, importance_df, per_k_itemsets, distances_df = run_bocsor_multi_k(
             model=model,
             X_train=X_train,
             y_train=y_train,
@@ -1058,6 +1096,12 @@ def main() -> None:
         imp_path = args.output_dir / f"feature_importance{suffix}.csv"
         importance_df.reset_index().to_csv(imp_path, index=False)
         logger.info("Importance -> %s", imp_path)
+
+        # Distances: one row per (boundary_instance, k_neighbour) pair.
+        # Columns: [k_value, instance_index, cf_index, k_neighbour_rank, distance].
+        dist_path = args.output_dir / f"bocsor_distances{suffix}.csv"
+        distances_df.to_csv(dist_path, index=False)
+        logger.info("Distances -> %s  (%d rows)", dist_path, len(distances_df))
 
         logger.info("Feature importance summary (class %d):", orig_cls)
         for k_col in importance_df.columns:
@@ -1194,11 +1238,13 @@ def _write_summary(
 
     # Group summary_data by direction (each direction appears once in summary_data
     # with its importance_df; we de-duplicate).
-    for entry in summary_data[:1]:   # single direction: class 0 -> class 1
+    for entry in summary_data:
+        orig_cls    = entry["orig_cls"]
+        cf_cls      = 1 - orig_cls
         imp_df      = entry["importance_df"]
         elapsed_dir = entry["elapsed_dir"]
 
-        a(f"### Class 0 → Class 1  *(elapsed: {elapsed_dir:.1f}s)*")
+        a(f"### Class {orig_cls} → Class {cf_cls}  *(elapsed: {elapsed_dir:.1f}s)*")
         a("")
 
         # Table header
@@ -1239,6 +1285,7 @@ def _write_summary(
     a("| `feature_importance_itemsets.csv` | Itemsets for all k merged — columns: k_value, instance_index, features, itemset |")
     for k in k_values:
         a(f"| `feature_importance_itemsets_k{k}.csv` | Itemsets for k={k} only |")
+    a("| `bocsor_distances.csv` | Distances — columns: k_value, instance_index, cf_index, k_neighbour_rank, distance |")
     a("| `bocsor_summary.md` | This file |")
     a("")
 
