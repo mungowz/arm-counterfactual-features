@@ -3,7 +3,7 @@ src/main.py
 ───────────
 Command-line entry point for the ACS Income pipeline.
 
-This file orchestrates both pipeline stages:
+This file orchestrates all four pipeline stages:
 
   Stage 1 — dataset creation  (src/create_dataset.py)
     Downloads ACS PUMS data via folktables, decodes categorical features,
@@ -14,7 +14,16 @@ This file orchestrates both pipeline stages:
   Stage 2 — feature importance  (src/feature_importance.py)
     Trains a CatBoost classifier on the stage-1 output and computes global
     feature importance using the BoCSoR algorithm (Alfeo et al., 2023).
+    Both boundary directions (class 0→1 and class 1→0) are always computed.
     Results are saved under <output-dir>/<states_tag>/<years_tag>/.
+
+  Stage 3 — macroscopic association rule mining  (src/macroscopic_data_mining.py)
+    Mines FP-Growth association rules on the feature *label* level (e.g.
+    {SCHL, WKHP}) using a grid search over support and confidence.
+
+  Stage 4 — microscopic association rule mining  (src/microscopic_data_mining.py)
+    For each macroscopic rule, filters itemsets that contain all its labels
+    and mines value-level rules (e.g. {SCHL=Bachelors-Degree, WKHP=Full-Time}).
 
 Usage
 ─────
@@ -23,7 +32,7 @@ From the project root:
 
 Examples
 ────────
-    # Both stages — dataset created if missing, BoCSoR skipped if output exists
+    # All stages — dataset created if missing, existing outputs skipped
     python -m src.main --states northeast --years 2024
 
     # Custom BoCSoR settings
@@ -57,6 +66,14 @@ from src.constants import (       # noqa: E402
     DEFAULT_COLUMNS,
 )
 from src.create_dataset import create_dataset  # noqa: E402
+from src.macroscopic_data_mining import (      # noqa: E402
+    run_macroscopic_mining,
+    add_arm_arguments,
+)
+from src.microscopic_data_mining import (      # noqa: E402
+    run_microscopic_mining,
+    add_micro_arguments,
+)
 
 VALID_HORIZONS   = ("1-Year", "5-Year")
 VALID_SURVEYS    = ("person", "household")
@@ -400,9 +417,10 @@ Available feature columns (--columns):
   {cols_str}
   or: ALL  (retain every feature column)
 
-The pipeline always runs both stages.  If the stage-1 CSV files already
+The pipeline always runs all four stages.  If the stage-1 CSV files already
 exist they are loaded directly (no download).  If the stage-2 output files
-already exist that class is skipped.  Re-runs are therefore always safe.
+already exist that class is skipped.  Stage-3 and stage-4 outputs are also
+skipped if they already exist.  Re-runs are therefore always safe.
 
 Examples:
   # Full pipeline — dataset + BoCSoR
@@ -538,6 +556,12 @@ Examples:
             f"Default: {_DEFAULT_WORKERS}."
         ),
     )
+
+    # ── Stage 3: macroscopic ARM hyperparameters ──────────────────────────────
+    add_arm_arguments(parser)
+
+    # ── Stage 4: microscopic ARM hyperparameters ──────────────────────────────
+    add_micro_arguments(parser)
 
     parser.add_argument(
         "--log-level",
@@ -811,6 +835,38 @@ def main() -> None:
             log_level=args.log_level,
         )
 
+        # ── Stage 3: macroscopic ARM ──────────────────────────────────────────
+        run_macroscopic_mining(
+            output_dir=xai_output_dir,
+            original_class=[0, 1],
+            k_value=args.arm_k,
+            min_support=args.arm_min_support,
+            max_support=args.arm_max_support,
+            support_step=args.arm_support_step,
+            min_confidence=args.arm_min_confidence,
+            max_confidence=args.arm_max_confidence,
+            confidence_step=args.arm_confidence_step,
+            lift_independence_low=args.arm_lift_low,
+            lift_independence_high=args.arm_lift_high,
+            n_workers=args.arm_workers,
+        )
+
+        # ── Stage 4: microscopic ARM ──────────────────────────────────────────
+        run_microscopic_mining(
+            output_dir=xai_output_dir,
+            original_class=[0, 1],
+            k_value=args.micro_k,
+            min_support=args.micro_min_support,
+            max_support=args.micro_max_support,
+            support_step=args.micro_support_step,
+            min_confidence=args.micro_min_confidence,
+            max_confidence=args.micro_max_confidence,
+            confidence_step=args.micro_confidence_step,
+            lift_independence_low=args.micro_lift_low,
+            lift_independence_high=args.micro_lift_high,
+            n_workers=args.micro_workers,
+        )
+
     else:
         # Multiple years: one process per year (CPU-bound + independent I/O).
         workers = min(args.workers, len(args.years))
@@ -879,6 +935,38 @@ def main() -> None:
                 n_workers=args.workers,
                 random_seed=args.seed,
                 log_level=args.log_level,
+            )
+
+            # ── Stage 3: macroscopic ARM ──────────────────────────────────────
+            run_macroscopic_mining(
+                output_dir=year_output_dir,
+                original_class=[0, 1],
+                k_value=args.arm_k,
+                min_support=args.arm_min_support,
+                max_support=args.arm_max_support,
+                support_step=args.arm_support_step,
+                min_confidence=args.arm_min_confidence,
+                max_confidence=args.arm_max_confidence,
+                confidence_step=args.arm_confidence_step,
+                lift_independence_low=args.arm_lift_low,
+                lift_independence_high=args.arm_lift_high,
+                n_workers=args.arm_workers,
+            )
+
+            # ── Stage 4: microscopic ARM ──────────────────────────────────────
+            run_microscopic_mining(
+                output_dir=year_output_dir,
+                original_class=[0, 1],
+                k_value=args.micro_k,
+                min_support=args.micro_min_support,
+                max_support=args.micro_max_support,
+                support_step=args.micro_support_step,
+                min_confidence=args.micro_min_confidence,
+                max_confidence=args.micro_max_confidence,
+                confidence_step=args.micro_confidence_step,
+                lift_independence_low=args.micro_lift_low,
+                lift_independence_high=args.micro_lift_high,
+                n_workers=args.micro_workers,
             )
 
     logger.info("═" * 62)

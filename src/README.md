@@ -72,11 +72,12 @@ python -m src.main --states midwest --years 2021 2022 2023 2024
 python -m src.main --states ALL --years 2024
 ```
 
-Each run always produces three stage-1 CSV files (`dataset_*.csv`,
-`train_*.csv`, `test_*.csv`) plus the stage-2 BoCSoR output for **both**
-boundary directions (class 0→1 and class 1→0, in separate `_class0` /
-`_class1` files).  If the files already exist from a previous run they are
-loaded directly — no re-download or re-encoding.
+Each run always executes all four stages in sequence. Stage 1 produces three
+CSV files (`dataset_*.csv`, `train_*.csv`, `test_*.csv`). Stage 2 produces
+BoCSoR output for **both** boundary directions (class 0→1 and class 1→0, in
+separate `_class0` / `_class1` files). Stage 3 and 4 produce macroscopic and
+microscopic association rules respectively. If any output already exists from
+a previous run it is loaded or skipped directly — no re-computation.
 
 ---
 
