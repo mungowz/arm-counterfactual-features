@@ -59,14 +59,11 @@ pip install folktables pandas numpy scikit-learn catboost mlxtend matplotlib sea
 ## Quick start
 
 ```bash
-# Single state, default columns (COW SCHL WKHP), default 80/20 split
+# Single state, default columns (COW SCHL WKHP)
 python -m src.main --states NY --years 2024
 
 # Custom BoCSoR settings
 python -m src.main --states CA NY TX --columns ALL --k 11 --percentile 20
-
-# Explain both class 0 and class 1 boundaries
-python -m src.main --states northeast --years 2024 --original-class 0 1
 
 # Multiple years (each year produces its own output sub-directory)
 python -m src.main --states midwest --years 2021 2022 2023 2024
@@ -76,9 +73,10 @@ python -m src.main --states ALL --years 2024
 ```
 
 Each run always produces three stage-1 CSV files (`dataset_*.csv`,
-`train_*.csv`, `test_*.csv`) plus the stage-2 BoCSoR output.  If the
-files already exist from a previous run they are loaded directly — no
-re-download or re-encoding.
+`train_*.csv`, `test_*.csv`) plus the stage-2 BoCSoR output for **both**
+boundary directions (class 0→1 and class 1→0, in separate `_class0` /
+`_class1` files).  If the files already exist from a previous run they are
+loaded directly — no re-download or re-encoding.
 
 ---
 
@@ -88,8 +86,10 @@ The pipeline always runs all four stages. Re-runs are safe:
 
 - **Stage 1** is skipped if the expected `train_*.csv` / `test_*.csv` files
   already exist in `--data-dir`.
-- **Stage 2** skips any class whose `feature_importance[_classN].csv` already
-  exists in the output directory.
+- **Stage 2** always explains both boundary directions (class 0→1 and class
+  1→0).  Each direction produces its own `_class0` / `_class1` suffixed output
+  files.  A direction is skipped only if its `feature_importance_class<N>.csv`
+  already exists in the output directory.
 - **Stage 3** skips any class whose `association_rules/all_k/arm[suffix]_all_k_rules.csv`
   already exists.  Individual per-k runs are also skipped if their output exists.
   k values with zero rules leave a sentinel file (`.arm[suffix]_done`) so they
@@ -129,7 +129,7 @@ Filename pattern:
 - `{horizon}` — `1Y` or `5Y`
 - `{cols}` — feature columns joined by `-` (e.g. `COW-SCHL-WKHP`), or `ALL`
 
-The train/test split is **stratified** on the binary target column (default 80/20).
+The train/test split is **fixed at 80/20**, stratified on the binary target column.
 
 ### Stage 2
 
@@ -202,10 +202,10 @@ Both pipeline stages check for existing output files before doing any work.
 the download and encoding steps are skipped entirely and the files are loaded
 directly.  If any one of the three is missing the full pipeline reruns.
 
-**Stage 2** (`feature_importance.py`): if `feature_importance.csv` (or
-`feature_importance_class0.csv` / `feature_importance_class1.csv` when
-`--original-class 0 1` is used) already exists in `--output-dir`, that class
-is skipped.  Classes whose output is missing are still processed normally.
+**Stage 2** (`feature_importance.py`): both boundary directions (class 0→1
+and class 1→0) are always computed, producing `feature_importance_class0.csv`
+and `feature_importance_class1.csv`.  A direction is skipped only if its
+output file already exists in `--output-dir`.
 
 **Stage 3** (`macroscopic_data_mining.py`): if `association_rules/all_k/arm[suffix]_all_k_rules.csv`
 already exists in the output directory, that class is skipped entirely.  Individual
@@ -269,9 +269,11 @@ further cuts the number of boundary instances to process.
 
 ### Train / test split *(stage 1)*
 
+The split is fixed at **80 % train / 20 % test**, stratified on the binary
+target.  Use `--seed` to control reproducibility.
+
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `--test-size` | float | `0.2` | Fraction reserved for the test split (0.0–1.0). Default: 0.2. |
 | `--seed` | int | `42` | Random seed for the stratified split and CatBoost. |
 
 ### BoCSoR hyperparameters *(stage 2)*
@@ -399,8 +401,8 @@ directory:
                 └── heatmap_confidence_lift[suffix].png
 ```
 
-When `--original-class 0 1` is used all files carry a `_class0` / `_class1`
-suffix, mirroring the stage-2 naming convention.
+All files carry a `_class0` / `_class1` suffix since both boundary directions
+are always computed, mirroring the stage-2 naming convention.
 
 ### FP-Growth
 
@@ -550,8 +552,8 @@ One row per `(min_support, min_confidence)` grid cell.  Columns: `min_support`,
 | `heatmap_support_lift[suffix].png` | Support (rows) × Lift (cols), actual-value binned view |
 | `heatmap_confidence_lift[suffix].png` | Confidence (rows) × Lift (cols), actual-value binned view |
 
-When `--original-class 0 1` is used all files carry a `_class0` / `_class1`
-suffix, mirroring the stage-2 naming convention.
+All files carry a `_class0` / `_class1` suffix since both boundary directions
+are always computed, mirroring the stage-2 naming convention.
 
 ---
 

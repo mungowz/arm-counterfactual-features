@@ -374,6 +374,10 @@ def occp_to_major_group(code: int) -> str:
     """
     Map a single integer ACS PUMS OCCP code to its BLS OEWS major-group label.
 
+    Uses bisect for O(log N) lookup instead of a linear scan — relevant
+    because this function is called via Series.map() on datasets that can
+    exceed 1 M rows.
+
     Parameters
     ----------
     code : Integer occupation code from the ACS PUMS OCCP field.
@@ -384,12 +388,19 @@ def occp_to_major_group(code: int) -> str:
         BLS major-group label (e.g. "Management", "Healthcare-Practitioners-
         And-Technical"), or OCCP_FALLBACK for code 0 and unmapped codes.
     """
+    import bisect
     if code <= 0:
         return OCCP_FALLBACK
-    for lower, upper, label in OCCP_MAJOR_GROUP_RANGES:
-        if lower <= code <= upper:
+    idx = bisect.bisect_right(_OCCP_LOWER_BOUNDS, code) - 1
+    if idx >= 0:
+        lower, upper, label = OCCP_MAJOR_GROUP_RANGES[idx]
+        if code <= upper:
             return label
     return OCCP_FALLBACK
+
+
+# Pre-computed lower-bound list for bisect lookup in occp_to_major_group.
+_OCCP_LOWER_BOUNDS: list[int] = [lo for lo, _, _ in OCCP_MAJOR_GROUP_RANGES]
 
 
 # Fallback labels for codes not present in the respective maps above.

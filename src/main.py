@@ -24,14 +24,14 @@ From the project root:
 Examples
 ────────
     # Both stages — dataset created if missing, BoCSoR skipped if output exists
-    python -m src.main --states northeast --years 2024 --test-size 0.2
+    python -m src.main --states northeast --years 2024
 
     # Custom BoCSoR settings
     python -m src.main --states CA NY TX --columns ALL \\
-                        --test-size 0.2 --k 11 --percentile 20
+                        --k 11 --percentile 20
 
     # Multiple years
-    python -m src.main --states ALL --years 2021 2022 2023 2024 --test-size 0.2
+    python -m src.main --states ALL --years 2021 2022 2023 2024
 
     python -m src.main --help
 """
@@ -173,7 +173,6 @@ def _process_year(
     survey: str,
     states: list[str] | None,
     threshold: float,
-    test_size: float,
     random_seed: int,
     data_dir: Path,
     keep_columns: list[str] | None,
@@ -201,7 +200,6 @@ def _process_year(
         survey=survey,
         states=states,
         threshold=threshold,
-        test_size=test_size,
         random_seed=random_seed,
         data_dir=data_dir,
         keep_columns=keep_columns,
@@ -225,7 +223,6 @@ def _run_feature_importance(
     cb_depth: int,
     cb_verbose: bool,
     cb_early_stopping: int,
-    original_class: list[int],
     n_workers: int,
     random_seed: int,
     log_level: str,
@@ -234,6 +231,8 @@ def _run_feature_importance(
     Invoke stage 2 (BoCSoR feature importance) programmatically.
 
     Called after stage 1 completes for each survey year.
+    Both boundary directions (class 0→1 and class 1→0) are always computed
+    and saved to separate files (_class0 / _class1 suffixes).
 
     Parameters
     ----------
@@ -250,7 +249,6 @@ def _run_feature_importance(
     cb_verbose           : Whether CatBoost prints training progress.
     cb_early_stopping    : Stop training if validation loss does not improve
                            for this many rounds (0 = disabled).
-    original_class       : List of classes to explain ([0], [1], or [0, 1]).
     random_seed          : Random seed for CatBoost.
     log_level            : Logging level string (e.g. "INFO").
     """
@@ -307,12 +305,10 @@ def _run_feature_importance(
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Skip classes whose output files already exist.
-    orig_classes_requested = sorted(set(original_class))
-    suffix_map = {
-        c: (f"_class{c}" if len(orig_classes_requested) > 1 else "")
-        for c in orig_classes_requested
-    }
+    # Always explain both boundary directions (0→1 and 1→0).
+    # Each class gets its own _class0 / _class1 suffixed output files.
+    orig_classes_requested = [0, 1]
+    suffix_map = {c: f"_class{c}" for c in orig_classes_requested}
     orig_classes_todo = [
         c for c in orig_classes_requested
         if not (output_dir / f"feature_importance{suffix_map[c]}.csv").exists()
@@ -330,7 +326,9 @@ def _run_feature_importance(
     orig_classes = orig_classes_todo
     for orig_cls in orig_classes:
         cf_cls = 1 - orig_cls
-        suffix = f"_class{orig_cls}" if len(orig_classes) > 1 else ""
+        # suffix_map is built on orig_classes_requested (full set) so it
+        # remains correct even when only a subset of classes is processed.
+        suffix = suffix_map[orig_cls]
 
         logger.info(
             "== BoCSoR: class %d boundary (counterfactual class %d) ==",
@@ -408,18 +406,14 @@ already exist that class is skipped.  Re-runs are therefore always safe.
 
 Examples:
   # Full pipeline — dataset + BoCSoR
-  python -m src.main --states northeast --years 2024 --test-size 0.2
+  python -m src.main --states northeast --years 2024
 
   # Custom BoCSoR settings
   python -m src.main --states CA NY TX --columns ALL \\
-                      --test-size 0.2 --k 11 --percentile 20
+                      --k 11 --percentile 20
 
   # Multiple years
-  python -m src.main --states ALL --years 2021 2022 2023 2024 --test-size 0.2
-
-  # Both classes
-  python -m src.main --states NY --years 2024 --test-size 0.2 \\
-                      --original-class 0 1
+  python -m src.main --states ALL --years 2021 2022 2023 2024
         """,
     )
 
@@ -469,16 +463,8 @@ Examples:
         ),
     )
 
-    # ── Train / test split (stage 1) ──────────────────────────────────────────
+    # ── Train / test split seed (stage 1) ────────────────────────────────────
     split = parser.add_argument_group("Train / test split  (stage 1)")
-    split.add_argument(
-        "--test-size", type=float, default=0.2, metavar="FRACTION",
-        help=(
-            "Fraction of the dataset reserved for the test split (0.0–1.0).  "
-            "0.0 produces a single dataset_*.csv with no split.  "
-            "Must be in (0.0, 1.0).  Default: 0.2."
-        ),
-    )
     split.add_argument(
         "--seed", type=int, default=42,
         help="Random seed for the stratified split and CatBoost.  Default: 42.",
@@ -520,17 +506,6 @@ Examples:
             "Instances whose distance to the nearest opposite-class instance "
             "is below this percentile are treated as boundary instances.  "
             "Default: 20."
-        ),
-    )
-    boc.add_argument(
-        "--original-class", nargs="+", type=int, default=[0],
-        choices=[0, 1], metavar="C",
-        help=(
-            "Class(es) whose boundary instances to explain.  "
-            "0 = income <= threshold (default).  "
-            "1 = income > threshold.  "
-            "0 1 = both (produces separate output files per class).  "
-            "Default: 0."
         ),
     )
 
@@ -622,7 +597,7 @@ def _infer_split_paths(
     else:
         states_tag = "_".join(sorted(states))
     horizon_tag = horizon.replace("-", "").replace("Year", "Y")   # "1-Year" -> "1Y"
-    cols_tag    = "-".join(keep_columns) if keep_columns else "ALL"
+    cols_tag    = "-".join(sorted(keep_columns)) if keep_columns else "ALL"
     stem = (
         f"{year}_{states_tag}"
         f"_{horizon_tag}_{survey}"
@@ -753,8 +728,13 @@ def main() -> None:
         logger.error("Year(s) out of supported range (2014–2024): %s", invalid_years)
         sys.exit(1)
 
-    if not (0.0 < args.test_size < 1.0):
-        logger.error("--test-size must be in the range (0.0, 1.0).")
+    invalid_k = [v for v in args.k if v < 1]
+    if invalid_k:
+        logger.error("--k values must be >= 1.  Invalid: %s", invalid_k)
+        sys.exit(1)
+
+    if not (0.0 < args.percentile <= 100.0):
+        logger.error("--percentile must be in the range (0, 100].")
         sys.exit(1)
 
     if args.threshold <= 0:
@@ -781,7 +761,6 @@ def main() -> None:
     logger.info("  BoCSoR k       : %s", args.k)
     logger.info("  BoCSoR pct     : %.1f%%", args.percentile)
     logger.info("  XAI output dir : %s", xai_output_dir.resolve())
-    logger.info("  Random seed    : %d", args.seed)
     logger.info("═" * 62)
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -797,7 +776,6 @@ def main() -> None:
                 survey=args.survey,
                 states=states,
                 threshold=args.threshold,
-                test_size=args.test_size,
                 random_seed=args.seed,
                 data_dir=args.data_dir,
                 keep_columns=keep_columns,
@@ -828,7 +806,6 @@ def main() -> None:
             cb_depth=args.cb_depth,
             cb_verbose=args.cb_verbose,
             cb_early_stopping=args.cb_early_stopping,
-            original_class=args.original_class,
             n_workers=args.workers,
             random_seed=args.seed,
             log_level=args.log_level,
@@ -847,7 +824,6 @@ def main() -> None:
             survey=args.survey,
             states=states,
             threshold=args.threshold,
-            test_size=args.test_size,
             random_seed=args.seed,
             data_dir=args.data_dir,
             keep_columns=keep_columns,
@@ -900,7 +876,6 @@ def main() -> None:
                 cb_depth=args.cb_depth,
                 cb_verbose=args.cb_verbose,
                 cb_early_stopping=args.cb_early_stopping,
-                original_class=args.original_class,
                 n_workers=args.workers,
                 random_seed=args.seed,
                 log_level=args.log_level,

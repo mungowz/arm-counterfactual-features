@@ -71,6 +71,12 @@ from catboost import CatBoostClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.neighbors import BallTree
 
+from src.constants import (
+    AGEP_LABELS,
+    WKHP_LABELS,
+    SCHL_MAP,
+)
+
 logger = logging.getLogger("src.feature_importance")
 
 def _compute_default_workers() -> int:
@@ -90,24 +96,19 @@ _DEFAULT_WORKERS = _compute_default_workers()
 # Ordered category definitions
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Ordered category definitions
+#
+# Imported from constants.py to avoid duplication: if category labels or
+# orderings change in constants.py this dict updates automatically.
+# ─────────────────────────────────────────────────────────────────────────────
+
 ORDERED_CATEGORIES: dict[str, list[str]] = {
-    "AGEP": [
-        "Young", "Young-Adult", "Mid-Career",
-        "Experienced", "Late-Career", "Retirement-Age",
-    ],
-    "SCHL": [
-        "No-Schooling-Completed", "Nursery-School-Preschool", "Kindergarten",
-        "Grade-1", "Grade-2", "Grade-3", "Grade-4", "Grade-5", "Grade-6",
-        "Grade-7", "Grade-8", "Grade-9", "Grade-10", "Grade-11",
-        "Grade-12-No-Diploma", "Regular-HS-Diploma", "GED-Or-Alt-Credential",
-        "Some-College-Less-Than-1yr", "Some-College-1yr-Or-More-No-Degree",
-        "Associates-Degree", "Bachelors-Degree", "Masters-Degree",
-        "Professional-Degree-Beyond-Bachelors", "Doctorate-Degree",
-    ],
-    "WKHP": [
-        "Part-Time-Low", "Part-Time", "Near-Full-Time",
-        "Full-Time", "Over-Full-Time", "Extended-Hours",
-    ],
+    "AGEP": AGEP_LABELS,
+    "WKHP": WKHP_LABELS,
+    # SCHL_MAP keys are already in ascending code order (1–24), so the
+    # values() list preserves the semantic educational attainment ordering.
+    "SCHL": list(SCHL_MAP.values()),
 }
 
 
@@ -224,7 +225,6 @@ def select_boundary_instances(
     percentile_th: float,
     original_class: int,
     cf_class: int,
-    model: object,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, BallTree]:
     """
     Compute boundary instances and counterfactual indices once using a BallTree.
@@ -248,7 +248,6 @@ def select_boundary_instances(
     y_true        : True class labels (used to separate class pools).
     y_pred_train  : Model predictions on the training set (used to filter
                     misclassified instances from the boundary candidates).
-    model         : Trained classifier (used for the correct-prediction filter).
 
     Returns
     -------
@@ -418,12 +417,16 @@ def _process_boundary_chunk(
             if int(pred) == original_class:
                 relevant_union.add(feature_cols[fi])
 
+        # Pre-compute a {feature_name: column_index} map to avoid O(n)
+        # list.index() calls inside the relevance-collection loop below.
+        feat_to_idx: dict[str, int] = {f: i for i, f in enumerate(feature_cols)}
+
         if relevant_union:
             # One row per boundary instance — all relevant features on the same
             # record.  "itemset" is a space-separated string of FEATURE=value
             # tokens (sorted for reproducibility), ready for ARM.
             items_str = " ".join(
-                f"{feat}={instance_vals[feature_cols.index(feat)]}"
+                f"{feat}={instance_vals[feat_to_idx[feat]]}"
                 for feat in sorted(relevant_union)
             )
             itemset_rows.append({
@@ -526,6 +529,11 @@ def run_bocsor_single_k(
         k, n_with_cf, len(boundary_indices),
     )
 
+    # Normalise by n_with_cf (instances that produced ≥ 1 relevant feature)
+    # rather than len(boundary_indices).  Instances for which no feature swap
+    # changed the prediction contribute no signal, so excluding them from the
+    # denominator keeps scores comparable across datasets with different
+    # counterfactual densities.  This choice is intentional and documented here.
     feat_imp = (
         pd.Series(total_importance, name="BoCSoR_importance")
         / max(n_with_cf, 1)
@@ -602,7 +610,6 @@ def run_bocsor_multi_k(
         percentile_th=percentile_th,
         original_class=original_class,
         cf_class=cf_class,
-        model=model,
     )
     t_boundary = time.perf_counter() - t0
     logger.info(
@@ -860,7 +867,7 @@ Examples:
   python -m src.feature_importance \\
       --train data/train_2024_ALL_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv \\
       --test  data/test_2024_ALL_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv \\
-      --k 1 5 11 --explain-both-classes --workers 12
+      --k 1 5 11 --original-class 0 1 --workers 12
         """,
     )
 
@@ -1052,10 +1059,9 @@ def main() -> None:
 
     for orig_cls in orig_classes:
         cf_cls = 1 - orig_cls
-        # When only one class is requested the files have no suffix;
-        # when both are requested each file gets a _class<N> suffix so
-        # results don't overwrite each other.
-        suffix = f"_class{orig_cls}" if len(orig_classes) > 1 else ""
+        # suffix_map is keyed on orig_classes_requested (the full set),
+        # so it is correct even when only a subset of classes is processed.
+        suffix = suffix_map[orig_cls]
 
         logger.info(
             "== BoCSoR: class %d boundary (counterfactual class %d) ==",
@@ -1224,7 +1230,11 @@ def _write_summary(
     a(f"| k values    | {k_values} |")
     a(f"| Percentile  | {percentile_th}% |")
     a(f"| Workers     | {n_workers} |")
-    a("| Boundaries  | class 0 → class 1 |")
+    directions = " | ".join(
+        f"class {e['orig_cls']} → class {1 - e['orig_cls']}"
+        for e in summary_data
+    )
+    a(f"| Boundaries  | {directions} |")
     a("")
     a("")
 

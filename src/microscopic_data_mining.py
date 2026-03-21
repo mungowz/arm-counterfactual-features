@@ -12,8 +12,8 @@ WKHP=Full-Time}) so the rules carry specific value-level information.
 
 The microscopic analysis is anchored to the macroscopic rules: for each
 macroscopic rule (antecedent_labels → consequent_labels) we select only the
-itemset rows that contain at least one item belonging to that rule (i.e. at
-least one token whose label matches a label in the antecedent or consequent).
+itemset rows that contain **all** items belonging to that rule (i.e. at least
+one token per label in both the antecedent and the consequent).
 This keeps the microscopic analysis focused on the same feature relationships
 identified at the coarser level.
 
@@ -528,7 +528,7 @@ def _run_micro_for_macro_rule(
 
     if not transactions:
         logger.info(
-            "      No transactions contain any label from this rule — skipping."
+            "      No transactions contain ALL labels from this rule — skipping."
         )
         return pd.DataFrame(), pd.DataFrame()
 
@@ -628,11 +628,9 @@ def _run_micro_for_k(
     all_rules_list:   list[pd.DataFrame] = []
     all_summary_list: list[pd.DataFrame] = []
 
-    for macro_rule, label_set in zip(macro_rules.itertuples(index=False), label_sets):
-        # Convert namedtuple to dict-like access via _asdict().
-        macro_row = macro_rule._asdict()
+    for (_, macro_rule), label_set in zip(macro_rules.iterrows(), label_sets):
         rules_i, summary_i = _run_micro_for_macro_rule(
-            macro_rule=pd.Series(macro_row),
+            macro_rule=macro_rule,
             label_set=label_set,
             exploded_tokens=exploded_tokens,
             min_support=min_support,
@@ -870,8 +868,13 @@ def run_microscopic_mining(
                     k_val, micro_rules_path.name,
                 )
                 try:
-                    ex_rules   = pd.read_csv(micro_rules_path)
-                    ex_summary = pd.read_csv(micro_out / f"micro{suffix}_grid_summary.csv")
+                    ex_rules = pd.read_csv(micro_rules_path)
+                    _summary_path = micro_out / f"micro{suffix}_grid_summary.csv"
+                    ex_summary = (
+                        pd.read_csv(_summary_path)
+                        if _summary_path.exists()
+                        else pd.DataFrame()
+                    )
                     if not ex_rules.empty:
                         all_micro_rules_list.append(ex_rules)
                     if not ex_summary.empty:

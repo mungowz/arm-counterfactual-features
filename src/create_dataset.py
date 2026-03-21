@@ -404,9 +404,8 @@ def create_dataset(
     threshold: float,
     random_seed: int,
     data_dir: Path,
-    keep_columns: list[str] | None = DEFAULT_COLUMNS,
+    keep_columns: list[str] | None = None,
     states_label: str | None = None,
-    test_size: float = 0.2,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Execute the full dataset-creation pipeline for a single survey year.
@@ -420,8 +419,7 @@ def create_dataset(
                    states in USA_STATES.
     threshold    : Annual personal income threshold in U.S. dollars.
                    The binary target label is 1 if PINCP > threshold.
-    test_size    : Fraction reserved for the test split (default 0.2).
-    random_seed  : Random seed for the stratified train/test split.
+    random_seed  : Random seed for the stratified 80/20 train/test split.
     data_dir     : Root output directory.  Raw PUMS files are cached in
                    <data_dir>/raw/; processed CSVs are written to
                    <data_dir>/.
@@ -436,9 +434,17 @@ def create_dataset(
     -------
     (dataset_df, train_df, test_df)
         dataset_df : full unsplit dataset.
-        train_df   : stratified training split.
-        test_df    : stratified test split.
+        train_df   : stratified training split (80 %).
+        test_df    : stratified test split (20 %).
     """
+    # Resolve mutable default: None → DEFAULT_COLUMNS.
+    # Sorting ensures filename tags are always alphabetically ordered,
+    # consistent with _build_output_dir() in main.py.
+    if keep_columns is None:
+        keep_columns = list(DEFAULT_COLUMNS)
+    else:
+        keep_columns = sorted(keep_columns)
+
     data_dir = Path(data_dir)
     raw_dir  = data_dir / "raw"
 
@@ -453,7 +459,7 @@ def create_dataset(
     else:
         _states_tag = "_".join(sorted(states))
     _horizon_tag = horizon.replace("-", "").replace("Year", "Y")
-    _cols_tag    = "-".join(keep_columns) if keep_columns else "ALL"
+    _cols_tag    = "-".join(keep_columns) if keep_columns else "ALL"    
     _stem = (
         f"{survey_year}_{_states_tag}"
         f"_{_horizon_tag}_{survey}"
@@ -514,7 +520,7 @@ def create_dataset(
 
     X_train, X_test, y_train, y_test = train_test_split(
         X, y,
-        test_size=test_size,
+        test_size=0.2,
         random_state=random_seed,
         stratify=y,
     )

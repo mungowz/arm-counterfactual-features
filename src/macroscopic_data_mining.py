@@ -217,11 +217,10 @@ def _move_feature_importance_files(output_dir: Path) -> None:
             if src.parent == fi_dir:
                 continue
             dst = fi_dir / src.name
-            if dst.exists():
-                # Destination already present — remove the stale copy in root.
-                src.unlink()
-            else:
-                src.rename(dst)
+            # src.replace(dst) atomically overwrites dst if it already exists,
+            # ensuring the most recent version always wins (avoids silently
+            # discarding a freshly written file in favour of an older copy).
+            src.replace(dst)
             moved += 1
     if moved:
         logger.info(
@@ -1651,7 +1650,11 @@ def run_macroscopic_mining(
                     # after _save_rules but before generate_heatmaps).
                     try:
                         existing = pd.read_csv(k_rules_path)
-                        existing_summary = pd.read_csv(k_summary_path)
+                        existing_summary = (
+                            pd.read_csv(k_summary_path)
+                            if k_summary_path.exists()
+                            else pd.DataFrame()
+                        )
                     except pd.errors.EmptyDataError:
                         existing = pd.DataFrame()
                         existing_summary = pd.DataFrame()
