@@ -144,11 +144,12 @@ All stage-2 outputs land in a subdirectory of `--output-dir` (default
 
 | Scenario | Example path |
 |---|---|
-| `--states northeast --years 2024` | `results/northeast/2024/colsCOW-SCHL-WKHP/pct20/` |
-| `--states northeast --years 2024 --columns COW OCCP SCHL WKHP` | `results/northeast/2024/colsCOW-OCCP-SCHL-WKHP/pct20/` |
-| `--states northeast --years 2024 --percentile 10` | `results/northeast/2024/colsCOW-SCHL-WKHP/pct10/` |
-| `--states ALL --years 2021 2022 2023 2024` | `results/ALL/2021-2024/colsCOW-SCHL-WKHP/pct20/<year>/` |
-| `--states midwest --years 2021 2023 --columns ALL` | `results/midwest/2021_2023/colsALL/pct20/` |
+| `--states northeast --years 2024` | `results/northeast/2024/colsCOW-SCHL-WKHP/pct20/catboost/` |
+| `--states northeast --years 2024 --columns COW OCCP SCHL WKHP` | `results/northeast/2024/colsCOW-OCCP-SCHL-WKHP/pct20/catboost/` |
+| `--states northeast --years 2024 --percentile 10` | `results/northeast/2024/colsCOW-SCHL-WKHP/pct10/catboost/` |
+| `--states northeast --years 2024 --classifier lightgbm` | `results/northeast/2024/colsCOW-SCHL-WKHP/pct20/lightgbm/` |
+| `--states ALL --years 2021 2022 2023 2024` | `results/ALL/2021-2024/colsCOW-SCHL-WKHP/pct20/catboost/<year>/` |
+| `--states midwest --years 2021 2023 --columns ALL` | `results/midwest/2021_2023/colsALL/pct20/catboost/` |
 
 Years tag rules: single year → the year itself; contiguous range →
 `<first>-<last>`; non-contiguous → years joined by `_`.

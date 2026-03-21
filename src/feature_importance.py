@@ -861,8 +861,15 @@ class LightGBMWrapper:
         self._rank_maps  = rank_maps
         self._feat_cols  = feature_cols
 
-    def _encode(self, X: np.ndarray) -> np.ndarray:
-        """Convert an (N, F) object array of strings to int32 via rank_maps."""
+    def _encode(self, X: np.ndarray) -> pd.DataFrame:
+        """
+        Convert an (N, F) object array of strings to an int32 DataFrame.
+
+        Returning a DataFrame (instead of a plain numpy array) keeps the
+        column names consistent between fit() and predict(), which prevents
+        sklearn's feature-name validation from emitting a UserWarning every
+        time predict() is called in a worker process.
+        """
         out = np.empty(X.shape, dtype=np.int32)
         for j, col in enumerate(self._feat_cols):
             rmap     = self._rank_maps[col]
@@ -870,7 +877,7 @@ class LightGBMWrapper:
             out[:, j] = np.array(
                 [rmap.get(v, fallback) for v in X[:, j]], dtype=np.int32
             )
-        return out
+        return pd.DataFrame(out, columns=self._feat_cols)
 
     def predict(self, X, **kwargs) -> np.ndarray:
         """
@@ -953,15 +960,17 @@ def train_lightgbm(
         early_stopping_rounds if early_stopping_rounds else "disabled",
     )
 
-    # Encode training data via rank_maps.
-    wrapper = LightGBMWrapper(lgbm_model, rank_maps, feature_cols)
-    X_arr   = X_train[feature_cols].to_numpy(dtype=object)
-    X_enc   = wrapper._encode(X_arr)
+    # Encode training data via rank_maps — returns a DataFrame with column
+    # names so that fit() and predict() both use named features, eliminating
+    # sklearn's "X does not have valid feature names" UserWarning.
+    wrapper  = LightGBMWrapper(lgbm_model, rank_maps, feature_cols)
+    X_arr    = X_train[feature_cols].to_numpy(dtype=object)
+    X_enc_df = wrapper._encode(X_arr)   # pd.DataFrame with int32 values
 
     if early_stopping_rounds is not None:
         from sklearn.model_selection import train_test_split as _tts
         X_tr, X_val, y_tr, y_val = _tts(
-            X_enc, y_train,
+            X_enc_df, y_train,
             test_size=0.2,
             stratify=y_train,
             random_state=random_seed,
@@ -972,7 +981,7 @@ def train_lightgbm(
             callbacks=[lgb.early_stopping(early_stopping_rounds, verbose=verbose)],
         )
     else:
-        lgbm_model.fit(X_enc, y_train)
+        lgbm_model.fit(X_enc_df, y_train)
 
     return wrapper
 

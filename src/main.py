@@ -655,15 +655,16 @@ def _build_output_dir(
     years: list[int],
     keep_columns: list[str] | None,
     percentile: float,
+    classifier: str = "catboost",
 ) -> Path:
     """
     Build the stage-2 output directory path, embedding the state scope,
-    year range, and feature columns so that results from different
-    configurations never overwrite each other.
+    year range, feature columns, percentile and classifier name so that
+    results from different configurations never overwrite each other.
 
     Directory structure
     -------------------
-        <base_dir>/<states_tag>/<years_tag>/cols<cols_tag>/
+        <base_dir>/<states_tag>/<years_tag>/cols<cols_tag>/pct<N>/<classifier>/
 
     <states_tag> rules
     ------------------
@@ -686,11 +687,15 @@ def _build_output_dir(
     ---------------
     - Percentile value as integer (e.g. 20 → "pct20").
 
+    <classifier>
+    ------------
+    - Classifier name as-is (e.g. "catboost" or "lightgbm").
+
     Examples
     --------
-        results/northeast/2024/colsCOW-SCHL-WKHP/pct20/
-        results/ALL/2021-2024/colsCOW-OCCP-SCHL-WKHP/pct10/
-        results/CA_NY_TX/2024/colsALL/pct20/
+        results/northeast/2024/colsCOW-SCHL-WKHP/pct20/catboost/
+        results/ALL/2021-2024/colsCOW-OCCP-SCHL-WKHP/pct10/lightgbm/
+        results/CA_NY_TX/2024/colsALL/pct20/catboost/
     """
     # ── States tag ────────────────────────────────────────────────────────────
     if raw_states_arg == ["ALL"] or states is None:
@@ -718,7 +723,7 @@ def _build_output_dir(
     # ── Percentile tag ────────────────────────────────────────────────────────
     pct_tag = f"pct{int(percentile)}"
 
-    return base_dir / states_tag / years_tag / f"cols{cols_tag}" / pct_tag
+    return base_dir / states_tag / years_tag / f"cols{cols_tag}" / pct_tag / classifier
 
 
 def _resolve_states_label(raw_states_arg: list[str]) -> str | None:
@@ -786,7 +791,7 @@ def main() -> None:
     n_states = len(states) if states else len(USA_STATES)
     xai_output_dir = _build_output_dir(
         args.output_dir, states, args.states, args.years,
-        keep_columns, args.percentile,
+        keep_columns, args.percentile, args.classifier,
     )
     logger.info("═" * 62)
     logger.info("  ACS INCOME PIPELINE")
@@ -801,6 +806,7 @@ def main() -> None:
     logger.info("  Data dir       : %s", args.data_dir.resolve())
     logger.info("  BoCSoR k       : %s", args.k)
     logger.info("  BoCSoR pct     : %.1f%%", args.percentile)
+    logger.info("  Classifier     : %s", args.classifier)
     logger.info("  XAI output dir : %s", xai_output_dir.resolve())
     logger.info("═" * 62)
 
