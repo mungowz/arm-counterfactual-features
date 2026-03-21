@@ -24,7 +24,7 @@ project/
 │   ├── __init__.py
 │   ├── constants.py                # State groups, feature set, bin configs, code maps, OCCP ranges
 │   ├── create_dataset.py           # Stage 1: download → encode → split → save
-│   ├── feature_importance.py       # Stage 2: BoCSoR XAI (rank encoding, CatBoost, itemsets)
+│   ├── feature_importance.py       # Stage 2: BoCSoR XAI (rank encoding, CatBoost/LightGBM, itemsets)
 │   ├── macroscopic_data_mining.py  # Stage 3: FP-Growth ARM on macroscopic feature labels
 │   ├── microscopic_data_mining.py  # Stage 4: FP-Growth ARM on full LABEL=value tokens
 │   └── main.py                     # CLI entry point — orchestrates all four stages
@@ -43,6 +43,7 @@ pandas
 numpy
 scikit-learn
 catboost
+lightgbm
 mlxtend
 matplotlib
 seaborn
@@ -51,7 +52,7 @@ seaborn
 Install with:
 
 ```bash
-pip install folktables pandas numpy scikit-learn catboost mlxtend matplotlib seaborn
+pip install folktables pandas numpy scikit-learn catboost lightgbm mlxtend matplotlib seaborn
 ```
 
 ---
@@ -275,7 +276,7 @@ target.  Use `--seed` to control reproducibility.
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `--seed` | int | `42` | Random seed for the stratified split and CatBoost. |
+| `--seed` | int | `42` | Random seed for the stratified split and classifier. |
 
 ### BoCSoR hyperparameters *(stage 2)*
 
@@ -283,16 +284,17 @@ target.  Use `--seed` to control reproducibility.
 |---|---|---|---|
 | `--k` | int (one or more) | `11` | Neighbourhood size(s). A single value K is auto-expanded to all odd integers 1…K (e.g. `--k 11` → 1 3 5 7 9 11). Multiple values used as-is (e.g. `--k 1 5 11`). |
 | `--percentile` | float | `20.0` | Percentile threshold for boundary instance selection (0–100). |
+| `--classifier` | choice | `catboost` | Gradient boosting classifier. `catboost` accepts raw string categoricals natively. `lightgbm` uses leaf-wise growth and typically produces finer-grained decision boundaries, increasing counterfactual yield at small k. |
 
-### CatBoost hyperparameters *(stage 2)*
+### Classifier hyperparameters *(stage 2 — shared by CatBoost and LightGBM)*
 
 | Option | Type | Default | Description |
 |---|---|---|---|
 | `--cb-iterations` | int | `500` | Boosting rounds (epochs). |
 | `--cb-lr` | float | `0.05` | Learning rate. |
-| `--cb-depth` | int | `6` | Tree depth. |
+| `--cb-depth` | int | `6` | Tree depth (`max_depth` for LightGBM; `num_leaves` is set to `2^depth − 1`). |
 | `--cb-early-stopping` | int | `0` | Stop if eval loss does not improve for N rounds. `0` = disabled. When enabled, 20% of training data is held out as validation. |
-| `--cb-verbose` | flag | off | Print CatBoost training progress. |
+| `--cb-verbose` | flag | off | Print training progress. |
 
 ### Input / output
 
@@ -805,20 +807,22 @@ importance ranking is as the counterfactual search becomes broader.
 - **Parallel processing**: boundary instances are split into chunks and
   processed with `ProcessPoolExecutor` using `fork` start method, so workers
   inherit the loaded model, encoded arrays, and BallTree without reimporting.
-- **CatBoost thread control**: each worker uses `thread_count=1` to avoid
-  competing internal thread pools.
+- **Classifier thread control**: each worker uses `thread_count=1` (CatBoost) or `num_threads=1` (LightGBM via `predict()`) to avoid competing internal thread pools.
 - **Worker auto-detection**: `max(1, min(14, cpu_count - 2))` — reserves
   2 logical CPUs for the OS and the main process, caps at 14 to avoid
-  diminishing returns from CatBoost's internal thread pools.  The same
+  diminishing returns from the classifier's internal thread pools.  The same
   formula is used for both stage-1 multi-year workers and stage-2 BoCSoR
   boundary processing.  Override with `--workers N` if needed.
 
 ### Classifier
 
-**CatBoost** is used because it accepts raw string-valued categorical columns
-with no manual encoding, handles high-cardinality columns (`OCCP`, `POBP`)
-robustly via ordered target statistics, and achieves state-of-the-art
-accuracy on tabular categorical data (Alfeo et al., 2023).
+Two gradient boosting classifiers are available via `--classifier`:
+
+**CatBoost** (default) accepts raw string-valued categorical columns with no manual encoding, handles high-cardinality columns (`OCCP`, `POBP`) robustly via ordered target statistics, and achieves state-of-the-art accuracy on tabular categorical data (Alfeo et al., 2023).
+
+**LightGBM** uses leaf-wise tree growth instead of depth-wise, which typically produces finer-grained decision boundaries. This increases the number of boundary instances that yield relevant counterfactuals — particularly at small k values, where CatBoost's flatter boundary can result in zero counterfactual yield. LightGBM requires integer-encoded inputs; the pipeline reuses the rank maps already computed for the Manhattan distance calculation, so no additional preprocessing is needed. The `--cb-depth` and `--cb-iterations` flags apply to both classifiers; `--cb-depth` maps to `max_depth` for LightGBM with `num_leaves = 2^depth − 1`.
+
+The choice of classifier does not affect the BoCSoR algorithm itself — only the decision boundary being explored changes. Both classifiers work only on correctly classified instances, consistent with the original BoCSoR approach.
 
 ---
 

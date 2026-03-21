@@ -240,6 +240,7 @@ def _run_feature_importance(
     cb_depth: int,
     cb_verbose: bool,
     cb_early_stopping: int,
+    classifier: str,
     n_workers: int,
     random_seed: int,
     log_level: str,
@@ -260,20 +261,21 @@ def _run_feature_importance(
                            Passed to expand_k(): single value K is auto-expanded
                            to all odd integers 1..K; multiple values used as-is.
     percentile           : Percentile threshold for boundary instance selection.
-    cb_iterations        : CatBoost boosting rounds.
-    cb_lr                : CatBoost learning rate.
-    cb_depth             : CatBoost tree depth.
-    cb_verbose           : Whether CatBoost prints training progress.
+    cb_iterations        : Boosting rounds (shared by CatBoost and LightGBM).
+    cb_lr                : Learning rate (shared by CatBoost and LightGBM).
+    cb_depth             : Tree depth (shared by CatBoost and LightGBM).
+    cb_verbose           : Whether the classifier prints training progress.
     cb_early_stopping    : Stop training if validation loss does not improve
                            for this many rounds (0 = disabled).
-    random_seed          : Random seed for CatBoost.
+    classifier           : "catboost" or "lightgbm".
+    random_seed          : Random seed for the classifier.
     log_level            : Logging level string (e.g. "INFO").
     """
     # Lazy import to keep stage-1-only runs free of catboost/sklearn overhead.
     from src.feature_importance import (
         load_split_data,
         build_rank_maps,
-        train_catboost,
+        train_model,
         run_bocsor_multi_k,
         expand_k,
         _compute_default_workers,
@@ -303,10 +305,12 @@ def _run_feature_importance(
     logger.info("Building rank maps from training data …")
     rank_maps = build_rank_maps(X_train)
 
-    model = train_catboost(
+    model = train_model(
+        classifier=classifier,
         X_train=X_train,
         y_train=y_train,
-        cat_features=feature_cols,
+        rank_maps=rank_maps,
+        feature_cols=feature_cols,
         random_seed=random_seed,
         iterations=cb_iterations,
         learning_rate=cb_lr,
@@ -318,7 +322,10 @@ def _run_feature_importance(
     y_pred_train = model.predict(X_train).astype(int).ravel()
     test_acc  = (y_pred_test  == y_test.values).mean()
     train_acc = (y_pred_train == y_train.values).mean()
-    logger.info("CatBoost accuracy — train: %.4f  |  test: %.4f", train_acc, test_acc)
+    logger.info(
+        "%s accuracy — train: %.4f  |  test: %.4f",
+        classifier.capitalize(), train_acc, test_acc,
+    )
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -526,9 +533,19 @@ Examples:
             "Default: 20."
         ),
     )
+    boc.add_argument(
+        "--classifier", choices=["catboost", "lightgbm"], default="catboost",
+        help=(
+            "Gradient boosting classifier for stage 2.  "
+            "'catboost' (default) accepts raw string categoricals natively.  "
+            "'lightgbm' uses leaf-wise growth and typically produces finer-grained "
+            "decision boundaries, increasing counterfactual yield at small k.  "
+            "Default: catboost."
+        ),
+    )
 
-    # ── CatBoost hyperparameters (stage 2) ────────────────────────────────────
-    cb = parser.add_argument_group("CatBoost hyperparameters  (stage 2)")
+    # ── CatBoost / LightGBM hyperparameters (stage 2) ─────────────────────────
+    cb = parser.add_argument_group("Classifier hyperparameters  (stage 2 — shared by CatBoost and LightGBM)")
     cb.add_argument("--cb-iterations", type=int,   default=500,  metavar="N",
                     help="Boosting rounds.  Default: 500.")
     cb.add_argument("--cb-lr",         type=float, default=0.05, metavar="LR",
@@ -830,6 +847,7 @@ def main() -> None:
             cb_depth=args.cb_depth,
             cb_verbose=args.cb_verbose,
             cb_early_stopping=args.cb_early_stopping,
+            classifier=args.classifier,
             n_workers=args.workers,
             random_seed=args.seed,
             log_level=args.log_level,
@@ -932,6 +950,7 @@ def main() -> None:
                 cb_depth=args.cb_depth,
                 cb_verbose=args.cb_verbose,
                 cb_early_stopping=args.cb_early_stopping,
+                classifier=args.classifier,
                 n_workers=args.workers,
                 random_seed=args.seed,
                 log_level=args.log_level,

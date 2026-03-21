@@ -192,9 +192,9 @@ def download_data(
             state = future_to_state[future]
             try:
                 frames[state] = future.result()
-                logger.debug("  ✓ %s (%d rows)", state, len(frames[state]))
+                logger.debug("  OK %s (%d rows)", state, len(frames[state]))
             except Exception as exc:
-                logger.error("  ✗ %s: %s", state, exc)
+                logger.error("  FAIL %s: %s", state, exc)
                 failures.append(state)
 
     if failures:
@@ -576,8 +576,8 @@ def create_dataset(
         f_train.result()
         f_test.result()
 
-    logger.info("✓ Dataset → %s", dataset_path)
-    logger.info("✓ Train   → %s", train_path)
-    logger.info("✓ Test    → %s", test_path)
+    logger.info("Dataset -> %s", dataset_path)
+    logger.info("Train   -> %s", train_path)
+    logger.info("Test    -> %s", test_path)
 
     return dataset_df, train_df, test_df

@@ -832,9 +832,206 @@ def train_catboost(
     return model
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CLI
-# ─────────────────────────────────────────────────────────────────────────────
+class LightGBMWrapper:
+    """
+    Wraps LGBMClassifier to expose the same predict() interface as CatBoost.
+
+    LightGBM requires integer-encoded categorical inputs and returns class
+    probabilities from predict(), while CatBoost accepts raw string DataFrames
+    and returns class labels directly.  This wrapper handles both differences
+    so the rest of the pipeline (BoCSoR workers, accuracy computation) can
+    call model.predict() uniformly regardless of which classifier was trained.
+
+    Encoding uses the rank_maps already computed for the distance calculation,
+    avoiding a second encoding step and keeping the integer representation
+    consistent throughout stage 2.
+
+    The wrapper silently drops the CatBoost-specific `thread_count` keyword
+    argument so that _process_boundary_chunk can call model.predict() with the
+    same signature for both classifiers.
+    """
+
+    def __init__(
+        self,
+        lgbm_model: object,
+        rank_maps: dict[str, dict[str, int]],
+        feature_cols: list[str],
+    ) -> None:
+        self._model      = lgbm_model
+        self._rank_maps  = rank_maps
+        self._feat_cols  = feature_cols
+
+    def _encode(self, X: np.ndarray) -> np.ndarray:
+        """Convert an (N, F) object array of strings to int32 via rank_maps."""
+        out = np.empty(X.shape, dtype=np.int32)
+        for j, col in enumerate(self._feat_cols):
+            rmap     = self._rank_maps[col]
+            fallback = int(np.median(list(rmap.values())))
+            out[:, j] = np.array(
+                [rmap.get(v, fallback) for v in X[:, j]], dtype=np.int32
+            )
+        return out
+
+    def predict(self, X, **kwargs) -> np.ndarray:
+        """
+        Return integer class labels (0 or 1).
+
+        Accepts either a pandas DataFrame or a numpy object array of raw
+        string category values.  The CatBoost-specific `thread_count` kwarg
+        is silently ignored.
+        """
+        kwargs.pop("thread_count", None)   # CatBoost-specific — not used by LightGBM
+        if isinstance(X, pd.DataFrame):
+            arr = X[self._feat_cols].to_numpy(dtype=object)
+        else:
+            arr = np.asarray(X, dtype=object)
+        X_enc = self._encode(arr)
+        proba = self._model.predict(X_enc, num_threads=1)
+        return (proba >= 0.5).astype(int)
+
+
+def train_lightgbm(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    rank_maps: dict[str, dict[str, int]],
+    feature_cols: list[str],
+    random_seed: int = 42,
+    iterations: int = 500,
+    learning_rate: float = 0.05,
+    depth: int = 6,
+    verbose: bool = False,
+    early_stopping_rounds: int | None = None,
+) -> LightGBMWrapper:
+    """
+    Train a LightGBM classifier on the (fully categorical) training set and
+    return it wrapped in a LightGBMWrapper for a uniform predict() interface.
+
+    LightGBM is a leaf-wise gradient boosting framework that can match or
+    exceed CatBoost accuracy on tabular data while producing decision
+    boundaries that are typically more fine-grained, which benefits BoCSoR
+    by increasing the number of boundary instances that produce relevant
+    counterfactuals (especially at small k values).
+
+    Categorical features are integer-encoded via the rank_maps already
+    computed for the distance calculation.  The `depth` parameter maps to
+    LightGBM's `max_depth`; LightGBM's leaf-wise growth is controlled
+    additionally via `num_leaves` (set to 2^depth - 1 to mirror CatBoost
+    behaviour by default).
+
+    Parameters
+    ----------
+    rank_maps            : {column -> {label -> rank}} from build_rank_maps().
+                           Used to encode string categories to integers.
+    feature_cols         : Ordered list of feature column names.
+    early_stopping_rounds: Stop if validation metric does not improve for N
+                           consecutive rounds.  An internal 80/20 stratified
+                           split is used as the eval set.  None = disabled.
+    """
+    try:
+        import lightgbm as lgb
+    except ImportError as exc:
+        raise ImportError(
+            "LightGBM is required for --classifier lightgbm.\n"
+            "  pip install lightgbm"
+        ) from exc
+
+    num_leaves = max(2, 2 ** depth - 1)
+    lgbm_model = lgb.LGBMClassifier(
+        n_estimators=iterations,
+        learning_rate=learning_rate,
+        max_depth=depth,
+        num_leaves=num_leaves,
+        random_state=random_seed,
+        verbose=-1 if not verbose else 1,
+        n_jobs=1,   # thread control handled externally via worker processes
+    )
+
+    logger.info(
+        "Training LightGBM: n_estimators=%d, lr=%.4f, max_depth=%d, "
+        "num_leaves=%d, early_stopping=%s.",
+        iterations, learning_rate, depth, num_leaves,
+        early_stopping_rounds if early_stopping_rounds else "disabled",
+    )
+
+    # Encode training data via rank_maps.
+    wrapper = LightGBMWrapper(lgbm_model, rank_maps, feature_cols)
+    X_arr   = X_train[feature_cols].to_numpy(dtype=object)
+    X_enc   = wrapper._encode(X_arr)
+
+    if early_stopping_rounds is not None:
+        from sklearn.model_selection import train_test_split as _tts
+        X_tr, X_val, y_tr, y_val = _tts(
+            X_enc, y_train,
+            test_size=0.2,
+            stratify=y_train,
+            random_state=random_seed,
+        )
+        lgbm_model.fit(
+            X_tr, y_tr,
+            eval_set=[(X_val, y_val)],
+            callbacks=[lgb.early_stopping(early_stopping_rounds, verbose=verbose)],
+        )
+    else:
+        lgbm_model.fit(X_enc, y_train)
+
+    return wrapper
+
+
+def train_model(
+    classifier: str,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    rank_maps: dict[str, dict[str, int]],
+    feature_cols: list[str],
+    random_seed: int = 42,
+    iterations: int = 500,
+    learning_rate: float = 0.05,
+    depth: int = 6,
+    verbose: bool = False,
+    early_stopping_rounds: int | None = None,
+) -> object:
+    """
+    Dispatch to train_catboost or train_lightgbm based on *classifier*.
+
+    Parameters
+    ----------
+    classifier : "catboost" or "lightgbm".
+    rank_maps  : Required for LightGBM encoding; unused for CatBoost.
+
+    Returns
+    -------
+    A trained model with a uniform predict(X) -> np.ndarray[int] interface.
+    """
+    if classifier == "catboost":
+        return train_catboost(
+            X_train=X_train,
+            y_train=y_train,
+            cat_features=feature_cols,
+            random_seed=random_seed,
+            iterations=iterations,
+            learning_rate=learning_rate,
+            depth=depth,
+            verbose=verbose,
+            early_stopping_rounds=early_stopping_rounds,
+        )
+    elif classifier == "lightgbm":
+        return train_lightgbm(
+            X_train=X_train,
+            y_train=y_train,
+            rank_maps=rank_maps,
+            feature_cols=feature_cols,
+            random_seed=random_seed,
+            iterations=iterations,
+            learning_rate=learning_rate,
+            depth=depth,
+            verbose=verbose,
+            early_stopping_rounds=early_stopping_rounds,
+        )
+    else:
+        raise ValueError(
+            f"Unknown classifier '{classifier}'. "
+            "Choose 'catboost' or 'lightgbm'."
+        )
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -909,7 +1106,18 @@ Examples:
         ),
     )
 
-    cb = parser.add_argument_group("CatBoost hyperparameters")
+    clf = parser.add_argument_group("Classifier selection")
+    clf.add_argument(
+        "--classifier", choices=["catboost", "lightgbm"], default="catboost",
+        help=(
+            "Gradient boosting classifier to train.  "
+            "'catboost' (default) accepts raw string categoricals natively.  "
+            "'lightgbm' uses leaf-wise growth and often produces finer-grained "
+            "decision boundaries, increasing counterfactual yield at small k."
+        ),
+    )
+
+    cb = parser.add_argument_group("Classifier hyperparameters  (shared by CatBoost and LightGBM)")
     cb.add_argument("--cb-iterations", type=int,   default=500,  metavar="N",
                     help="Boosting rounds (epochs).  Default: 500.")
     cb.add_argument("--cb-lr",         type=float, default=0.05, metavar="LR",
@@ -999,10 +1207,12 @@ def main() -> None:
     logger.info("Building rank maps ...")
     rank_maps = build_rank_maps(X_train)
 
-    model = train_catboost(
+    model = train_model(
+        classifier=args.classifier,
         X_train=X_train,
         y_train=y_train,
-        cat_features=feature_cols,
+        rank_maps=rank_maps,
+        feature_cols=feature_cols,
         random_seed=args.seed,
         iterations=args.cb_iterations,
         learning_rate=args.cb_lr,
@@ -1018,8 +1228,8 @@ def main() -> None:
     train_acc = (y_pred_train == y_train.values).mean()
     test_acc  = (y_pred_test  == y_test.values).mean()
     logger.info(
-        "CatBoost accuracy -- train: %.4f  |  test (held-out): %.4f",
-        train_acc, test_acc,
+        "%s accuracy -- train: %.4f  |  test (held-out): %.4f",
+        args.classifier.capitalize(), train_acc, test_acc,
     )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -1279,11 +1489,11 @@ def _write_summary(
             if ranks.loc[feat].max() - ranks.loc[feat].min() > 1
         ]
         if unstable:
-            a(f"⚠ **Rank-unstable features** (rank varies across k values): "
+            a(f"WARNING: Rank-unstable features (rank varies across k values): "
               f"{', '.join(f'`{f}`' for f in unstable)}")
             a("")
         else:
-            a("✓ All features maintain a consistent rank across all k values.")
+            a("All features maintain a consistent rank across all k values.")
             a("")
 
     # ── Output files ──────────────────────────────────────────────────────────
