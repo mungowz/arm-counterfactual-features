@@ -98,6 +98,103 @@ INCOME_FEATURES: list[str] = [
 DEFAULT_COLUMNS: list[str] = ["COW", "SCHL", "WKHP"]
 
 # ─────────────────────────────────────────────────────────────
+# Default income thresholds — Pew Research Center formula
+#
+# T = 2 × M_fam ÷ √3   (upper-income boundary, household size 3)
+# Source: ACS 1-year 2024, Census Bureau (ACSBR-025).
+#         Pew Research Center, Kochhar (2022).
+# Values rounded to the nearest $100.
+#
+# Resolution order in main.py:
+#   1. --threshold CLI argument (explicit, always wins)
+#   2. Recognised state group name  → group threshold below
+#   3. Single state code            → per-state threshold below
+#   4. Multiple state codes or ALL  → national fallback
+# ─────────────────────────────────────────────────────────────
+
+# National fallback (population-weighted average across 49 states, no AK).
+NATIONAL_THRESHOLD: float = 94_200.0
+
+# Per state-group thresholds (Census regions, divisions, convenience aliases).
+GROUP_THRESHOLDS: dict[str, float] = {
+    # 4 Census regions
+    "northeast":            100_700.0,
+    "midwest":               91_100.0,
+    "south":                 86_000.0,
+    "west":                 101_400.0,
+    # 9 Census divisions
+    "new_england":          111_300.0,
+    "middle_atlantic":       96_500.0,
+    "east_north_central":    90_400.0,
+    "west_north_central":    92_400.0,
+    "south_atlantic":        89_800.0,
+    "east_south_central":    73_700.0,
+    "west_south_central":    86_300.0,
+    "mountain":              93_300.0,
+    "pacific":              106_000.0,
+    # Convenience aliases
+    "sunbelt":               92_600.0,
+    "rust_belt":             90_900.0,
+    "great_plains":          92_400.0,
+}
+
+# Per-state thresholds (ACS 1-year 2024 family medians, T = 2×M÷√3).
+# Alaska (AK) is excluded from the ACS 1-year survey.
+# DC is included as it appears in ACS data.
+# Puerto Rico (PR) falls back to the national threshold.
+STATE_THRESHOLDS: dict[str, float] = {
+    "AL":  69_300.0,   # Alabama
+    "AZ":  95_800.0,   # Arizona
+    "AR":  73_000.0,   # Arkansas
+    "CA": 103_100.0,   # California
+    "CO": 111_700.0,   # Colorado
+    "CT": 106_400.0,   # Connecticut
+    "DC": 126_700.0,   # District of Columbia
+    "DE": 100_500.0,   # Delaware
+    "FL":  83_100.0,   # Florida
+    "GA":  83_100.0,   # Georgia
+    "HI": 111_200.0,   # Hawaii
+    "ID":  85_300.0,   # Idaho
+    "IL": 101_200.0,   # Illinois
+    "IN":  87_800.0,   # Indiana
+    "IA":  92_900.0,   # Iowa
+    "KS":  97_100.0,   # Kansas
+    "KY":  71_600.0,   # Kentucky
+    "LA":  66_400.0,   # Louisiana
+    "ME":  86_600.0,   # Maine
+    "MD": 117_900.0,   # Maryland
+    "MA": 122_000.0,   # Massachusetts
+    "MI":  88_900.0,   # Michigan
+    "MN": 104_000.0,   # Minnesota
+    "MS":  63_500.0,   # Mississippi
+    "MO":  90_100.0,   # Missouri
+    "MT":  91_700.0,   # Montana
+    "NE": 103_300.0,   # Nebraska
+    "NV":  93_500.0,   # Nevada
+    "NH": 114_200.0,   # New Hampshire
+    "NJ": 105_800.0,   # New Jersey
+    "NM":  69_400.0,   # New Mexico
+    "NY":  94_400.0,   # New York
+    "NC":  79_700.0,   # North Carolina
+    "ND":  87_300.0,   # North Dakota
+    "OH":  85_700.0,   # Ohio
+    "OK":  77_700.0,   # Oklahoma
+    "OR": 102_200.0,   # Oregon
+    "PA":  89_500.0,   # Pennsylvania
+    "RI":  94_700.0,   # Rhode Island
+    "SC":  79_800.0,   # South Carolina
+    "SD":  94_700.0,   # South Dakota
+    "TN":  84_300.0,   # Tennessee
+    "TX":  90_800.0,   # Texas
+    "UT": 116_600.0,   # Utah
+    "VT":  98_100.0,   # Vermont
+    "VA": 112_000.0,   # Virginia
+    "WA": 108_500.0,   # Washington
+    "WV":  69_300.0,   # West Virginia
+    "WI":  91_800.0,   # Wisconsin
+    "WY":  89_000.0,   # Wyoming
+}
+
 # Binning configuration for continuous features
 # ─────────────────────────────────────────────────────────────
 

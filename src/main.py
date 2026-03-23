@@ -64,6 +64,9 @@ from src.constants import (       # noqa: E402
     STATE_GROUPS,
     INCOME_FEATURES,
     DEFAULT_COLUMNS,
+    NATIONAL_THRESHOLD,
+    GROUP_THRESHOLDS,
+    STATE_THRESHOLDS,
 )
 from src.create_dataset import create_dataset  # noqa: E402
 from src.macroscopic_data_mining import (      # noqa: E402
@@ -180,9 +183,67 @@ def resolve_columns(raw: list[str] | None) -> list[str] | None:
     return raw
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Multi-year process worker  (stage 1)
-# ─────────────────────────────────────────────────────────────────────────────
+def resolve_threshold(
+    explicit: float | None,
+    raw_states_arg: list[str],
+    states: list[str] | None,
+) -> float:
+    """
+    Return the income threshold to use for this pipeline run.
+
+    Resolution order
+    ────────────────
+    1. Explicit --threshold CLI value  →  used as-is.
+    2. Recognised state group name     →  GROUP_THRESHOLDS lookup.
+    3. Single state code               →  STATE_THRESHOLDS lookup.
+    4. Multiple state codes or ALL     →  NATIONAL_THRESHOLD fallback.
+
+    For any state or group not found in the lookup tables the national
+    threshold ($94,200) is used and a warning is logged.
+
+    Parameters
+    ----------
+    explicit        : Value from --threshold, or None if not supplied.
+    raw_states_arg  : Raw token list from --states (e.g. ["NY"] or ["northeast"]).
+    states          : Resolved state-code list (None means all states).
+    """
+    if explicit is not None:
+        return explicit
+
+    # Group name
+    if (len(raw_states_arg) == 1
+            and raw_states_arg[0].lower() in STATE_GROUPS):
+        group = raw_states_arg[0].lower()
+        if group in GROUP_THRESHOLDS:
+            t = GROUP_THRESHOLDS[group]
+            logger.info(
+                "Auto-threshold: group '%s' -> $%.0f", group, t
+            )
+            return t
+
+    # Single state code
+    if states is not None and len(states) == 1:
+        code = states[0]
+        if code in STATE_THRESHOLDS:
+            t = STATE_THRESHOLDS[code]
+            logger.info(
+                "Auto-threshold: state '%s' -> $%.0f", code, t
+            )
+            return t
+        logger.warning(
+            "No pre-computed threshold for state '%s'; "
+            "using national fallback $%.0f.", code, NATIONAL_THRESHOLD
+        )
+        return NATIONAL_THRESHOLD
+
+    # ALL states or multiple state codes → national fallback
+    logger.info(
+        "Auto-threshold: national fallback -> $%.0f", NATIONAL_THRESHOLD
+    )
+    return NATIONAL_THRESHOLD
+
+
+
 
 def _process_year(
     year: int,
@@ -470,10 +531,15 @@ Examples:
     # ── Task parameters (stage 1) ─────────────────────────────────────────────
     task = parser.add_argument_group("Task parameters  (stage 1)")
     task.add_argument(
-        "--threshold", type=float, default=100_000.0, metavar="DOLLARS",
+        "--threshold", type=float, default=None, metavar="DOLLARS",
         help=(
             "Annual personal income threshold in U.S. dollars (PINCP field).  "
-            "The binary target is 1 if PINCP > threshold.  Default: 100000."
+            "The binary target is 1 if PINCP > threshold.  "
+            "Default: auto-selected from pre-computed Pew Research Center "
+            "upper-income thresholds (T = 2 × M_fam ÷ √3, ACS 2024) based "
+            "on the --states argument.  Single state → state-level threshold;  "
+            "group name → group threshold;  multiple states or ALL → national "
+            "fallback ($94,200).  Pass an explicit value to override."
         ),
     )
 
@@ -769,6 +835,8 @@ def main() -> None:
 
     states_label = _resolve_states_label(args.states)
 
+    threshold = resolve_threshold(args.threshold, args.states, states)
+
     invalid_years = [y for y in args.years if not (2014 <= y <= 2024)]
     if invalid_years:
         logger.error("Year(s) out of supported range (2014–2024): %s", invalid_years)
@@ -781,10 +849,6 @@ def main() -> None:
 
     if not (0.0 < args.percentile <= 100.0):
         logger.error("--percentile must be in the range (0, 100].")
-        sys.exit(1)
-
-    if args.threshold <= 0:
-        logger.error("--threshold must be a positive value.")
         sys.exit(1)
 
     # ── Configuration summary ─────────────────────────────────────────────────
@@ -800,7 +864,7 @@ def main() -> None:
     logger.info("  Horizon        : %s", args.horizon)
     logger.info("  Survey         : %s", args.survey)
     logger.info("  States         : %s (%d)", states or "ALL", n_states)
-    logger.info("  Threshold      : $%.0f", args.threshold)
+    logger.info("  Threshold      : $%.0f (auto)", threshold) if args.threshold is None else logger.info("  Threshold      : $%.0f (explicit)", threshold)
     logger.info("  Output columns : %s", keep_columns or "ALL")
     logger.info("  Workers        : %d (auto-detected: %d)", args.workers, _DEFAULT_WORKERS)
     logger.info("  Data dir       : %s", args.data_dir.resolve())
@@ -822,7 +886,7 @@ def main() -> None:
                 horizon=args.horizon,
                 survey=args.survey,
                 states=states,
-                threshold=args.threshold,
+                threshold=threshold,
                 random_seed=args.seed,
                 data_dir=args.data_dir,
                 keep_columns=keep_columns,
@@ -838,7 +902,7 @@ def main() -> None:
 
         # ── Stage 2 (single year) ─────────────────────────────────────────────
         train_path, test_path = _infer_split_paths(
-            args.data_dir, year, states, args.threshold,
+            args.data_dir, year, states, threshold,
             args.horizon, args.survey, keep_columns,
             states_label=states_label,
         )
@@ -903,7 +967,7 @@ def main() -> None:
             horizon=args.horizon,
             survey=args.survey,
             states=states,
-            threshold=args.threshold,
+            threshold=threshold,
             random_seed=args.seed,
             data_dir=args.data_dir,
             keep_columns=keep_columns,
@@ -940,7 +1004,7 @@ def main() -> None:
         for year in sorted(completed):
             logger.info("── Stage 2: year %d ─────────────────────────────────", year)
             train_path, test_path = _infer_split_paths(
-                args.data_dir, year, states, args.threshold,
+                args.data_dir, year, states, threshold,
                 args.horizon, args.survey, keep_columns,
                 states_label=states_label,
             )
