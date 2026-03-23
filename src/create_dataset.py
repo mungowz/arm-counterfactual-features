@@ -459,7 +459,7 @@ def create_dataset(
     else:
         _states_tag = "_".join(sorted(states))
     _horizon_tag = horizon.replace("-", "").replace("Year", "Y")
-    _cols_tag    = "-".join(keep_columns) if keep_columns else "ALL"    
+    _cols_tag    = "-".join(keep_columns) if keep_columns else "ALL"
     _stem = (
         f"{survey_year}_{_states_tag}"
         f"_{_horizon_tag}_{survey}"

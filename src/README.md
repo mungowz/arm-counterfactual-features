@@ -60,16 +60,22 @@ pip install folktables pandas numpy scikit-learn catboost lightgbm mlxtend matpl
 ## Quick start
 
 ```bash
-# Single state, default columns (COW SCHL WKHP)
+# Single state — threshold auto-selected ($94,400 for NY)
 python -m src.main --states NY --years 2024
+
+# Group — threshold auto-selected ($100,700 for northeast)
+python -m src.main --states northeast --years 2024
 
 # Custom BoCSoR settings
 python -m src.main --states CA NY TX --columns ALL --k 11 --percentile 20
 
+# Override the auto-selected threshold explicitly
+python -m src.main --states NY --years 2024 --threshold 109500
+
 # Multiple years (each year produces its own output sub-directory)
 python -m src.main --states midwest --years 2021 2022 2023 2024
 
-# All 49 states
+# All 49 states — national fallback threshold ($94,200)
 python -m src.main --states ALL --years 2024
 ```
 
@@ -79,6 +85,11 @@ BoCSoR output for **both** boundary directions (class 0→1 and class 1→0, in
 separate `_class0` / `_class1` files). Stage 3 and 4 produce macroscopic and
 microscopic association rules respectively. If any output already exists from
 a previous run it is loaded or skipped directly — no re-computation.
+
+The income threshold is **auto-selected** when `--threshold` is omitted:
+single state → per-state value; group name → group value; multiple states or
+ALL → national fallback. All values follow the Pew Research Center formula
+(T = 2 × M_fam ÷ √3, ACS 2024 family medians).
 
 ---
 
@@ -262,7 +273,7 @@ further cuts the number of boundary instances to process.
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `--threshold` | float | `100000` | Income threshold in USD. Target is **1** if `PINCP > threshold`. |
+| `--threshold` | float | *auto* | Income threshold in USD. Target is **1** if `PINCP > threshold`. If omitted, the threshold is selected automatically from pre-computed Pew Research Center upper-income values (T = 2 × M_fam ÷ √3, ACS 2024). Resolution order: single state → state-level value; group name → group value; multiple states or ALL → national fallback ($94,200). Pass an explicit value to override. |
 
 ### Output column selection *(stage 1)*
 
@@ -667,6 +678,81 @@ Stage 4 shares all performance infrastructure with stage 3:
 - All floating-point values in CSV output use **`%.6f`** format (6 fixed
   decimal places): `1.0` → `1.000000`, `0.625` → `0.625000`.  Infinities
   (`conviction` when `confidence = 1.0`) are replaced with empty cells.
+
+---
+
+## Income thresholds (auto-selected)
+
+When `--threshold` is omitted the pipeline selects the threshold automatically
+using the **Pew Research Center upper-income formula** (Kochhar, 2022):
+
+```
+T = 2 × M_fam ÷ √3
+```
+
+where M_fam is the ACS 1-year 2024 family median income for the state or
+group.  Values are rounded to the nearest $100.
+
+### National fallback
+
+| Scope | Threshold |
+|---|---|
+| USA (49 states, no AK) | **$94,200** |
+
+### Per state-group thresholds
+
+| Group | Threshold | vs USA |
+|---|---|---|
+| `northeast` | $100,700 | +7% |
+| `midwest` | $91,100 | −3% |
+| `south` | $86,000 | −9% |
+| `west` | $101,400 | +8% |
+| `new_england` | $111,300 | +18% |
+| `middle_atlantic` | $96,500 | +2% |
+| `east_north_central` | $90,400 | −4% |
+| `west_north_central` | $92,400 | −2% |
+| `south_atlantic` | $89,800 | −5% |
+| `east_south_central` | $73,700 | −22% |
+| `west_south_central` | $86,300 | −8% |
+| `mountain` | $93,300 | −1% |
+| `pacific` | $106,000 | +13% |
+| `sunbelt` | $92,600 | −2% |
+| `rust_belt` | $90,900 | −4% |
+| `great_plains` | $92,400 | −2% |
+
+### Per-state thresholds (sorted by value)
+
+| # | State | Threshold | # | State | Threshold |
+|---|---|---|---|---|---|
+| 1 | DC | $126,700 | 26 | WI | $91,800 |
+| 2 | MA | $122,000 | 27 | MT | $91,700 |
+| 3 | MD | $117,900 | 28 | TX | $90,800 |
+| 4 | UT | $116,600 | 29 | MO | $90,100 |
+| 5 | NH | $114,200 | 30 | PA | $89,500 |
+| 6 | VA | $112,000 | 31 | WY | $89,000 |
+| 7 | CO | $111,700 | 32 | MI | $88,900 |
+| 8 | HI | $111,200 | 33 | IN | $87,800 |
+| 9 | WA | $108,500 | 34 | ND | $87,300 |
+| 10 | CT | $106,400 | 35 | ME | $86,600 |
+| 11 | NJ | $105,800 | 36 | OH | $85,700 |
+| 12 | MN | $104,000 | 37 | ID | $85,300 |
+| 13 | NE | $103,300 | 38 | TN | $84,300 |
+| 14 | CA | $103,100 | 39 | GA | $83,100 |
+| 15 | OR | $102,200 | 40 | FL | $83,100 |
+| 16 | IL | $101,200 | 41 | SC | $79,800 |
+| 17 | DE | $100,500 | 42 | NC | $79,700 |
+| 18 | VT | $98,100 | 43 | OK | $77,700 |
+| 19 | KS | $97,100 | 44 | AR | $73,000 |
+| 20 | AZ | $95,800 | 45 | KY | $71,600 |
+| 21 | SD | $94,700 | 46 | NM | $69,400 |
+| 22 | RI | $94,700 | 47 | AL | $69,300 |
+| 23 | NY | $94,400 | 48 | WV | $69,300 |
+| 24 | NV | $93,500 | 49 | LA | $66,400 |
+| 25 | IA | $92,900 | 50 | MS | $63,500 |
+
+Alaska (AK) is excluded from the ACS 1-year survey and has no threshold entry.
+Puerto Rico (PR) falls back to the national value ($94,200).
+Source: ACS 1-year 2024, Census Bureau (ACSBR-025).
 
 ---
 
