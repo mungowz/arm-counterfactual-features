@@ -8,24 +8,62 @@ Adapted from:
   efficient, robust, and model-agnostic explanations for brain connectivity networks"
   Computer Methods and Programs in Biomedicine 236, 107550.
 
+How the original paper uses data
+─────────────────────────────────
+The paper states that BoCSoR operates on the training set.  In practice the
+training set serves as the *starting pool* — the actual counterfactuals and
+the instances used for relevance testing are **synthetic**:
+
+  1. Boundary instances are selected from the training set (percentile filter
+     on inter-class distance) — these are real training rows.
+  2. For each boundary instance, k nearest neighbours of the opposite class
+     are retrieved from the training set — these are also real.
+  3. Intermediate points are generated via np.linspace between the boundary
+     instance and each neighbour — these are **synthetic**, not in any dataset.
+  4. The first synthetic midpoint classified as the opposite class becomes
+     the closestCF — a **synthetic** point near the decision boundary.
+  5. Feature substitution on closestCF creates yet another **synthetic**
+     instance, on which model.predict() is called — the model is thus
+     probed on an instance it has never seen during training.
+
+The model is therefore queried on synthetic, unseen instances to explore
+its decision surface.  This is functionally equivalent to probing with test
+data, except the probe points are constructed strategically near the
+boundary rather than sampled randomly.
+
 Adaptations for fully-categorical data
 ───────────────────────────────────────
-* Analysis runs on the TRAINING SET.  The classifier has full knowledge of
-  training instances, so boundary instances found there are the most
-  informative for explaining the model's decision surface.  The test set is
-  used only to compute a held-out accuracy estimate.
+* Boundary instances and the opposite-class pool come from the TRAINING SET,
+  exactly as in the paper.  The test set is used only to compute a held-out
+  accuracy estimate.
 
 * No interpolation of intermediate points (not meaningful for categorical
-  features).  Counterfactuals are the K nearest neighbours of the opposite
-  class in rank-encoded Manhattan space.
+  features).  Instead of generating synthetic midpoints (Algorithm 1 of the
+  paper), counterfactuals are the K nearest neighbours of the opposite class
+  in hybrid-encoded Manhattan space.  With all 10 feature columns (the
+  default), cross-class collisions (distance = 0) are extremely rare.
+  When they occur, the relevance check naturally skips them (no differing
+  features to substitute).
 
-* Rank-based encoding:
-    - Ordinal columns (AGEP, SCHL, WKHP) use the declared semantic order.
-    - All other columns use lexicographic (alphabetical) order — consistent
-      but arbitrary, no semantic meaning for nominal features.
+* Feature substitution (Algorithm 2) creates synthetic instances just as in
+  the paper: each modified counterfactual (one feature swapped back to the
+  original value) is an instance that likely does not exist in the training
+  set.  model.predict() is called on these synthetic instances to determine
+  which features are relevant — again probing the model on unseen data.
+
+* Hybrid encoding (new):
+    - Ordinal columns (AGEP, SCHL, WKHP, ...): rank-based encoding
+      normalised per-column via min-max to [0, 1].
+    - Nominal columns (all others): one-hot encoding.  Within a single
+      nominal column two samples either share the same category (distance 0)
+      or differ (distance 2 in Manhattan / Hamming).  The per-column
+      contribution is normalised to [0, 1] by dividing by 2.
+    Both groups therefore contribute values in [0, 1] per column before
+    the global sum, making ordinal and nominal columns commensurable.
 
 * Manhattan distance normalised to [0, 2]:
-      dist(a,b) = 2 x sum|rank_i(a) - rank_i(b)| / sum(max_rank_i)
+      dist(a,b) = 2 × Σ_i  d_i(a,b)  /  n_cols
+    where d_i ∈ [0,1] for every column i (see hybrid encoding above).
 
 * Multi-k evaluation via --k:
       Single value K  -> auto-expanded to all odd integers 1..K (plus K if
@@ -113,52 +151,164 @@ ORDERED_CATEGORIES: dict[str, list[str]] = {
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Rank encoding
+# Hybrid encoding  (ordinal → rank-normalised | nominal → one-hot)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_rank_maps(df: pd.DataFrame) -> dict[str, dict[str, int]]:
     """
-    Build {column -> {category_label -> rank}} from the training DataFrame.
+    Build {column -> {category_label -> rank}} for ORDINAL columns only.
 
-    Ordinal columns use the semantic order in ORDERED_CATEGORIES (rank 1 =
-    lowest, rank N = highest).  All other columns use lexicographic order.
-    Ranks are 1-based.  Must be built from training data only.
+    Ordinal columns are those listed in ORDERED_CATEGORIES; they use the
+    declared semantic order (rank 1 = lowest).  Ranks are 1-based and must
+    be built from training data only.
+
+    Nominal columns are NOT included here — they are handled by
+    build_nominal_maps / encode_hybrid.
     """
     rank_maps: dict[str, dict[str, int]] = {}
     for col in df.columns:
+        if col not in ORDERED_CATEGORIES:
+            continue
         present = set(df[col].dropna().unique())
-        if col in ORDERED_CATEGORIES:
-            ordered = [c for c in ORDERED_CATEGORIES[col] if c in present]
-            ordered += sorted(present - set(ordered))
-        else:
-            ordered = sorted(present)
+        ordered = [c for c in ORDERED_CATEGORIES[col] if c in present]
+        ordered += sorted(present - set(ordered))   # unseen values at the end
         rank_maps[col] = {cat: rank for rank, cat in enumerate(ordered, start=1)}
     return rank_maps
 
 
-def encode_ranks(
+def build_nominal_maps(df: pd.DataFrame) -> dict[str, list[str]]:
+    """
+    Build {column -> sorted_categories} for NOMINAL (non-ordinal) columns.
+
+    The sorted list of categories observed in the training data defines the
+    one-hot column order.  Must be built from training data only.
+    """
+    nominal_maps: dict[str, list[str]] = {}
+    for col in df.columns:
+        if col in ORDERED_CATEGORIES:
+            continue
+        cats = sorted(df[col].dropna().unique().tolist())
+        nominal_maps[col] = cats
+    return nominal_maps
+
+
+def encode_hybrid(
     df: pd.DataFrame,
     rank_maps: dict[str, dict[str, int]],
+    nominal_maps: dict[str, list[str]],
+    feature_cols: list[str],
 ) -> np.ndarray:
     """
-    Convert a categorical DataFrame to a (n_samples, n_features) int32 matrix.
+    Encode a categorical DataFrame into a float32 matrix where every column
+    contributes values in [0, 1], making ordinal and nominal distances
+    commensurable.
 
-    Values absent from the rank map fall back to the median rank of that
-    column (neutral fallback, avoids NaN in distance calculations).
+    Ordinal columns (in rank_maps)
+    ──────────────────────────────
+    Rank-based encoding normalised per-column with min-max to [0, 1]:
+        encoded = (rank - 1) / (max_rank - 1)   if max_rank > 1, else 0.
+    Unknown values fall back to 0.5 (mid-range neutral).
+
+    Nominal columns (in nominal_maps)
+    ──────────────────────────────────
+    One-hot encoding, one column per category.  Within a single original
+    column the Manhattan distance between two samples is either 0 (same
+    category, bits identical) or 2 (different categories, two bits differ).
+    Each one-hot column therefore contributes 0 or 1 after dividing by 2 — 
+    still in [0, 1].  The /2 normalisation is applied here so that the
+    encoded values are 0.0 or 0.5 per bit; the BallTree Manhattan distance
+    then recovers values in {0, 1} per original nominal column.
+
+    Column order
+    ────────────
+    Ordinal columns appear in feature_cols order; nominal one-hot columns are
+    appended immediately after their source column, in category sort order.
+    The `encoded_col_names` helper mirrors this order.
+
+    Parameters
+    ----------
+    df           : DataFrame whose rows are to be encoded.
+    rank_maps    : Output of build_rank_maps (training data only).
+    nominal_maps : Output of build_nominal_maps (training data only).
+    feature_cols : Ordered list of original feature column names.
+
+    Returns
+    -------
+    (n_samples, n_encoded_cols) float32 array.
     """
-    result = np.empty((len(df), len(df.columns)), dtype=np.int32)
-    for j, col in enumerate(df.columns):
-        rmap     = rank_maps[col]
-        fallback = int(np.median(list(rmap.values())))
-        result[:, j] = (
-            df[col].map(lambda v, rm=rmap, fb=fallback: rm.get(v, fb)).to_numpy()
-        )
-    return result
+    n = len(df)
+    cols_out: list[np.ndarray] = []
+
+    for col in feature_cols:
+        if col in rank_maps:
+            # ── Ordinal: rank → min-max normalised to [0, 1] ─────────────────
+            # Vectorised via pd.Series.map(dict) (C-optimised in pandas) +
+            # fillna for unknown values, avoiding a Python-level lambda per row.
+            rmap     = rank_maps[col]
+            max_rank = max(rmap.values())
+            denom    = float(max_rank - 1) if max_rank > 1 else 1.0
+            fallback = 0.5
+            # Build a pre-normalised mapping: {category -> normalised_rank}.
+            norm_map = {cat: (rank - 1) / denom for cat, rank in rmap.items()}
+            vals = (
+                df[col]
+                .map(norm_map)          # C-optimised dict lookup
+                .fillna(fallback)       # unknown categories → mid-range
+                .to_numpy(dtype=np.float32)
+            )
+            cols_out.append(vals.reshape(-1, 1))
+        else:
+            # ── Nominal: one-hot / 2  → each bit in {0.0, 0.5} ──────────────
+            cats = nominal_maps.get(col, [])
+            col_vals = df[col].to_numpy()
+            for cat in cats:
+                bit = (col_vals == cat).astype(np.float32) * 0.5
+                cols_out.append(bit.reshape(-1, 1))
+
+    if not cols_out:
+        return np.empty((n, 0), dtype=np.float32)
+    return np.concatenate(cols_out, axis=1)
 
 
-def max_rank_per_column(rank_maps: dict[str, dict[str, int]]) -> np.ndarray:
-    """Return a (F,) float64 array of maximum rank for each column."""
-    return np.array([max(rm.values()) for rm in rank_maps.values()], dtype=np.float64)
+def encoded_col_names(
+    feature_cols: list[str],
+    rank_maps: dict[str, dict[str, int]],
+    nominal_maps: dict[str, list[str]],
+) -> list[str]:
+    """
+    Return the list of encoded column names in the same order as encode_hybrid.
+
+    Useful for debugging / logging.  Ordinal columns keep their name;
+    nominal columns become 'COL=cat' strings.
+    """
+    names: list[str] = []
+    for col in feature_cols:
+        if col in rank_maps:
+            names.append(col)
+        else:
+            for cat in nominal_maps.get(col, []):
+                names.append(f"{col}={cat}")
+    return names
+
+
+def n_encoded_cols(
+    feature_cols: list[str],
+    rank_maps: dict[str, dict[str, int]],
+    nominal_maps: dict[str, list[str]],
+) -> int:
+    """
+    Return the total number of columns produced by encode_hybrid.
+
+    Used to compute the normalisation factor (n_cols) for the global
+    Manhattan distance without actually materialising the encoded matrix.
+    """
+    total = 0
+    for col in feature_cols:
+        if col in rank_maps:
+            total += 1
+        else:
+            total += len(nominal_maps.get(col, []))
+    return total
 
 
 
@@ -200,20 +350,26 @@ def expand_k(k_values: list[int]) -> list[int]:
 # Boundary instance selection (computed once, shared across all k values)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_balltree(X_enc: np.ndarray, max_ranks: np.ndarray) -> BallTree:
+def build_balltree(X_enc: np.ndarray, n_cols: int) -> BallTree:
     """
-    Build a BallTree on rank-encoded data using normalised Manhattan distance.
+    Build a BallTree on hybrid-encoded data using normalised Manhattan distance.
 
     The tree is built once in the main process and inherited by worker
     processes via fork — no serialisation overhead.
 
-    We use the "chebyshev" leaf_size default and Manhattan (L1) metric.
-    The normalisation (divide by norm_factor, multiply by 2) is applied to
-    the input before building so that the tree returns distances in [0, 2],
-    consistent with the formula: dist(a,b) = 2 × Σ|rank_i(a)-rank_i(b)| / Σmax_rank_i.
+    Each encoded column already contributes values in [0, 1] (ordinal columns
+    are min-max normalised; nominal one-hot bits are divided by 2 during
+    encoding).  The global normalisation factor is therefore simply n_cols,
+    so that the tree returns distances in [0, 2]:
+
+        dist(a, b) = 2 × Σ_i |enc_i(a) - enc_i(b)|  /  n_cols
+
+    X_enc is already in [0, 1] per column, so we divide by (n_cols / 2)
+    before inserting into the tree; the raw Manhattan distances reported by
+    the tree then equal the normalised distance above.
     """
-    norm_factor = float(max_ranks.sum())
-    X_norm = X_enc.astype(np.float32) / norm_factor * 2.0
+    norm_factor = float(n_cols) / 2.0    # divide by this → distances in [0, 2]
+    X_norm = X_enc.astype(np.float32) / norm_factor
     return BallTree(X_norm, metric="manhattan", leaf_size=40)
 
 
@@ -221,7 +377,7 @@ def select_boundary_instances(
     X_enc: np.ndarray,
     y_true: np.ndarray,
     y_pred_train: np.ndarray,
-    max_ranks: np.ndarray,
+    n_enc_cols: int,
     percentile_th: float,
     original_class: int,
     cf_class: int,
@@ -245,16 +401,20 @@ def select_boundary_instances(
 
     Parameters
     ----------
-    y_true        : True class labels (used to separate class pools).
-    y_pred_train  : Model predictions on the training set (used to filter
-                    misclassified instances from the boundary candidates).
+    X_enc       : Hybrid-encoded matrix produced by encode_hybrid (float32,
+                  values in [0, 1] per column).
+    y_true      : True class labels (used to separate class pools).
+    y_pred_train: Model predictions on the training set (used to filter
+                  misclassified instances from the boundary candidates).
+    n_enc_cols  : Total number of encoded columns (= X_enc.shape[1]).
+                  Used as the normalisation factor for distance computation.
 
     Returns
     -------
     (boundary_indices, cf_indices, X_enc_cf, cf_tree)
       boundary_indices : row indices in X_enc of boundary instances.
       cf_indices       : row indices in X_enc of true-cf-class instances.
-      X_enc_cf         : rank-encoded submatrix for cf-class instances.
+      X_enc_cf         : encoded submatrix for cf-class instances.
       cf_tree          : BallTree built on cf-class instances (normalised).
     """
     # Separate by TRUE label — same as the original authors.
@@ -265,12 +425,9 @@ def select_boundary_instances(
         empty_tree = BallTree(np.zeros((1, X_enc.shape[1]), dtype=np.float32),
                               metric="manhattan")
         return (np.array([], dtype=int), cf_indices,
-                np.empty((0, X_enc.shape[1]), dtype=np.int32), empty_tree)
+                np.empty((0, X_enc.shape[1]), dtype=np.float32), empty_tree)
 
     # Keep only correctly classified orig-class instances.
-    # A misclassified instance would already be on the CF side of the
-    # decision boundary; its counterfactual direction is inverted and
-    # its relevant features would be meaningless.
     correct_mask  = y_pred_train[orig_indices_true] == original_class
     orig_indices  = orig_indices_true[correct_mask]
 
@@ -278,19 +435,19 @@ def select_boundary_instances(
         empty_tree = BallTree(np.zeros((1, X_enc.shape[1]), dtype=np.float32),
                               metric="manhattan")
         return (np.array([], dtype=int), cf_indices,
-                np.empty((0, X_enc.shape[1]), dtype=np.int32), empty_tree)
+                np.empty((0, X_enc.shape[1]), dtype=np.float32), empty_tree)
 
     X_enc_orig = X_enc[orig_indices]
     X_enc_cf   = X_enc[cf_indices]
 
     # Build BallTree on the true-cf-class instances (normalised coordinates).
-    cf_tree = build_balltree(X_enc_cf, max_ranks)
+    cf_tree = build_balltree(X_enc_cf, n_enc_cols)
 
-    # For each correctly-classified orig-class instance find its nearest
-    # true-cf-class neighbour (k=1).  Instances below the distance threshold
-    # are the boundary instances.
-    norm_factor = float(max_ranks.sum())
-    X_orig_norm = X_enc_orig.astype(np.float32) / norm_factor * 2.0
+    # Query k=1 to find each orig-class instance's nearest cf-class neighbour.
+    # X_enc is already in [0,1] per column; the BallTree was built with the
+    # same /norm_factor scaling, so we apply the same transform to query rows.
+    norm_factor = float(n_enc_cols) / 2.0
+    X_orig_norm = X_enc_orig.astype(np.float32) / norm_factor
     min_dists, _ = cf_tree.query(X_orig_norm, k=1)   # (N_orig, 1)
     min_dists    = min_dists[:, 0]                     # (N_orig,)
 
@@ -316,15 +473,18 @@ def _process_boundary_chunk(
     model: CatBoostClassifier,
     k: int,
     original_class: int,
-    norm_factor: float,
+    n_enc_cols: int,
     cf_tree: BallTree,
 ) -> tuple[dict[str, int], list[dict], list[dict]]:
     """
     Process one chunk of boundary instances in a worker process.
 
     For each boundary instance:
-      1. Find k nearest neighbours from the counterfactual class
-         (Algorithm 1 — no interpolation for categorical data).
+      1. Find the k nearest neighbours from the counterfactual class
+         (Algorithm 1 — k-NN via BallTree in hybrid-encoded Manhattan space).
+         Counterfactuals with distance = 0 (identical features, different
+         class) are possible with few columns; the relevance check below
+         naturally skips them (no differing features to substitute).
       2. Build a batch of all modified instances needed for the relevance
          check across all k counterfactuals, then call model.predict() once
          on the entire batch (batched Algorithm 2).
@@ -336,15 +496,16 @@ def _process_boundary_chunk(
     Parameters
     ----------
     chunk_indices     : Row indices (in X_enc / X_train_values) to process.
-    X_enc             : Full rank-encoded training matrix (read-only).
-    X_enc_cf          : Rank-encoded submatrix of counterfactual-class rows.
+    X_enc             : Full hybrid-encoded training matrix (float32, [0,1] per col).
+    X_enc_cf          : Hybrid-encoded submatrix of counterfactual-class rows.
     cf_global_indices : Maps position in X_enc_cf -> row in X_enc.
     X_train_values    : (n_train, n_features) object array of string labels.
-    feature_cols      : Ordered feature column names.
+    feature_cols      : Ordered ORIGINAL feature column names.
     model             : CatBoostClassifier inherited from parent via fork.
     k                 : Number of nearest counterfactuals to consider.
     original_class    : Class label of the boundary instances.
-    norm_factor       : sum(max_rank_i), precomputed for distance normalisation.
+    n_enc_cols        : Number of columns in X_enc (= n_orig + n_ohe_extra).
+                        Used to compute the BallTree query normalisation factor.
     cf_tree           : BallTree built on cf-class instances (normalised coords).
                         Inherited via fork — used for O(k log N) k-NN queries.
 
@@ -358,6 +519,7 @@ def _process_boundary_chunk(
                           with fields instance_index, cf_index,
                           k_neighbour_rank (1=closest), distance.
     """
+    norm_factor = float(n_enc_cols) / 2.0   # same as used in build_balltree
     n_features = len(feature_cols)
     importance_counts: dict[str, int] = {f: 0 for f in feature_cols}
     itemset_rows: list[dict] = []
@@ -365,13 +527,17 @@ def _process_boundary_chunk(
 
     n_cf = len(cf_global_indices)
 
+    # Pre-compute once: {feature_name: column_index} — constant across all
+    # boundary instances, avoids O(n) list.index() inside the inner loop.
+    feat_to_idx: dict[str, int] = {f: i for i, f in enumerate(feature_cols)}
+
     for b_idx in chunk_indices:
         # ── Algorithm 1: k-NN via BallTree — O(k log N_cf) ───────────────────
         query_norm = (X_enc[b_idx].astype(np.float32)
-                      / norm_factor * 2.0).reshape(1, -1)
-        k_act          = min(k, n_cf)
+                      / norm_factor).reshape(1, -1)
+        k_act = min(k, n_cf)
         dists, top_local = cf_tree.query(query_norm, k=k_act)   # (1, k_act)
-        cf_idxs = [int(cf_global_indices[i]) for i in top_local[0]]
+        cf_idxs  = [int(cf_global_indices[i]) for i in top_local[0]]
         cf_dists = dists[0].tolist()   # normalised Manhattan distances
 
         if not cf_idxs:
@@ -380,6 +546,10 @@ def _process_boundary_chunk(
         instance_vals = X_train_values[b_idx]
 
         # Record one distance row per (boundary_instance, k_neighbour) pair.
+        # Distance = 0.0 means the counterfactual has identical feature values
+        # but a different class label — possible with few columns, very rare
+        # with all 10 columns.  These are recorded faithfully; the relevance
+        # check below naturally skips them (no differing features to substitute).
         for rank, (cf_idx, dist) in enumerate(zip(cf_idxs, cf_dists), start=1):
             distance_rows.append({
                 "instance_index":    int(b_idx),
@@ -417,10 +587,6 @@ def _process_boundary_chunk(
             if int(pred) == original_class:
                 relevant_union.add(feature_cols[fi])
 
-        # Pre-compute a {feature_name: column_index} map to avoid O(n)
-        # list.index() calls inside the relevance-collection loop below.
-        feat_to_idx: dict[str, int] = {f: i for i, f in enumerate(feature_cols)}
-
         if relevant_union:
             # One row per boundary instance — all relevant features on the same
             # record.  "itemset" is a space-separated string of FEATURE=value
@@ -454,7 +620,7 @@ def run_bocsor_single_k(
     X_enc_cf: np.ndarray,
     cf_tree: BallTree,
     feature_cols: list[str],
-    rank_maps: dict[str, dict[str, int]],
+    n_enc_cols: int,
     k: int,
     original_class: int,
     n_workers: int,
@@ -470,8 +636,6 @@ def run_bocsor_single_k(
     -------
     (itemsets_df, feature_importance, distances_df)
     """
-    norm_factor = float(max_rank_per_column(rank_maps).sum())
-
     logger.info(
         "  k=%d | boundary instances: %d (class %d)",
         k, len(boundary_indices), original_class,
@@ -511,7 +675,7 @@ def run_bocsor_single_k(
                 model,
                 k,
                 original_class,
-                norm_factor,
+                n_enc_cols,
                 cf_tree,
             ): chunk
             for chunk in chunks
@@ -542,6 +706,14 @@ def run_bocsor_single_k(
     dist_df = pd.DataFrame(all_dist_rows) if all_dist_rows else pd.DataFrame(
         columns=["instance_index", "cf_index", "k_neighbour_rank", "distance"]
     )
+    # Sort so that within each boundary instance the nearest counterfactual
+    # comes first (k_neighbour_rank = 1, 2, …, k).
+    if not dist_df.empty:
+        dist_df = (
+            dist_df
+            .sort_values(["instance_index", "k_neighbour_rank"], ascending=True)
+            .reset_index(drop=True)
+        )
     return pd.DataFrame(all_rows), feat_imp, dist_df
 
 
@@ -566,7 +738,9 @@ def run_bocsor_multi_k(
     Run BoCSoR once per value in k_values on the training set.
 
     Key optimisations vs. the naive loop:
-    - Rank encoding of X_train: computed once, reused for all k values.
+    - Hybrid encoding of X_train: computed once, reused for all k values.
+      Ordinal columns: rank-based, min-max normalised to [0,1].
+      Nominal columns: one-hot / 2, each bit in {0.0, 0.5}.
     - Boundary selection via BallTree: O(N log N) instead of O(N²).
       Pools separated by TRUE label; only correctly-classified orig-class
       instances are candidates.  Built once, reused for all k values.
@@ -594,8 +768,10 @@ def run_bocsor_multi_k(
         k_values, original_class, cf_class, percentile_th, n_workers,
     )
 
-    max_ranks = max_rank_per_column(rank_maps)
-    X_enc     = encode_ranks(X_train[feature_cols], rank_maps)
+    # ── Hybrid encoding: built once, reused for all k values ─────────────────
+    nominal_maps = build_nominal_maps(X_train[feature_cols])
+    X_enc        = encode_hybrid(X_train[feature_cols], rank_maps, nominal_maps, feature_cols)
+    _n_enc_cols  = n_encoded_cols(feature_cols, rank_maps, nominal_maps)
     X_train_values = (
         X_train[feature_cols].reset_index(drop=True).to_numpy(dtype=object)
     )
@@ -606,7 +782,7 @@ def run_bocsor_multi_k(
         X_enc=X_enc,
         y_true=y_train.to_numpy().astype(int),
         y_pred_train=y_pred_train,
-        max_ranks=max_ranks,
+        n_enc_cols=_n_enc_cols,
         percentile_th=percentile_th,
         original_class=original_class,
         cf_class=cf_class,
@@ -652,16 +828,27 @@ def run_bocsor_multi_k(
             X_enc_cf=X_enc_cf,
             cf_tree=cf_tree,
             feature_cols=feature_cols,
-            rank_maps=rank_maps,
+            n_enc_cols=_n_enc_cols,
             k=k,
             original_class=original_class,
             n_workers=n_workers,
         )
         logger.info("  k=%d | elapsed: %.1fs", k, time.perf_counter() - t_k)
+        # Always tag with k_value — even if empty — so pd.concat produces
+        # a consistent column schema across all k values.
         if not itemsets_df.empty:
             itemsets_df.insert(0, "k_value", k)
+        else:
+            itemsets_df = pd.DataFrame(
+                columns=["k_value", "instance_index", "features", "itemset"]
+            )
         if not dist_df.empty:
             dist_df.insert(0, "k_value", k)
+        else:
+            dist_df = pd.DataFrame(
+                columns=["k_value", "instance_index", "cf_index",
+                         "k_neighbour_rank", "distance"]
+            )
         all_itemsets.append(itemsets_df)
         all_distances.append(dist_df)
         importance_dict[k] = feat_imp
@@ -676,8 +863,19 @@ def run_bocsor_multi_k(
     }
 
     # distances_df: all k merged, columns [k_value, instance_index,
-    # cf_index, k_neighbour_rank, distance]
+    # cf_index, k_neighbour_rank, distance].
+    # Sorted so that within each (k_value, instance_index) group the nearest
+    # counterfactual comes first (k_neighbour_rank ascending).
     distances_df = pd.concat(all_distances, ignore_index=True)
+    if not distances_df.empty:
+        distances_df = (
+            distances_df
+            .sort_values(
+                ["k_value", "instance_index", "k_neighbour_rank"],
+                ascending=True,
+            )
+            .reset_index(drop=True)
+        )
 
     return combined, imp_df, per_k_itemsets, distances_df
 
@@ -832,75 +1030,106 @@ def train_catboost(
     return model
 
 
-class LightGBMWrapper:
+class MLPWrapper:
     """
-    Wraps LGBMClassifier to expose the same predict() interface as CatBoost.
+    Wraps sklearn MLPClassifier to expose the same predict() interface as CatBoost.
 
-    LightGBM requires integer-encoded categorical inputs and returns class
-    probabilities from predict(), while CatBoost accepts raw string DataFrames
-    and returns class labels directly.  This wrapper handles both differences
-    so the rest of the pipeline (BoCSoR workers, accuracy computation) can
-    call model.predict() uniformly regardless of which classifier was trained.
+    MLPClassifier requires numeric inputs, so categorical features are
+    integer-encoded: ordinal columns use their semantic rank from rank_maps;
+    nominal columns use 1-based lexicographic rank from nominal_maps.
+    Features are then standardised (zero-mean, unit-variance) using statistics
+    computed at fit time, stored in the wrapper so predict() can apply the
+    same transform.
 
-    Encoding uses the rank_maps already computed for the distance calculation,
-    avoiding a second encoding step and keeping the integer representation
-    consistent throughout stage 2.
-
-    The wrapper silently drops the CatBoost-specific `thread_count` keyword
-    argument so that _process_boundary_chunk can call model.predict() with the
-    same signature for both classifiers.
+    The CatBoost-specific ``thread_count`` keyword argument is silently
+    dropped so that _process_boundary_chunk can call model.predict() with
+    the same signature for both classifiers.
     """
 
     def __init__(
         self,
-        lgbm_model: object,
+        mlp_model: object,
         rank_maps: dict[str, dict[str, int]],
+        nominal_maps: dict[str, list[str]],
         feature_cols: list[str],
+        mean: np.ndarray | None = None,
+        std: np.ndarray | None = None,
     ) -> None:
-        self._model      = lgbm_model
-        self._rank_maps  = rank_maps
-        self._feat_cols  = feature_cols
+        self._model = mlp_model
+        self._rank_maps = rank_maps
+        self._nominal_maps = nominal_maps
+        self._feat_cols = feature_cols
+        self._mean = mean
+        self._std = std
+        # Build a combined int-encoding map: ordinal columns use their
+        # semantic rank; nominal columns use 1-based lexicographic index.
+        # Unknown categories fall back to 0 (a dedicated sentinel value).
+        self._enc: dict[str, dict[str, int]] = {}
+        for col in feature_cols:
+            if col in rank_maps:
+                self._enc[col] = rank_maps[col]
+            else:
+                cats = nominal_maps.get(col, [])
+                self._enc[col] = {cat: i + 1 for i, cat in enumerate(cats)}
 
-    def _encode(self, X: np.ndarray) -> pd.DataFrame:
+    def _encode(self, X: np.ndarray) -> np.ndarray:
         """
-        Convert an (N, F) object array of strings to an int32 DataFrame.
+        Convert an (N, F) object array of strings to a float64 array.
 
-        Returning a DataFrame (instead of a plain numpy array) keeps the
-        column names consistent between fit() and predict(), which prevents
-        sklearn's feature-name validation from emitting a UserWarning every
-        time predict() is called in a worker process.
+        Unknown category values are mapped to 0.  If standardisation
+        statistics are available the output is standardised.
+
+        Uses pd.Series.map(dict) for arrays with > 1000 rows (C-optimised
+        dict lookup in pandas) and falls back to list comprehension for
+        small batches where pandas overhead would dominate.
         """
-        out = np.empty(X.shape, dtype=np.int32)
-        for j, col in enumerate(self._feat_cols):
-            rmap     = self._rank_maps[col]
-            fallback = int(np.median(list(rmap.values())))
-            out[:, j] = np.array(
-                [rmap.get(v, fallback) for v in X[:, j]], dtype=np.int32
-            )
-        return pd.DataFrame(out, columns=self._feat_cols)
+        n_rows = X.shape[0]
+        out = np.zeros(X.shape, dtype=np.float64)
+
+        if n_rows > 1000:
+            # Large array: pd.Series.map(dict) is ~5× faster than list comp.
+            for j, col in enumerate(self._feat_cols):
+                rmap = self._enc[col]
+                out[:, j] = (
+                    pd.Series(X[:, j])
+                    .map(rmap)
+                    .fillna(0)
+                    .to_numpy(dtype=np.float64)
+                )
+        else:
+            # Small batch (worker predict): list comp avoids pandas overhead.
+            for j, col in enumerate(self._feat_cols):
+                rmap = self._enc[col]
+                out[:, j] = np.array(
+                    [rmap.get(v, 0) for v in X[:, j]], dtype=np.float64
+                )
+
+        if self._mean is not None and self._std is not None:
+            out = (out - self._mean) / self._std
+        return out
 
     def predict(self, X, **kwargs) -> np.ndarray:
         """
         Return integer class labels (0 or 1).
 
         Accepts either a pandas DataFrame or a numpy object array of raw
-        string category values.  The CatBoost-specific `thread_count` kwarg
-        is silently ignored.
+        string category values.
         """
-        kwargs.pop("thread_count", None)   # CatBoost-specific — not used by LightGBM
+        kwargs.pop("thread_count", None)  # CatBoost-specific — ignored
         if isinstance(X, pd.DataFrame):
             arr = X[self._feat_cols].to_numpy(dtype=object)
         else:
             arr = np.asarray(X, dtype=object)
         X_enc = self._encode(arr)
-        proba = self._model.predict(X_enc, num_threads=1)
-        return (proba >= 0.5).astype(int)
+        labels = self._model.predict(X_enc)
+        return np.asarray(labels).astype(int)
 
 
-def train_lightgbm(
+def train_mlp(
     X_train: pd.DataFrame,
     y_train: pd.Series,
     rank_maps: dict[str, dict[str, int]],
+    nominal_maps: dict[str, list[str]],
     feature_cols: list[str],
     random_seed: int = 42,
     iterations: int = 500,
@@ -908,81 +1137,69 @@ def train_lightgbm(
     depth: int = 6,
     verbose: bool = False,
     early_stopping_rounds: int | None = None,
-) -> LightGBMWrapper:
+) -> MLPWrapper:
     """
-    Train a LightGBM classifier on the (fully categorical) training set and
-    return it wrapped in a LightGBMWrapper for a uniform predict() interface.
+    Train an sklearn MLPClassifier on the (fully categorical) training set
+    and return it wrapped in an MLPWrapper for a uniform predict() interface.
 
-    LightGBM is a leaf-wise gradient boosting framework that can match or
-    exceed CatBoost accuracy on tabular data while producing decision
-    boundaries that are typically more fine-grained, which benefits BoCSoR
-    by increasing the number of boundary instances that produce relevant
-    counterfactuals (especially at small k values).
+    The MLP provides a fundamentally different decision boundary geometry
+    compared to tree-based classifiers (smooth non-linear surfaces vs.
+    axis-aligned splits), making it an ideal complement to CatBoost for
+    verifying that BoCSoR results are model-agnostic.
 
-    Categorical features are integer-encoded via the rank_maps already
-    computed for the distance calculation.  The `depth` parameter maps to
-    LightGBM's `max_depth`; LightGBM's leaf-wise growth is controlled
-    additionally via `num_leaves` (set to 2^depth - 1 to mirror CatBoost
-    behaviour by default).
+    Hyperparameter mapping from tree parameters
+    ────────────────────────────────────────────
+    - iterations → max_iter (training epochs)
+    - learning_rate → learning_rate_init
+    - depth → two hidden layers of width 2^depth (captures model capacity)
+    - early_stopping_rounds → early_stopping=True with n_iter_no_change
 
     Parameters
     ----------
     rank_maps            : {column -> {label -> rank}} from build_rank_maps().
-                           Used to encode string categories to integers.
+    nominal_maps         : {column -> sorted_categories} from build_nominal_maps().
     feature_cols         : Ordered list of feature column names.
-    early_stopping_rounds: Stop if validation metric does not improve for N
-                           consecutive rounds.  An internal 80/20 stratified
+    early_stopping_rounds: Stop if validation loss does not improve for N
+                           consecutive rounds.  An internal 10% stratified
                            split is used as the eval set.  None = disabled.
     """
-    try:
-        import lightgbm as lgb
-    except ImportError as exc:
-        raise ImportError(
-            "LightGBM is required for --classifier lightgbm.\n"
-            "  pip install lightgbm"
-        ) from exc
+    from sklearn.neural_network import MLPClassifier
 
-    num_leaves = max(2, 2 ** depth - 1)
-    lgbm_model = lgb.LGBMClassifier(
-        n_estimators=iterations,
-        learning_rate=learning_rate,
-        max_depth=depth,
-        num_leaves=num_leaves,
+    hidden_size = max(16, 2 ** depth)
+    hidden_layers = (hidden_size, hidden_size)
+
+    mlp_model = MLPClassifier(
+        hidden_layer_sizes=hidden_layers,
+        max_iter=iterations,
+        learning_rate_init=learning_rate,
         random_state=random_seed,
-        verbose=-1 if not verbose else 1,
-        n_jobs=1,   # thread control handled externally via worker processes
+        verbose=verbose,
+        early_stopping=early_stopping_rounds is not None,
+        n_iter_no_change=early_stopping_rounds if early_stopping_rounds else 10,
+        validation_fraction=0.1,
     )
 
     logger.info(
-        "Training LightGBM: n_estimators=%d, lr=%.4f, max_depth=%d, "
-        "num_leaves=%d, early_stopping=%s.",
-        iterations, learning_rate, depth, num_leaves,
-        early_stopping_rounds if early_stopping_rounds else "disabled",
+        "Training MLP: hidden_layers=%s, max_iter=%d, lr=%.4f, "
+        "early_stopping=%s.",
+        hidden_layers, iterations, learning_rate,
+        f"{early_stopping_rounds} rounds" if early_stopping_rounds else "disabled",
     )
 
-    # Encode training data via rank_maps — returns a DataFrame with column
-    # names so that fit() and predict() both use named features, eliminating
-    # sklearn's "X does not have valid feature names" UserWarning.
-    wrapper  = LightGBMWrapper(lgbm_model, rank_maps, feature_cols)
-    X_arr    = X_train[feature_cols].to_numpy(dtype=object)
-    X_enc_df = wrapper._encode(X_arr)   # pd.DataFrame with int32 values
+    # Build wrapper and encode the training data.
+    wrapper = MLPWrapper(mlp_model, rank_maps, nominal_maps, feature_cols)
+    X_arr = X_train[feature_cols].to_numpy(dtype=object)
+    X_enc = wrapper._encode(X_arr)  # (N, F) float64
 
-    if early_stopping_rounds is not None:
-        from sklearn.model_selection import train_test_split as _tts
-        X_tr, X_val, y_tr, y_val = _tts(
-            X_enc_df, y_train,
-            test_size=0.2,
-            stratify=y_train,
-            random_state=random_seed,
-        )
-        lgbm_model.fit(
-            X_tr, y_tr,
-            eval_set=[(X_val, y_val)],
-            callbacks=[lgb.early_stopping(early_stopping_rounds, verbose=verbose)],
-        )
-    else:
-        lgbm_model.fit(X_enc_df, y_train)
+    # Standardise: compute mean/std on training data and store in wrapper.
+    mean = X_enc.mean(axis=0)
+    std = X_enc.std(axis=0)
+    std[std == 0] = 1.0  # avoid division by zero for constant columns
+    X_enc = (X_enc - mean) / std
+    wrapper._mean = mean
+    wrapper._std = std
 
+    mlp_model.fit(X_enc, y_train)
     return wrapper
 
 
@@ -991,6 +1208,7 @@ def train_model(
     X_train: pd.DataFrame,
     y_train: pd.Series,
     rank_maps: dict[str, dict[str, int]],
+    nominal_maps: dict[str, list[str]],
     feature_cols: list[str],
     random_seed: int = 42,
     iterations: int = 500,
@@ -1000,12 +1218,15 @@ def train_model(
     early_stopping_rounds: int | None = None,
 ) -> object:
     """
-    Dispatch to train_catboost or train_lightgbm based on *classifier*.
+    Dispatch to train_catboost or train_mlp based on *classifier*.
 
     Parameters
     ----------
-    classifier : "catboost" or "lightgbm".
-    rank_maps  : Required for LightGBM encoding; unused for CatBoost.
+    classifier   : "catboost" or "mlp".
+    rank_maps    : Ordinal-only rank maps from build_rank_maps().
+                   Required for MLP encoding; unused for CatBoost.
+    nominal_maps : Nominal category lists from build_nominal_maps().
+                   Required for MLP encoding; unused for CatBoost.
 
     Returns
     -------
@@ -1023,11 +1244,12 @@ def train_model(
             verbose=verbose,
             early_stopping_rounds=early_stopping_rounds,
         )
-    elif classifier == "lightgbm":
-        return train_lightgbm(
+    elif classifier == "mlp":
+        return train_mlp(
             X_train=X_train,
             y_train=y_train,
             rank_maps=rank_maps,
+            nominal_maps=nominal_maps,
             feature_cols=feature_cols,
             random_seed=random_seed,
             iterations=iterations,
@@ -1039,7 +1261,7 @@ def train_model(
     else:
         raise ValueError(
             f"Unknown classifier '{classifier}'. "
-            "Choose 'catboost' or 'lightgbm'."
+            "Choose 'catboost' or 'mlp'."
         )
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1117,28 +1339,29 @@ Examples:
 
     clf = parser.add_argument_group("Classifier selection")
     clf.add_argument(
-        "--classifier", choices=["catboost", "lightgbm"], default="catboost",
+        "--classifier", choices=["catboost", "mlp"], default="catboost",
         help=(
-            "Gradient boosting classifier to train.  "
+            "Classifier to train.  "
             "'catboost' (default) accepts raw string categoricals natively.  "
-            "'lightgbm' uses leaf-wise growth and often produces finer-grained "
-            "decision boundaries, increasing counterfactual yield at small k."
+            "'mlp' (Multi-Layer Perceptron) provides a fundamentally different "
+            "decision boundary geometry, useful for verifying model-agnosticity."
         ),
     )
 
-    cb = parser.add_argument_group("Classifier hyperparameters  (shared by CatBoost and LightGBM)")
+    cb = parser.add_argument_group("Classifier hyperparameters  (shared by CatBoost and MLP)")
     cb.add_argument("--cb-iterations", type=int,   default=500,  metavar="N",
-                    help="Boosting rounds (epochs).  Default: 500.")
+                    help="Boosting rounds / training epochs.  Default: 500.")
     cb.add_argument("--cb-lr",         type=float, default=0.05, metavar="LR",
                     help="Learning rate.  Default: 0.05.")
     cb.add_argument("--cb-depth",      type=int,   default=6,    metavar="D",
-                    help="Tree depth.  Default: 6.")
+                    help="Tree depth / hidden layer size exponent.  Default: 6.")
     cb.add_argument("--cb-early-stopping", type=int, default=0, metavar="N",
                     help=(
                         "Stop training if the eval loss does not improve for N "
                         "consecutive rounds.  0 disables early stopping.  "
                         "When enabled, 20%% of the training data is held out as "
-                        "an internal validation split.  Default: 0 (disabled)."
+                        "an internal validation split (CatBoost) or 10%% (MLP).  "
+                        "Default: 0 (disabled)."
                     ))
     cb.add_argument("--cb-verbose",    action="store_true",
                     help="Print CatBoost training progress.")
@@ -1213,14 +1436,16 @@ def main() -> None:
                 len(X_train), len(X_test), len(feature_cols))
     logger.info("Target: %s  |  Features: %s", target_col, feature_cols)
 
-    logger.info("Building rank maps ...")
-    rank_maps = build_rank_maps(X_train)
+    logger.info("Building rank maps (ordinal columns only) ...")
+    rank_maps    = build_rank_maps(X_train[feature_cols])
+    nominal_maps = build_nominal_maps(X_train[feature_cols])
 
     model = train_model(
         classifier=args.classifier,
         X_train=X_train,
         y_train=y_train,
         rank_maps=rank_maps,
+        nominal_maps=nominal_maps,
         feature_cols=feature_cols,
         random_seed=args.seed,
         iterations=args.cb_iterations,
@@ -1328,6 +1553,11 @@ def main() -> None:
         distances_df.to_csv(dist_path, index=False)
         logger.info("Distances -> %s  (%d rows)", dist_path, len(distances_df))
 
+        # ── Distance histograms ───────────────────────────────────────────
+        plot_distance_histograms(
+            distances_df, args.output_dir, suffix=suffix,
+        )
+
         logger.info("Feature importance summary (class %d):", orig_cls)
         for k_col in importance_df.columns:
             top = importance_df[k_col].sort_values(ascending=False)
@@ -1363,6 +1593,7 @@ def main() -> None:
         percentile_th=args.percentile,
         summary_data=summary_data,
         total_elapsed=total_elapsed,
+        classifier=args.classifier,
         cb_iterations=args.cb_iterations,
         cb_lr=args.cb_lr,
         cb_depth=args.cb_depth,
@@ -1374,6 +1605,115 @@ def main() -> None:
     logger.info("  Stage 2 complete.  Outputs: %s", args.output_dir.resolve())
     logger.info("  Total elapsed: %.1fs", total_elapsed)
     logger.info("=" * 62)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Distance histograms
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_distance_histograms(
+    distances_df: pd.DataFrame,
+    output_dir: Path,
+    suffix: str = "",
+    bins: int = 50,
+) -> None:
+    """
+    Plot one histogram of counterfactual distances per k value.
+
+    For k = 3 each boundary instance contributes 3 distances (to its 1st,
+    2nd, and 3rd nearest counterfactual).  All distances for that k are
+    pooled and binned into a single histogram.
+
+    One PNG is saved per k value, plus one combined PNG with all k values
+    as subplots on the same figure for easy comparison.
+
+    Parameters
+    ----------
+    distances_df : DataFrame with columns [k_value, instance_index,
+                   cf_index, k_neighbour_rank, distance].
+    output_dir   : Directory where PNGs are saved.
+    suffix       : Filename suffix (e.g. "_class0", "_class1").
+    bins         : Number of histogram bins.
+    """
+    import matplotlib
+    matplotlib.use("Agg")          # non-interactive backend
+    import matplotlib.pyplot as plt
+
+    if distances_df.empty:
+        logger.info("No distances to plot (empty DataFrame).")
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    k_values = sorted(distances_df["k_value"].unique())
+
+    # ── One PNG per k ────────────────────────────────────────────────────────
+    for k_val in k_values:
+        dists = distances_df.loc[
+            distances_df["k_value"] == k_val, "distance"
+        ].to_numpy()
+
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.hist(dists, bins=bins, edgecolor="black", alpha=0.75, color="#4C72B0")
+        ax.set_xlabel("Normalised Manhattan distance")
+        ax.set_ylabel("Count")
+        ax.set_title(
+            f"BoCSoR counterfactual distances — k = {k_val}\n"
+            f"({len(dists):,} distances from "
+            f"{distances_df.loc[distances_df['k_value'] == k_val, 'instance_index'].nunique():,} "
+            f"boundary instances)"
+        )
+        ax.axvline(
+            float(np.median(dists)), color="red", linestyle="--", linewidth=1,
+            label=f"median = {np.median(dists):.4f}",
+        )
+        ax.legend()
+        fig.tight_layout()
+
+        path = output_dir / f"bocsor_distance_histogram_k{k_val}{suffix}.png"
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        logger.info("Distance histogram k=%d -> %s", k_val, path.name)
+
+    # ── Combined figure: one subplot per k ───────────────────────────────────
+    if len(k_values) > 1:
+        n_k = len(k_values)
+        n_cols = min(3, n_k)
+        n_rows = math.ceil(n_k / n_cols)
+        fig, axes = plt.subplots(
+            n_rows, n_cols, figsize=(6 * n_cols, 4.5 * n_rows),
+            squeeze=False,
+        )
+
+        for idx, k_val in enumerate(k_values):
+            ax = axes[idx // n_cols][idx % n_cols]
+            dists = distances_df.loc[
+                distances_df["k_value"] == k_val, "distance"
+            ].to_numpy()
+
+            ax.hist(dists, bins=bins, edgecolor="black", alpha=0.75, color="#4C72B0")
+            ax.set_title(f"k = {k_val}  (n = {len(dists):,})")
+            ax.set_xlabel("Distance")
+            ax.set_ylabel("Count")
+            ax.axvline(
+                float(np.median(dists)), color="red", linestyle="--", linewidth=1,
+                label=f"med = {np.median(dists):.4f}",
+            )
+            ax.legend(fontsize=8)
+
+        # Hide unused subplots.
+        for idx in range(n_k, n_rows * n_cols):
+            axes[idx // n_cols][idx % n_cols].set_visible(False)
+
+        fig.suptitle(
+            f"BoCSoR counterfactual distance distributions{suffix}",
+            fontsize=14, fontweight="bold",
+        )
+        fig.tight_layout(rect=[0, 0, 1, 0.96])
+
+        path = output_dir / f"bocsor_distance_histograms_all_k{suffix}.png"
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        logger.info("Combined distance histograms -> %s", path.name)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1394,6 +1734,7 @@ def _write_summary(
     percentile_th: float,
     summary_data: list[dict],
     total_elapsed: float,
+    classifier: str,
     cb_iterations: int,
     cb_lr: float,
     cb_depth: int,
@@ -1429,7 +1770,7 @@ def _write_summary(
     a("")
 
     # ── Classifier ────────────────────────────────────────────────────────────
-    a("## CatBoost Classifier")
+    a(f"## {classifier.capitalize()} Classifier")
     a("")
     a(f"| | |")
     a(f"|---|---|")

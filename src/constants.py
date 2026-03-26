@@ -13,6 +13,8 @@ Shared constants for the ACS Income pipeline:
 
 from __future__ import annotations
 
+import bisect
+
 # ─────────────────────────────────────────────────────────────
 # Predefined state groups
 #
@@ -93,8 +95,9 @@ INCOME_FEATURES: list[str] = [
     "RAC1P",  # Race (also used as the sensitive-attribute group)
 ]
 
-# Feature columns retained in the final output CSV by default.
-# Pass --columns ALL to keep every feature, or supply a custom list.
+# Legacy column subset — no longer the pipeline default.
+# The pipeline now retains ALL feature columns by default.
+# Pass --columns COW SCHL WKHP to use this subset explicitly.
 DEFAULT_COLUMNS: list[str] = ["COW", "SCHL", "WKHP"]
 
 # ─────────────────────────────────────────────────────────────
@@ -485,7 +488,6 @@ def occp_to_major_group(code: int) -> str:
         BLS major-group label (e.g. "Management", "Healthcare-Practitioners-
         And-Technical"), or OCCP_FALLBACK for code 0 and unmapped codes.
     """
-    import bisect
     if code <= 0:
         return OCCP_FALLBACK
     idx = bisect.bisect_right(_OCCP_LOWER_BOUNDS, code) - 1

@@ -63,12 +63,11 @@ from src.constants import (       # noqa: E402
     USA_STATES,
     STATE_GROUPS,
     INCOME_FEATURES,
-    DEFAULT_COLUMNS,
     NATIONAL_THRESHOLD,
     GROUP_THRESHOLDS,
     STATE_THRESHOLDS,
 )
-from src.create_dataset import create_dataset  # noqa: E402
+from src.create_dataset import create_dataset, build_dataset_stem  # noqa: E402
 from src.macroscopic_data_mining import (      # noqa: E402
     run_macroscopic_mining,
     add_arm_arguments,
@@ -159,8 +158,8 @@ def resolve_columns(raw: list[str] | None) -> list[str] | None:
 
     Mapping
     ───────
-    None      → DEFAULT_COLUMNS  (COW, SCHL, WKHP)
-    ["ALL"]   → None  (retain all feature columns)
+    None      → None  (retain all feature columns — default)
+    ["ALL"]   → None  (explicit alias for all feature columns)
     list      → validated against INCOME_FEATURES
 
     Raises
@@ -168,9 +167,7 @@ def resolve_columns(raw: list[str] | None) -> list[str] | None:
     ValueError
         If any supplied column name is not in INCOME_FEATURES.
     """
-    if raw is None:
-        return list(DEFAULT_COLUMNS)
-    if raw == ["ALL"]:
+    if raw is None or raw == ["ALL"]:
         return None
 
     valid   = set(INCOME_FEATURES)
@@ -322,13 +319,13 @@ def _run_feature_importance(
                            Passed to expand_k(): single value K is auto-expanded
                            to all odd integers 1..K; multiple values used as-is.
     percentile           : Percentile threshold for boundary instance selection.
-    cb_iterations        : Boosting rounds (shared by CatBoost and LightGBM).
-    cb_lr                : Learning rate (shared by CatBoost and LightGBM).
-    cb_depth             : Tree depth (shared by CatBoost and LightGBM).
+    cb_iterations        : Boosting rounds / training epochs.
+    cb_lr                : Learning rate.
+    cb_depth             : Tree depth / hidden layer size exponent.
     cb_verbose           : Whether the classifier prints training progress.
     cb_early_stopping    : Stop training if validation loss does not improve
                            for this many rounds (0 = disabled).
-    classifier           : "catboost" or "lightgbm".
+    classifier           : "catboost" or "mlp".
     random_seed          : Random seed for the classifier.
     log_level            : Logging level string (e.g. "INFO").
     """
@@ -336,9 +333,11 @@ def _run_feature_importance(
     from src.feature_importance import (
         load_split_data,
         build_rank_maps,
+        build_nominal_maps,
         train_model,
         run_bocsor_multi_k,
         expand_k,
+        plot_distance_histograms,
         _compute_default_workers,
     )
 
@@ -364,13 +363,15 @@ def _run_feature_importance(
     logger.info("Target: %s  |  Features: %s", target_col, feature_cols)
 
     logger.info("Building rank maps from training data …")
-    rank_maps = build_rank_maps(X_train)
+    rank_maps    = build_rank_maps(X_train[feature_cols])
+    nominal_maps = build_nominal_maps(X_train[feature_cols])
 
     model = train_model(
         classifier=classifier,
         X_train=X_train,
         y_train=y_train,
         rank_maps=rank_maps,
+        nominal_maps=nominal_maps,
         feature_cols=feature_cols,
         random_seed=random_seed,
         iterations=cb_iterations,
@@ -452,6 +453,11 @@ def _run_feature_importance(
         distances_df.to_csv(dist_path, index=False)
         logger.info("Distances -> %s  (%d rows)", dist_path, len(distances_df))
 
+        # ── Distance histograms ───────────────────────────────────────────
+        plot_distance_histograms(
+            distances_df, output_dir, suffix=suffix,
+        )
+
         logger.info("Feature importance summary (class %d):", orig_cls)
         for k_col in importance_df.columns:
             top = importance_df[k_col].sort_values(ascending=False)
@@ -483,7 +489,8 @@ Predefined state groups:
 
 Available feature columns (--columns):
   {cols_str}
-  or: ALL  (retain every feature column)
+  Default: ALL (every feature column retained).
+  Pass specific names to use a subset (e.g. --columns COW SCHL WKHP).
 
 The pipeline always runs all four stages.  If the stage-1 CSV files already
 exist they are loaded directly (no download).  If the stage-2 output files
@@ -491,11 +498,11 @@ already exist that class is skipped.  Stage-3 and stage-4 outputs are also
 skipped if they already exist.  Re-runs are therefore always safe.
 
 Examples:
-  # Full pipeline — dataset + BoCSoR
+  # Full pipeline — all columns (default), threshold auto-selected
   python -m src.main --states northeast --years 2024
 
-  # Custom BoCSoR settings
-  python -m src.main --states CA NY TX --columns ALL \\
+  # Use only a subset of columns
+  python -m src.main --states CA NY TX --columns COW SCHL WKHP \\
                       --k 11 --percentile 20
 
   # Multiple years
@@ -549,8 +556,8 @@ Examples:
         "--columns", nargs="+", default=None, metavar="COL",
         help=(
             f"Feature columns to retain in the output CSV.  "
-            f"Default: {DEFAULT_COLUMNS}.  "
-            f"Pass ALL to keep every feature column."
+            f"Default: ALL (every feature column).  "
+            f"Pass specific names to filter (e.g. --columns COW SCHL WKHP)."
         ),
     )
 
@@ -600,30 +607,31 @@ Examples:
         ),
     )
     boc.add_argument(
-        "--classifier", choices=["catboost", "lightgbm"], default="catboost",
+        "--classifier", choices=["catboost", "mlp"], default="catboost",
         help=(
-            "Gradient boosting classifier for stage 2.  "
+            "Classifier for stage 2.  "
             "'catboost' (default) accepts raw string categoricals natively.  "
-            "'lightgbm' uses leaf-wise growth and typically produces finer-grained "
-            "decision boundaries, increasing counterfactual yield at small k.  "
+            "'mlp' (Multi-Layer Perceptron) provides a fundamentally different "
+            "decision boundary geometry, useful for verifying model-agnosticity.  "
             "Default: catboost."
         ),
     )
 
-    # ── CatBoost / LightGBM hyperparameters (stage 2) ─────────────────────────
-    cb = parser.add_argument_group("Classifier hyperparameters  (stage 2 — shared by CatBoost and LightGBM)")
+    # ── CatBoost / MLP hyperparameters (stage 2) ─────────────────────────────
+    cb = parser.add_argument_group("Classifier hyperparameters  (stage 2 — shared by CatBoost and MLP)")
     cb.add_argument("--cb-iterations", type=int,   default=500,  metavar="N",
-                    help="Boosting rounds.  Default: 500.")
+                    help="Boosting rounds / training epochs.  Default: 500.")
     cb.add_argument("--cb-lr",         type=float, default=0.05, metavar="LR",
                     help="Learning rate.  Default: 0.05.")
     cb.add_argument("--cb-depth",      type=int,   default=6,    metavar="D",
-                    help="Tree depth.  Default: 6.")
+                    help="Tree depth / hidden layer size exponent.  Default: 6.")
     cb.add_argument("--cb-early-stopping", type=int, default=0, metavar="N",
                     help=(
                         "Stop training if the loss does not improve for N consecutive "
                         "rounds (early stopping).  0 disables early stopping.  "
                         "When enabled, 20%% of the training set is used as an internal "
-                        "validation split.  Default: 0 (disabled)."
+                        "validation split (CatBoost) or 10%% (MLP).  "
+                        "Default: 0 (disabled)."
                     ))
     cb.add_argument("--cb-verbose",    action="store_true",
                     help="Print CatBoost training progress.")
@@ -673,43 +681,23 @@ def _infer_split_paths(
     """
     Reconstruct the train/test file paths that create_dataset writes.
 
-    Mirrors the naming convention in create_dataset.py (step 8):
-
-        {prefix}_{year}_{states_tag}_{horizon_tag}_{survey}_thr{threshold}_cols{cols_tag}.csv
-
-    When states_label is provided it is used in place of the sorted
-    state codes (e.g. 'northeast' instead of 'CT_MA_ME_NH_NJ_NY_PA_RI_VT').
+    Uses build_dataset_stem() from create_dataset.py as single source of
+    truth for the filename convention, ensuring consistency.
 
     Examples
     --------
         train_2024_NY_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv
         train_2024_northeast_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv
         test_2024_ALL_1Y_person_thr75000_colsALL.csv
-
-    Parameters
-    ----------
-    data_dir     : Root output directory passed to create_dataset.
-    year         : Survey year.
-    states       : Expanded state codes, or None for all states.
-    threshold    : Income threshold.
-    horizon      : Survey horizon ("1-Year" or "5-Year").
-    survey       : Survey unit ("person" or "household").
-    keep_columns : Feature columns retained (None means ALL).
-    states_label : Group name to use in the filename instead of state codes.
     """
-    if states_label is not None:
-        states_tag = states_label
-    elif states is None:
-        states_tag = "ALL"
-    else:
-        states_tag = "_".join(sorted(states))
-    horizon_tag = horizon.replace("-", "").replace("Year", "Y")   # "1-Year" -> "1Y"
-    cols_tag    = "-".join(sorted(keep_columns)) if keep_columns else "ALL"
-    stem = (
-        f"{year}_{states_tag}"
-        f"_{horizon_tag}_{survey}"
-        f"_thr{int(threshold)}"
-        f"_cols{cols_tag}"
+    stem = build_dataset_stem(
+        survey_year=year,
+        states=states,
+        horizon=horizon,
+        survey=survey,
+        threshold=threshold,
+        keep_columns=keep_columns,
+        states_label=states_label,
     )
     return data_dir / f"train_{stem}.csv", data_dir / f"test_{stem}.csv"
 
@@ -720,17 +708,18 @@ def _build_output_dir(
     raw_states_arg: list[str],
     years: list[int],
     keep_columns: list[str] | None,
+    threshold: float,
     percentile: float,
     classifier: str = "catboost",
 ) -> Path:
     """
     Build the stage-2 output directory path, embedding the state scope,
-    year range, feature columns, percentile and classifier name so that
-    results from different configurations never overwrite each other.
+    year range, feature columns, threshold, percentile and classifier name
+    so that results from different configurations never overwrite each other.
 
     Directory structure
     -------------------
-        <base_dir>/<states_tag>/<years_tag>/cols<cols_tag>/pct<N>/<classifier>/
+        <base_dir>/<states_tag>/<years_tag>/cols<cols_tag>/thr<N>/pct<N>/<classifier>/
 
     <states_tag> rules
     ------------------
@@ -749,19 +738,23 @@ def _build_output_dir(
     - keep_columns list → columns sorted and joined by "-" (e.g. "COW-SCHL-WKHP").
     - None (all columns) → "ALL".
 
+    <thr_tag> rules
+    ---------------
+    - Threshold as integer (e.g. 94200 → "thr94200").
+
     <pct_tag> rules
     ---------------
     - Percentile value as integer (e.g. 20 → "pct20").
 
     <classifier>
     ------------
-    - Classifier name as-is (e.g. "catboost" or "lightgbm").
+    - Classifier name as-is (e.g. "catboost" or "mlp").
 
     Examples
     --------
-        results/northeast/2024/colsCOW-SCHL-WKHP/pct20/catboost/
-        results/ALL/2021-2024/colsCOW-OCCP-SCHL-WKHP/pct10/lightgbm/
-        results/CA_NY_TX/2024/colsALL/pct20/catboost/
+        results/northeast/2024/colsCOW-SCHL-WKHP/thr94200/pct20/catboost/
+        results/ALL/2021-2024/colsCOW-OCCP-SCHL-WKHP/thr50000/pct10/mlp/
+        results/CA_NY_TX/2024/colsALL/thr100000/pct20/catboost/
     """
     # ── States tag ────────────────────────────────────────────────────────────
     if raw_states_arg == ["ALL"] or states is None:
@@ -786,10 +779,13 @@ def _build_output_dir(
     # ── Columns tag ───────────────────────────────────────────────────────────
     cols_tag = "-".join(sorted(keep_columns)) if keep_columns else "ALL"
 
+    # ── Threshold tag ─────────────────────────────────────────────────────────
+    thr_tag = f"thr{int(threshold)}"
+
     # ── Percentile tag ────────────────────────────────────────────────────────
     pct_tag = f"pct{int(percentile)}"
 
-    return base_dir / states_tag / years_tag / f"cols{cols_tag}" / pct_tag / classifier
+    return base_dir / states_tag / years_tag / f"cols{cols_tag}" / thr_tag / pct_tag / classifier
 
 
 def _resolve_states_label(raw_states_arg: list[str]) -> str | None:
@@ -855,7 +851,7 @@ def main() -> None:
     n_states = len(states) if states else len(USA_STATES)
     xai_output_dir = _build_output_dir(
         args.output_dir, states, args.states, args.years,
-        keep_columns, args.percentile, args.classifier,
+        keep_columns, threshold, args.percentile, args.classifier,
     )
     logger.info("═" * 62)
     logger.info("  ACS INCOME PIPELINE")

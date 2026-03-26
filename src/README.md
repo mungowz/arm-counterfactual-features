@@ -24,7 +24,7 @@ project/
 │   ├── __init__.py
 │   ├── constants.py                # State groups, feature set, bin configs, code maps, OCCP ranges
 │   ├── create_dataset.py           # Stage 1: download → encode → split → save
-│   ├── feature_importance.py       # Stage 2: BoCSoR XAI (rank encoding, CatBoost/LightGBM, itemsets)
+│   ├── feature_importance.py       # Stage 2: BoCSoR XAI (hybrid encoding, CatBoost/MLP, itemsets)
 │   ├── macroscopic_data_mining.py  # Stage 3: FP-Growth ARM on macroscopic feature labels
 │   ├── microscopic_data_mining.py  # Stage 4: FP-Growth ARM on full LABEL=value tokens
 │   └── main.py                     # CLI entry point — orchestrates all four stages
@@ -43,7 +43,6 @@ pandas
 numpy
 scikit-learn
 catboost
-lightgbm
 mlxtend
 matplotlib
 seaborn
@@ -52,7 +51,7 @@ seaborn
 Install with:
 
 ```bash
-pip install folktables pandas numpy scikit-learn catboost lightgbm mlxtend matplotlib seaborn
+pip install folktables pandas numpy scikit-learn catboost mlxtend matplotlib seaborn
 ```
 
 ---
@@ -60,14 +59,17 @@ pip install folktables pandas numpy scikit-learn catboost lightgbm mlxtend matpl
 ## Quick start
 
 ```bash
-# Single state — threshold auto-selected ($94,400 for NY)
+# Single state — threshold auto-selected ($94,400 for NY), all columns
 python -m src.main --states NY --years 2024
 
 # Group — threshold auto-selected ($100,700 for northeast)
 python -m src.main --states northeast --years 2024
 
-# Custom BoCSoR settings
-python -m src.main --states CA NY TX --columns ALL --k 11 --percentile 20
+# Custom BoCSoR settings (all columns is already the default)
+python -m src.main --states CA NY TX --k 11 --percentile 20
+
+# Use only a subset of columns
+python -m src.main --states NY --years 2024 --columns COW SCHL WKHP
 
 # Override the auto-selected threshold explicitly
 python -m src.main --states NY --years 2024 --threshold 109500
@@ -123,9 +125,9 @@ with different configurations never overwrite each other:
 Every run always produces all three files together:
 
 ```
-dataset_2024_NY_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv
-train_2024_NY_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv
-test_2024_NY_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv
+dataset_2024_NY_1Y_person_thr100000_colsALL.csv
+train_2024_NY_1Y_person_thr100000_colsALL.csv
+test_2024_NY_1Y_person_thr100000_colsALL.csv
 ```
 
 When `--states` is a group/region/division name the group name is used
@@ -147,38 +149,44 @@ The train/test split is **fixed at 80/20**, stratified on the binary target colu
 ### Stage 2
 
 All stage-2 outputs land in a subdirectory of `--output-dir` (default
-`results/`) that encodes the **state scope** and the **year range**:
+`results/`) that encodes the **state scope**, **year range**, **columns**,
+**threshold**, **percentile**, and **classifier** so that different
+configurations never overwrite each other:
 
 ```
-<output-dir>/<states_tag>/<years_tag>/cols<cols_tag>/pct<N>/
+<output-dir>/<states_tag>/<years_tag>/cols<cols_tag>/thr<N>/pct<N>/<classifier>/
 ```
 
 | Scenario | Example path |
 |---|---|
-| `--states northeast --years 2024` | `results/northeast/2024/colsCOW-SCHL-WKHP/pct20/catboost/` |
-| `--states northeast --years 2024 --columns COW OCCP SCHL WKHP` | `results/northeast/2024/colsCOW-OCCP-SCHL-WKHP/pct20/catboost/` |
-| `--states northeast --years 2024 --percentile 10` | `results/northeast/2024/colsCOW-SCHL-WKHP/pct10/catboost/` |
-| `--states northeast --years 2024 --classifier lightgbm` | `results/northeast/2024/colsCOW-SCHL-WKHP/pct20/lightgbm/` |
-| `--states ALL --years 2021 2022 2023 2024` | `results/ALL/2021-2024/colsCOW-SCHL-WKHP/pct20/catboost/<year>/` |
-| `--states midwest --years 2021 2023 --columns ALL` | `results/midwest/2021_2023/colsALL/pct20/catboost/` |
+| `--states northeast --years 2024` | `results/northeast/2024/colsALL/thr100700/pct20/catboost/` |
+| `--states northeast --years 2024 --columns COW OCCP SCHL WKHP` | `results/northeast/2024/colsCOW-OCCP-SCHL-WKHP/thr100700/pct20/catboost/` |
+| `--states northeast --years 2024 --percentile 10` | `results/northeast/2024/colsALL/thr100700/pct10/catboost/` |
+| `--states northeast --years 2024 --classifier mlp` | `results/northeast/2024/colsALL/thr100700/pct20/mlp/` |
+| `--states ALL --years 2021 2022 2023 2024` | `results/ALL/2021-2024/colsALL/thr94200/pct20/catboost/<year>/` |
+| `--states midwest --years 2021 2023 --columns COW SCHL WKHP` | `results/midwest/2021_2023/colsCOW-SCHL-WKHP/thr91100/pct20/catboost/` |
+| `--states NY --threshold 50000` | `results/NY/2024/colsALL/thr50000/pct20/catboost/` |
 
 Years tag rules: single year → the year itself; contiguous range →
 `<first>-<last>`; non-contiguous → years joined by `_`.
 Columns tag: feature columns sorted and joined by `-`, prefixed with `cols`
-(e.g. `colsCOW-SCHL-WKHP`, `colsALL` for all columns).
+(e.g. `colsCOW-SCHL-WKHP` when using `--columns COW SCHL WKHP`, or `colsALL`
+when using the default — all columns).
+Threshold tag: income threshold as integer, prefixed with `thr`
+(e.g. `thr94200`, `thr50000`).
 Percentile tag: boundary selection percentile as integer, prefixed with `pct`
-(e.g. `pct20`, `pct10`).  Together these two tags ensure that runs with any
-combination of `--columns` and `--percentile` on the same states and year
-never overwrite each other.
+(e.g. `pct20`, `pct10`).  Together these tags ensure that runs with any
+combination of `--columns`, `--threshold`, and `--percentile` on the same
+states and year never overwrite each other.
 When multiple years are processed, each year also gets its own
-sub-directory inside the cols/pct folder: `results/ALL/2021-2024/colsCOW-SCHL-WKHP/pct20/2022/`.
+sub-directory inside the cols/thr/pct folder: `results/ALL/2021-2024/colsALL/thr94200/pct20/catboost/2022/`.
 
 | File | Description |
 |---|---|
 | `feature_importance.csv` | BoCSoR importance scores. Rows: features. Columns: `feature`, `k_1`, `k_3`, …, `k_N`. |
 | `feature_importance_itemsets.csv` | All k values merged. Columns: `k_value`, `instance_index`, `features`, `itemset`. One row per boundary instance per k. |
 | `feature_importance_itemsets_k<N>.csv` | Same format, one file per k value (e.g. `_k1.csv`, `_k3.csv`, …). |
-| `bocsor_distances.csv` | One row per `(boundary_instance, k_neighbour)` pair. Columns: `k_value`, `instance_index`, `cf_index`, `k_neighbour_rank` (1 = closest), `distance` (normalised Manhattan in [0, 2]). |
+| `bocsor_distances.csv` | One row per `(boundary_instance, k_neighbour)` pair. Columns: `k_value`, `instance_index`, `cf_index`, `k_neighbour_rank` (1 = closest), `distance` (normalised Manhattan in [0, 2]).  Sorted by `k_value`, `instance_index`, `k_neighbour_rank` (ascending) so that within each instance the nearest counterfactual comes first. |
 | `bocsor_summary.md` | Human-readable run summary with importance tables, stability notes, and timing. |
 | `arm_rules.csv` | All unique association rules surviving the grid search (support, confidence, lift, lift filter). |
 | `arm_grid_summary.csv` | Grid search summary: one row per `(min_support, min_confidence)` cell with the rule count. |
@@ -279,7 +287,7 @@ further cuts the number of boundary instances to process.
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `--columns` | str (one or more) | `COW SCHL WKHP` | Feature columns to retain. Pass `ALL` to keep every feature. |
+| `--columns` | str (one or more) | `ALL` | Feature columns to retain. Default: all feature columns. Pass specific names to filter (e.g. `--columns COW SCHL WKHP`). |
 
 ### Train / test split *(stage 1)*
 
@@ -296,16 +304,16 @@ target.  Use `--seed` to control reproducibility.
 |---|---|---|---|
 | `--k` | int (one or more) | `11` | Neighbourhood size(s). A single value K is auto-expanded to all odd integers 1…K (e.g. `--k 11` → 1 3 5 7 9 11). Multiple values used as-is (e.g. `--k 1 5 11`). |
 | `--percentile` | float | `20.0` | Percentile threshold for boundary instance selection (0–100). |
-| `--classifier` | choice | `catboost` | Gradient boosting classifier. `catboost` accepts raw string categoricals natively. `lightgbm` uses leaf-wise growth and typically produces finer-grained decision boundaries, increasing counterfactual yield at small k. |
+| `--classifier` | choice | `catboost` | Classifier. `catboost` accepts raw string categoricals natively. `mlp` (Multi-Layer Perceptron) provides a fundamentally different decision boundary geometry, useful for verifying model-agnosticity. |
 
-### Classifier hyperparameters *(stage 2 — shared by CatBoost and LightGBM)*
+### Classifier hyperparameters *(stage 2 — shared by CatBoost and MLP)*
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `--cb-iterations` | int | `500` | Boosting rounds (epochs). |
+| `--cb-iterations` | int | `500` | Boosting rounds / training epochs. |
 | `--cb-lr` | float | `0.05` | Learning rate. |
-| `--cb-depth` | int | `6` | Tree depth (`max_depth` for LightGBM; `num_leaves` is set to `2^depth − 1`). |
-| `--cb-early-stopping` | int | `0` | Stop if eval loss does not improve for N rounds. `0` = disabled. When enabled, 20% of training data is held out as validation. |
+| `--cb-depth` | int | `6` | Tree depth (CatBoost) / hidden layer size exponent (MLP: two layers of width `2^depth`). |
+| `--cb-early-stopping` | int | `0` | Stop if eval loss does not improve for N rounds. `0` = disabled. When enabled, 20% of training data is held out as validation (CatBoost) or 10% (MLP). |
 | `--cb-verbose` | flag | off | Print training progress. |
 
 ### Input / output
@@ -488,10 +496,11 @@ negative-correlation rules (lift < `arm_lift_low`) are retained.
   value; results are reused for all confidence values at that support level.
 - **Adaptive rule generation strategy** — the implementation is chosen at
   runtime by probing the actual rule count at the lowest support threshold:
-  with few columns (e.g. 3) `association_rules()` is called once per support
-  level and per-cell filtering is a vectorised numpy mask (thread overhead
-  would dominate); with many columns (e.g. `--columns ALL`) rule generation
-  is expensive and a `ThreadPoolExecutor` evaluates grid cells concurrently.
+  with few columns (e.g. `--columns COW SCHL WKHP`) `association_rules()` is
+  called once per support level and per-cell filtering is a vectorised numpy
+  mask (thread overhead would dominate); with many columns (the default — all
+  10 features) rule generation is expensive and a `ThreadPoolExecutor`
+  evaluates grid cells concurrently.
   The crossover threshold is 500 rules per support level.
 - **Vectorised deduplication** — rules are deduplicated via serialised frozenset
   keys and `drop_duplicates()`, replacing row-level loops.
@@ -817,21 +826,49 @@ The binary **target column** is always appended: `income_over_<threshold>`.
 Stage 2 implements the **Boundary Crossing Solo Ratio (BoCSoR)** algorithm
 (Alfeo et al., 2023) adapted for fully-categorical data.
 
-### Algorithm
+### How the original paper uses data
 
-BoCSoR explains *which features matter most* for instances that sit close to
-the classifier's decision boundary.  The analysis runs on the **training set**
-— the classifier has full knowledge of training instances, making their
-boundary behaviour the most informative signal.
+The paper states that BoCSoR operates on the training set.  In practice the
+training set serves as the **starting pool** — the actual counterfactuals used
+for feature importance are **synthetic**:
+
+1. Boundary instances are selected from the training set (percentile filter
+   on inter-class distance) — these are real training rows.
+2. For each boundary instance, k nearest neighbours of the opposite class are
+   retrieved from the training set — also real.
+3. Intermediate points are generated via `np.linspace` between the boundary
+   instance and each neighbour — these are **synthetic**, not in any dataset.
+4. The first synthetic midpoint classified as the opposite class becomes the
+   `closestCF` — a **synthetic** point near the decision boundary.
+5. Feature substitution on `closestCF` creates yet another **synthetic**
+   instance, on which `model.predict()` is called — the model is probed on
+   an instance it has never seen during training.
+
+The model is therefore queried on synthetic, unseen instances to explore its
+decision surface.  This is functionally equivalent to probing with test data,
+except the probe points are constructed strategically near the boundary rather
+than sampled randomly.
+
+### Categorical adaptation
+
+With fully-categorical data, interpolation is not meaningful — there is no
+continuous path between `"Bachelors-Degree"` and `"Doctorate-Degree"`.  Our
+adaptation preserves the spirit of the algorithm:
 
 For each boundary instance:
 
-1. Find the k nearest neighbours from the opposite class in rank-encoded
-   Manhattan space (**Algorithm 1** — no interpolation, categorical data).
+1. Find the k nearest neighbours from the opposite class in hybrid-encoded
+   Manhattan space (**adapted Algorithm 1**).  With all 10 feature columns
+   (the default), cross-class collisions (distance = 0) are extremely rare.
+   When they occur, the relevance check naturally skips them (no differing
+   features to substitute).
 2. For each counterfactual, substitute each differing feature value back to
    the original instance's value one at a time; if the model prediction flips
    back to the original class, that feature is **relevant** (**Algorithm 2**).
    Each feature is tested independently (restored before the next is tested).
+   The modified counterfactual is a **synthetic instance** that likely does
+   not exist in the training set — the model is probed on unseen data, just
+   as in the original paper.
 3. Take the **union** of relevant features across all k counterfactuals and
    record one itemset row for this boundary instance.
 
@@ -843,26 +880,33 @@ BoCSoR(feature_i) = count of boundary instances where feature_i is relevant
                   ÷ n_boundary_instances_with_counterfactual
 ```
 
-### Rank-based encoding
+### Hybrid distance encoding
 
-All features are categorical, so Manhattan distance is computed on
-**rank-encoded** representations:
+All features are categorical.  Manhattan distance is computed on a
+**hybrid-encoded** representation that makes ordinal and nominal columns
+commensurable — each column contributes values in [0, 1]:
 
-- **Ordinal columns** (`AGEP`, `SCHL`, `WKHP`) — ranks follow the declared
-  semantic order (e.g. `Young=1` < `Young-Adult=2` < … < `Retirement-Age=6`).
-- **All other columns** — ranks assigned in **lexicographic (alphabetical)
-  order**. This is consistent but carries no semantic meaning for nominal
-  features — it only provides unique integers for distance computation.
+- **Ordinal columns** (`AGEP`, `SCHL`, `WKHP`) — rank-based encoding
+  normalised per-column with **min-max** to [0, 1].  Ranks follow the
+  declared semantic order (e.g. `Young=1` < `Young-Adult=2` < … <
+  `Retirement-Age=6`).  Unknown values fall back to 0.5 (mid-range neutral).
 
-Rank maps are built **from the training set only** to prevent data leakage.
+- **Nominal columns** (all others) — **one-hot encoding**, with each bit
+  divided by 2 (values in {0.0, 0.5}).  Within a single nominal column, two
+  samples either share the same category (Manhattan distance = 0) or differ
+  (distance = 2 × (0.5 + 0.5) = 1.0 after the /2 normalisation).  This
+  ensures nominal columns also contribute values in [0, 1] per column,
+  identical to ordinal columns.
+
+Encoding maps are built **from the training set only** to prevent data leakage.
 
 Distance formula:
 
 ```
-dist(a, b) = 2 × Σ|rank_i(a) − rank_i(b)| / Σ max_rank_i
+dist(a, b) = 2 × Σ_i d_i(a, b) / n_cols
 ```
 
-Result is in [0, 2].
+where `d_i ∈ [0, 1]` for every column `i`.  Result is in [0, 2].
 
 ### Multi-k evaluation
 
@@ -882,6 +926,9 @@ importance ranking is as the counterfactual search becomes broader.
 
 ### Performance optimisations
 
+- **Vectorised hybrid encoding**: ordinal columns use pre-normalised dict
+  lookup via `pd.Series.map(dict)` (C-optimised in pandas) instead of a
+  per-row Python lambda.  Nominal columns use numpy boolean vectorisation.
 - **BallTree boundary selection**: O(N log N) instead of O(N²) pairwise
   matrix.  Built once on the cf-class instances, reused for all k values.
   For 650K rows this reduces boundary selection from ~8 min to ~2 min.
@@ -894,7 +941,7 @@ importance ranking is as the counterfactual search becomes broader.
 - **Parallel processing**: boundary instances are split into chunks and
   processed with `ProcessPoolExecutor` using `fork` start method, so workers
   inherit the loaded model, encoded arrays, and BallTree without reimporting.
-- **Classifier thread control**: each worker uses `thread_count=1` (CatBoost) or `num_threads=1` (LightGBM via `predict()`) to avoid competing internal thread pools.
+- **Classifier thread control**: each worker uses `thread_count=1` (CatBoost) to avoid competing internal thread pools. The MLP wrapper silently drops this keyword argument.
 - **Worker auto-detection**: `max(1, min(14, cpu_count - 2))` — reserves
   2 logical CPUs for the OS and the main process, caps at 14 to avoid
   diminishing returns from the classifier's internal thread pools.  The same
@@ -903,11 +950,11 @@ importance ranking is as the counterfactual search becomes broader.
 
 ### Classifier
 
-Two gradient boosting classifiers are available via `--classifier`:
+Two classifiers are available via `--classifier`:
 
 **CatBoost** (default) accepts raw string-valued categorical columns with no manual encoding, handles high-cardinality columns (`OCCP`, `POBP`) robustly via ordered target statistics, and achieves state-of-the-art accuracy on tabular categorical data (Alfeo et al., 2023).
 
-**LightGBM** uses leaf-wise tree growth instead of depth-wise, which typically produces finer-grained decision boundaries. This increases the number of boundary instances that yield relevant counterfactuals — particularly at small k values, where CatBoost's flatter boundary can result in zero counterfactual yield. LightGBM requires integer-encoded inputs; the pipeline reuses the rank maps already computed for the Manhattan distance calculation, so no additional preprocessing is needed. The `--cb-depth` and `--cb-iterations` flags apply to both classifiers; `--cb-depth` maps to `max_depth` for LightGBM with `num_leaves = 2^depth − 1`.
+**MLP** (Multi-Layer Perceptron, via sklearn `MLPClassifier`) provides a fundamentally different decision boundary geometry compared to tree-based classifiers — smooth non-linear surfaces vs. axis-aligned splits — making it an ideal complement to CatBoost for verifying that BoCSoR results are model-agnostic. MLP requires numeric inputs; categorical features are integer-encoded (ordinal columns use their semantic rank, nominal columns use lexicographic rank) and standardised (zero-mean, unit-variance). The `--cb-depth` parameter maps to two hidden layers of width `2^depth` (e.g. `--cb-depth 6` → `(64, 64)`); `--cb-iterations` maps to `max_iter`.
 
 The choice of classifier does not affect the BoCSoR algorithm itself — only the decision boundary being explored changes. Both classifiers work only on correctly classified instances, consistent with the original BoCSoR approach.
 
@@ -925,17 +972,20 @@ which renames `RELSHIPP → RELP` on the raw DataFrame when necessary.
 
 `OCCP` codes are contiguous integer blocks aligned with SOC major groups.
 The mapping uses `(lower, upper, label)` tuples — more concise and complete
-than enumerating every individual code.
+than enumerating every individual code.  Categorisation is vectorised via
+`np.searchsorted` + fancy indexing (~10× faster than per-row Python lookups
+on 1M+ rows).
 
 ### Parallelisation
 
 | Level | Mechanism | Rationale |
 |---|---|---|
 | Per-state download | `ThreadPoolExecutor` | I/O-bound. |
-| Column categorisation | `ThreadPoolExecutor` | Independent per-column transforms. |
-| CSV write (split) | 2 threads | Train and test written concurrently. |
-| Multi-year execution | `ProcessPoolExecutor` | CPU-bound, bypasses GIL. |
-| BoCSoR boundary chunks | `ProcessPoolExecutor` (fork) | CPU-bound, inherits model via fork. |
+| Column categorisation | `ThreadPoolExecutor` | Independent per-column transforms; NumPy ops release GIL. |
+| CSV write (split) | 3 threads | Dataset, train and test written concurrently. |
+| Multi-year stage 1 | `ProcessPoolExecutor` | CPU-bound, bypasses GIL. |
+| BoCSoR boundary chunks | `ProcessPoolExecutor` (fork) | CPU-bound, inherits model/BallTree via fork. |
+| ARM grid search | `ThreadPoolExecutor` (adaptive) | Only activated when rule volume exceeds 500/support level. |
 
 ---
 

@@ -58,8 +58,6 @@ from src.constants import (
     POBP_MAP, RELP_MAP, SEX_MAP, RAC1P_MAP,
     COLUMN_FALLBACKS,
     INCOME_FEATURES,
-    DEFAULT_COLUMNS,
-    occp_to_major_group,
     OCCP_FALLBACK,
     OCCP_MAJOR_GROUP_RANGES,
 )
@@ -247,7 +245,7 @@ def build_acs_income_task(threshold: float) -> folktables.BasicProblem:
 
 def _bin_column(series: pd.Series, bins: list, labels: list[str]) -> pd.Categorical:
     """Bin a continuous Series into ordered categorical bands."""
-    return pd.cut(series, bins=bins, labels=labels, right=True)
+    return pd.cut(series, bins=bins, labels=labels, right=True, include_lowest=True)
 
 
 def _map_column(
@@ -271,9 +269,8 @@ def _categorize_occp(series: pd.Series) -> pd.Categorical:
     """
     Map ACS PUMS OCCP codes to BLS OEWS major-group labels.
 
-    Uses range-based lookup via occp_to_major_group() rather than a
-    dictionary map, because OCCP codes are contiguous numeric ranges
-    rather than a sparse set of individual keys.
+    Uses vectorised np.searchsorted on the pre-computed lower-bound array
+    instead of a per-row Python function call — ~10× faster on 1M+ rows.
 
     Parameters
     ----------
@@ -283,9 +280,34 @@ def _categorize_occp(series: pd.Series) -> pd.Categorical:
     -------
     pd.Categorical with the 23 BLS major-group labels as categories.
     """
-    labels = series.astype(int).map(occp_to_major_group)
-    all_categories = sorted({label for *_, label in OCCP_MAJOR_GROUP_RANGES} | {OCCP_FALLBACK})
-    return pd.Categorical(labels, categories=all_categories)
+    codes = series.to_numpy(dtype=np.int64)
+
+    # Vectorised range lookup: for each code, find the candidate range
+    # index via searchsorted, then verify the code falls within the
+    # upper bound of that range.
+    lower_bounds = np.array([lo for lo, _, _ in OCCP_MAJOR_GROUP_RANGES], dtype=np.int64)
+    upper_bounds = np.array([hi for _, hi, _ in OCCP_MAJOR_GROUP_RANGES], dtype=np.int64)
+    range_labels = [lbl for _, _, lbl in OCCP_MAJOR_GROUP_RANGES]
+
+    # searchsorted with side='right' gives the insertion point; subtract 1
+    # to get the index of the range whose lower bound is <= code.
+    idx = np.searchsorted(lower_bounds, codes, side="right") - 1
+
+    # Vectorised label assignment via fancy indexing (no Python loop).
+    # Build a label lookup with OCCP_FALLBACK at position -1 and len(ranges).
+    label_lookup = np.array(range_labels + [OCCP_FALLBACK], dtype=object)
+    # Codes outside any range → fallback (last position in label_lookup).
+    fallback_idx = len(range_labels)
+
+    valid = (codes > 0) & (idx >= 0) & (idx < len(upper_bounds))
+    valid[valid] &= codes[valid] <= upper_bounds[idx[valid]]
+
+    # Map: valid indices → label_lookup[idx], invalid → fallback.
+    mapped_idx = np.where(valid, idx, fallback_idx)
+    result = label_lookup[mapped_idx]
+
+    all_categories = sorted(set(range_labels) | {OCCP_FALLBACK})
+    return pd.Categorical(result, categories=all_categories)
 
 
 def _build_column_transforms() -> list[tuple[str, Callable[[pd.Series], pd.Series]]]:
@@ -393,7 +415,50 @@ def select_columns(
 
 
 # ─────────────────────────────────────────────────────────────
-# 6. Main pipeline function
+# 6. Shared filename stem builder
+# ─────────────────────────────────────────────────────────────
+
+def build_dataset_stem(
+    survey_year: int,
+    states: list[str] | None,
+    horizon: str,
+    survey: str,
+    threshold: float,
+    keep_columns: list[str] | None,
+    states_label: str | None = None,
+) -> str:
+    """
+    Build the filename stem shared by dataset, train and test CSV files.
+
+    Pattern:
+        {year}_{states}_{horizon}_{survey}_thr{threshold}_cols{cols}
+
+    Examples:
+        2024_CA_NY_1Y_person_thr100000_colsCOW-SCHL-WKHP
+        2024_ALL_1Y_person_thr75000_colsALL
+        2024_northeast_1Y_person_thr100000_colsCOW-SCHL-WKHP
+
+    This function is the single source of truth for filename construction.
+    It is also imported by main.py (_infer_split_paths) to ensure consistency.
+    """
+    if states_label is not None:
+        states_tag = states_label
+    elif states is None:
+        states_tag = "ALL"
+    else:
+        states_tag = "_".join(sorted(states))
+    horizon_tag = horizon.replace("-", "").replace("Year", "Y")  # "1-Year" → "1Y"
+    cols_tag = "-".join(sorted(keep_columns)) if keep_columns else "ALL"
+    return (
+        f"{survey_year}_{states_tag}"
+        f"_{horizon_tag}_{survey}"
+        f"_thr{int(threshold)}"
+        f"_cols{cols_tag}"
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# 7. Main pipeline function
 # ─────────────────────────────────────────────────────────────
 
 def create_dataset(
@@ -424,8 +489,8 @@ def create_dataset(
                    <data_dir>/raw/; processed CSVs are written to
                    <data_dir>/.
     keep_columns : Feature columns retained in the output CSV.
-                   Defaults to DEFAULT_COLUMNS = ["COW", "SCHL", "WKHP"].
-                   Pass None to retain all feature columns.
+                   None (default) retains all feature columns.
+                   Pass a list to keep only specific columns.
     states_label : Optional group/region name used in the output filename
                    instead of individual state codes (e.g. "northeast").
                    If None the sorted state codes are used.
@@ -437,34 +502,21 @@ def create_dataset(
         train_df   : stratified training split (80 %).
         test_df    : stratified test split (20 %).
     """
-    # Resolve mutable default: None → DEFAULT_COLUMNS.
-    # Sorting ensures filename tags are always alphabetically ordered,
-    # consistent with _build_output_dir() in main.py.
-    if keep_columns is None:
-        keep_columns = list(DEFAULT_COLUMNS)
-    else:
+    # Resolve keep_columns: None → all columns (no filtering).
+    # When a list is provided, sort for consistent filename tags.
+    if keep_columns is not None:
         keep_columns = sorted(keep_columns)
 
     data_dir = Path(data_dir)
     raw_dir  = data_dir / "raw"
 
     # ── Pre-flight: skip if output files already exist ────────
-    # Reconstruct the expected output filename using the same logic
-    # as step 8 below.  If all three files exist, load and return
-    # them directly, skipping download + encoding entirely.
-    if states_label is not None:
-        _states_tag = states_label
-    elif states is None:
-        _states_tag = "ALL"
-    else:
-        _states_tag = "_".join(sorted(states))
-    _horizon_tag = horizon.replace("-", "").replace("Year", "Y")
-    _cols_tag    = "-".join(keep_columns) if keep_columns else "ALL"
-    _stem = (
-        f"{survey_year}_{_states_tag}"
-        f"_{_horizon_tag}_{survey}"
-        f"_thr{int(threshold)}"
-        f"_cols{_cols_tag}"
+    # Reconstruct the expected output filename using build_dataset_stem().
+    # If all three files exist, load and return them directly, skipping
+    # download + encoding entirely.
+    _stem = build_dataset_stem(
+        survey_year, states, horizon, survey, threshold,
+        keep_columns, states_label,
     )
     _dataset_path = data_dir / f"dataset_{_stem}.csv"
     _train_path   = data_dir / f"train_{_stem}.csv"
@@ -495,6 +547,17 @@ def create_dataset(
     task = build_acs_income_task(threshold)
     features, labels, _ = task.df_to_pandas(acs_data)
     logger.info("Feature matrix: %d rows × %d columns.", *features.shape)
+
+    # Log the number of missing values replaced by the postprocess
+    # (np.nan_to_num converts NaN → -1 in folktables).
+    sentinel_counts = (features == -1).sum()
+    if sentinel_counts.any():
+        for col, cnt in sentinel_counts.items():
+            if cnt > 0:
+                logger.warning(
+                    "  Column '%s': %d rows had NaN (replaced with -1 by postprocess).",
+                    col, cnt,
+                )
 
     # ── Step 4: Categorize feature columns ───────────────────
     logger.info("Categorizing feature columns…")
@@ -540,21 +603,9 @@ def create_dataset(
     #   train_2024_northeast_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv
     #   test_2024_northeast_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv
 
-    if states_label is not None:
-        states_tag = states_label
-    elif states is None:
-        states_tag = "ALL"
-    else:
-        states_tag = "_".join(sorted(states))
-    horizon_tag = horizon.replace("-", "").replace("Year", "Y")   # "1-Year" → "1Y"
-    cols_tag    = (
-        "-".join(keep_columns) if keep_columns else "ALL"
-    )
-    stem = (
-        f"{survey_year}_{states_tag}"
-        f"_{horizon_tag}_{survey}"
-        f"_thr{int(threshold)}"
-        f"_cols{cols_tag}"
+    stem = build_dataset_stem(
+        survey_year, states, horizon, survey, threshold,
+        keep_columns, states_label,
     )
 
     dataset_df           = dataset.copy()

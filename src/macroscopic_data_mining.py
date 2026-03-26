@@ -550,7 +550,7 @@ def run_grid_search(
     lift_independence_low:  float         = DEFAULT_LIFT_INDEPENDENCE_LOW,
     lift_independence_high: float         = DEFAULT_LIFT_INDEPENDENCE_HIGH,
     n_workers:              int           = _DEFAULT_ARM_WORKERS,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Full grid search over (support, confidence) parameter space.
 
