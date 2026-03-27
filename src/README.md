@@ -59,7 +59,7 @@ pip install folktables pandas numpy scikit-learn catboost mlxtend matplotlib sea
 ## Quick start
 
 ```bash
-# Single state — threshold auto-selected ($94,400 for NY), all columns
+# Single state — threshold and dead zone auto-selected
 python -m src.main --states NY --years 2024
 
 # Group — threshold auto-selected ($100,700 for northeast)
@@ -73,6 +73,12 @@ python -m src.main --states NY --years 2024 --columns COW SCHL WKHP
 
 # Override the auto-selected threshold explicitly
 python -m src.main --states NY --years 2024 --threshold 109500
+
+# Disable the dead zone entirely
+python -m src.main --states NY --years 2024 --margin 0
+
+# Custom dead zone half-width
+python -m src.main --states northeast --years 2024 --margin 5000
 
 # Multiple years (each year produces its own output sub-directory)
 python -m src.main --states midwest --years 2021 2022 2023 2024
@@ -92,6 +98,12 @@ The income threshold is **auto-selected** when `--threshold` is omitted:
 single state → per-state value; group name → group value; multiple states or
 ALL → national fallback. All values follow the Pew Research Center formula
 (T = 2 × M_fam ÷ √3, ACS 2024 family medians).
+
+The **dead zone** is enabled by default: individuals whose income falls
+within ±margin of the threshold are excluded from the dataset.  The margin
+is auto-computed from the ACS Margin of Error (MOE) for median family
+income, propagated through the Pew formula (margin = 2 × MOE / √3).
+Pass `--margin 0` to disable.
 
 ---
 
@@ -136,12 +148,13 @@ in the filename instead of the full list of state codes
 
 Filename pattern:
 ```
-{prefix}_{year}_{states}_{horizon}_{survey}_thr{threshold}_cols{cols}.csv
+{prefix}_{year}_{states}_{horizon}_{survey}_thr{threshold}[_dz{margin}]_cols{cols}.csv
 ```
 
 - `{prefix}` — `dataset`, `train`, or `test`
 - `{states}` — group name, sorted state codes joined by `_`, or `ALL`
 - `{horizon}` — `1Y` or `5Y`
+- `_dz{margin}` — dead zone half-width (only present when margin > 0)
 - `{cols}` — feature columns joined by `-` (e.g. `COW-SCHL-WKHP`), or `ALL`
 
 The train/test split is **fixed at 80/20**, stratified on the binary target column.
@@ -187,7 +200,10 @@ sub-directory inside the cols/thr/pct folder: `results/ALL/2021-2024/colsALL/thr
 | `feature_importance_itemsets.csv` | All k values merged. Columns: `k_value`, `instance_index`, `features`, `itemset`. One row per boundary instance per k. |
 | `feature_importance_itemsets_k<N>.csv` | Same format, one file per k value (e.g. `_k1.csv`, `_k3.csv`, …). |
 | `bocsor_distances.csv` | One row per `(boundary_instance, k_neighbour)` pair. Columns: `k_value`, `instance_index`, `cf_index`, `k_neighbour_rank` (1 = closest), `distance` (normalised Manhattan in [0, 2]).  Sorted by `k_value`, `instance_index`, `k_neighbour_rank` (ascending) so that within each instance the nearest counterfactual comes first. |
+| `bocsor_distance_histogram_k<N>.png` | Histogram of counterfactual distances for k = N.  X-axis: normalised Manhattan distance. Y-axis: count of (instance, k-neighbour) pairs. Red dashed line: median. |
+| `bocsor_distance_histograms_all_k.png` | Combined figure with one subplot per k value for side-by-side comparison. |
 | `bocsor_summary.md` | Human-readable run summary with importance tables, stability notes, and timing. |
+| `pipeline.log` | Full pipeline log (all stages, append mode across re-runs). |
 | `arm_rules.csv` | All unique association rules surviving the grid search (support, confidence, lift, lift filter). |
 | `arm_grid_summary.csv` | Grid search summary: one row per `(min_support, min_confidence)` cell with the rule count. |
 
@@ -282,6 +298,7 @@ further cuts the number of boundary instances to process.
 | Option | Type | Default | Description |
 |---|---|---|---|
 | `--threshold` | float | *auto* | Income threshold in USD. Target is **1** if `PINCP > threshold`. If omitted, the threshold is selected automatically from pre-computed Pew Research Center upper-income values (T = 2 × M_fam ÷ √3, ACS 2024). Resolution order: single state → state-level value; group name → group value; multiple states or ALL → national fallback ($94,200). Pass an explicit value to override. |
+| `--margin` | float | *auto* | Dead zone half-width in dollars. Individuals with PINCP in [threshold − margin, threshold + margin] are excluded. Default: auto-computed from ACS MOE for median family income (margin = 2 × MOE / √3). Pass `0` to disable. |
 
 ### Output column selection *(stage 1)*
 
@@ -675,6 +692,14 @@ Confidence×Lift), generated per k and for all_k, saved under
 
 Stage 4 shares all performance infrastructure with stage 3:
 
+- **Parallel per-macro-rule processing** — each macroscopic rule generates
+  an independent filtered transaction set and grid search with no shared
+  mutable state.  The per-macro-rule loop uses `ProcessPoolExecutor` with
+  fork (exploded tokens inherited in shared memory).  Inner grid search
+  worker count is reduced to avoid oversubscription:
+  `total_threads ≈ n_parallel × inner_workers ≤ cpu_count`.
+  With 20 macro rules and 14 cores this gives ~14× speedup vs sequential.
+  Falls back to sequential for a single rule or single worker.
 - The exploded token DataFrame is loaded **once per k** and reused for all
   macroscopic rules — no repeated CSV reads.
 - **Transaction filtering via numpy lexsort + split** — `_filter_transactions_for_rule`
@@ -986,6 +1011,68 @@ on 1M+ rows).
 | Multi-year stage 1 | `ProcessPoolExecutor` | CPU-bound, bypasses GIL. |
 | BoCSoR boundary chunks | `ProcessPoolExecutor` (fork) | CPU-bound, inherits model/BallTree via fork. |
 | ARM grid search | `ThreadPoolExecutor` (adaptive) | Only activated when rule volume exceeds 500/support level. |
+| Micro ARM per-macro-rule | `ProcessPoolExecutor` (fork) | Each macro rule is independent; inherits exploded tokens via fork. Inner grid workers reduced to avoid oversubscription. |
+
+---
+
+## Dead zone (margin-based sample exclusion)
+
+With categorical features and a continuous income target binarised at a
+threshold, individuals whose income falls near the threshold boundary are
+inherently ambiguous — two people with identical feature profiles can end up
+in different classes simply because one earns $93K and the other $95K.  This
+creates cross-class collisions at distance 0 in the BoCSoR encoding space,
+reducing the informativeness of the analysis.
+
+The **dead zone** addresses this by excluding individuals whose income
+`PINCP` falls within ±margin of the threshold:
+
+- **Class 1**: `PINCP > threshold + margin` (clearly above)
+- **Class 0**: `PINCP ≤ threshold − margin` (clearly below)
+- **Excluded**: `PINCP ∈ (threshold − margin, threshold + margin]`
+
+### Default margin (auto from ACS MOE)
+
+When `--margin` is omitted, the margin is computed from the **ACS 1-Year
+Margin of Error** for median family income (Census Bureau Table B19113),
+propagated through the Pew upper-income formula:
+
+```
+margin = 2 × MOE_median_family_income / √3
+```
+
+For groups of states the MOE decreases with sample size:
+`group_MOE = mean(member_MOEs) / √n_members`.
+
+| Scope | Approx. MOE | Approx. margin |
+|---|---|---|
+| Large state (CA, TX, FL, NY) | $900–1,100 | $1,000–1,300 |
+| Medium state (WA, AZ, MN) | $1,800–2,200 | $2,100–2,500 |
+| Small state (VT, WY) | $4,500–5,200 | $5,200–6,000 |
+| Northeast (9 states) | ~$700 (pooled) | ~$800 |
+| National (49 states) | $500 | $600 |
+
+### Disabling the dead zone
+
+Pass `--margin 0` to disable the dead zone entirely.  The pipeline then
+behaves identically to a standard threshold binarisation with no exclusions.
+Filenames without dead zone omit the `_dz` tag, so runs with and without
+dead zone never overwrite each other.
+
+---
+
+## Logging
+
+All pipeline output is logged both to **stdout** and to a **log file**
+saved in the output directory:
+
+```
+results/<states>/<years>/cols<cols>/thr<N>/pct<N>/<classifier>/pipeline.log
+```
+
+The file uses append mode — re-runs add to the existing log rather than
+overwriting it.  The timestamp format includes the full date
+(`YYYY-MM-DD HH:MM:SS`) for traceability across runs.
 
 ---
 

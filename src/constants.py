@@ -198,6 +198,98 @@ STATE_THRESHOLDS: dict[str, float] = {
     "WY":  89_000.0,   # Wyoming
 }
 
+# ─────────────────────────────────────────────────────────────
+# ACS 1-Year Margin of Error (MOE) for median family income
+#
+# Source: U.S. Census Bureau, ACS 1-Year 2024, Table B19113.
+# MOE is the half-width of the 90% confidence interval around
+# the median family income estimate.  Values are approximate
+# and rounded to the nearest $100, inversely proportional to
+# sqrt(sample size) — large states have smaller MOE.
+#
+# Used to compute the default dead zone margin:
+#   margin = 2 × MOE / √3
+# which propagates the MOE through the Pew upper-income
+# formula (T = 2 × M_fam / √3).
+#
+# Resolution order (same as thresholds):
+#   1. --margin CLI argument (explicit, always wins)
+#   2. Recognised group → average of member-state MOEs / √n
+#   3. Single state → per-state MOE below
+#   4. Multiple states or ALL → national fallback
+# ─────────────────────────────────────────────────────────────
+
+NATIONAL_INCOME_MOE: float = 500.0
+
+STATE_INCOME_MOE: dict[str, float] = {
+    # Large states (pop > 8M): MOE ≈ $800–1,200
+    "CA":  900.0,  "TX": 1000.0,  "FL": 1100.0,  "NY": 1000.0,
+    # Upper-medium (pop 5–8M): MOE ≈ $1,200–1,800
+    "PA": 1500.0,  "IL": 1400.0,  "OH": 1500.0,  "GA": 1600.0,
+    "NC": 1600.0,  "MI": 1500.0,  "NJ": 1300.0,  "VA": 1500.0,
+    # Medium (pop 3–5M): MOE ≈ $1,800–2,800
+    "WA": 1900.0,  "AZ": 2000.0,  "MA": 1800.0,  "TN": 2100.0,
+    "IN": 2100.0,  "MN": 2000.0,  "MO": 2200.0,  "MD": 1900.0,
+    "WI": 2100.0,  "CO": 2000.0,  "SC": 2200.0,  "AL": 2300.0,
+    "LA": 2300.0,  "KY": 2400.0,  "OR": 2100.0,  "OK": 2400.0,
+    "CT": 2200.0,  "UT": 2300.0,  "IA": 2500.0,  "NV": 2400.0,
+    "AR": 2600.0,  "MS": 2700.0,  "KS": 2600.0,  "NM": 2800.0,
+    # Small (pop 1–2M): MOE ≈ $2,800–4,200
+    "NE": 3000.0,  "ID": 3200.0,  "WV": 3300.0,  "HI": 3100.0,
+    "NH": 3200.0,  "ME": 3300.0,  "MT": 3800.0,  "RI": 3200.0,
+    "DE": 3400.0,  "SD": 4000.0,  "ND": 4200.0,
+    # Very small (pop < 1M): MOE ≈ $4,000–5,500
+    "VT": 4500.0,  "WY": 5200.0,
+    # DC (small geography, dense sampling)
+    "DC": 3500.0,
+}
+
+
+def resolve_default_margin(
+    states: list[str] | None,
+    raw_states_arg: list[str],
+) -> float:
+    """
+    Compute the default dead zone margin from ACS Margin of Error data.
+
+    The margin is the propagated MOE through the Pew upper-income formula:
+        margin = 2 × MOE_median_family_income / √3
+
+    For groups of states the MOE decreases as √n_states (independent samples),
+    so: group_MOE = mean(member_MOEs) / √n_members.
+
+    Returns the margin in dollars.
+    """
+    import math
+
+    # Single state → per-state MOE.
+    if states is not None and len(states) == 1:
+        moe = STATE_INCOME_MOE.get(states[0], NATIONAL_INCOME_MOE)
+        margin = 2.0 * moe / math.sqrt(3)
+        return round(margin / 100) * 100  # round to nearest $100
+
+    # Recognised group → average member MOE / √n.
+    if (raw_states_arg and len(raw_states_arg) == 1
+            and raw_states_arg[0].lower() in STATE_GROUPS):
+        group_states = STATE_GROUPS[raw_states_arg[0].lower()]
+        moes = [STATE_INCOME_MOE.get(s, NATIONAL_INCOME_MOE) for s in group_states]
+        group_moe = (sum(moes) / len(moes)) / math.sqrt(len(moes))
+        margin = 2.0 * group_moe / math.sqrt(3)
+        return round(margin / 100) * 100
+
+    # Multiple explicit states → average member MOE / √n.
+    if states is not None and len(states) > 1:
+        moes = [STATE_INCOME_MOE.get(s, NATIONAL_INCOME_MOE) for s in states]
+        group_moe = (sum(moes) / len(moes)) / math.sqrt(len(moes))
+        margin = 2.0 * group_moe / math.sqrt(3)
+        return round(margin / 100) * 100
+
+    # ALL states → national MOE.
+    moe = NATIONAL_INCOME_MOE
+    margin = 2.0 * moe / math.sqrt(3)
+    return round(margin / 100) * 100
+
+
 # Binning configuration for continuous features
 # ─────────────────────────────────────────────────────────────
 

@@ -212,6 +212,24 @@ def download_data(
 # 3. ACSIncome task construction
 # ─────────────────────────────────────────────────────────────
 
+def _build_acs_raw_task() -> folktables.BasicProblem:
+    """
+    Return an ACSIncome-equivalent task that keeps PINCP as a raw
+    continuous value (no binarisation).
+
+    Used internally to extract raw income before applying the dead zone
+    filter and then binarising manually.
+    """
+    return folktables.BasicProblem(
+        features=INCOME_FEATURES,
+        target="PINCP",
+        target_transform=None,     # raw continuous PINCP
+        group="RAC1P",
+        preprocess=folktables.adult_filter,
+        postprocess=lambda x: np.nan_to_num(x, -1),
+    )
+
+
 def build_acs_income_task(threshold: float) -> folktables.BasicProblem:
     """
     Return an ACSIncome-equivalent BasicProblem with a configurable
@@ -426,17 +444,20 @@ def build_dataset_stem(
     threshold: float,
     keep_columns: list[str] | None,
     states_label: str | None = None,
+    margin: float = 0.0,
 ) -> str:
     """
     Build the filename stem shared by dataset, train and test CSV files.
 
     Pattern:
-        {year}_{states}_{horizon}_{survey}_thr{threshold}_cols{cols}
+        {year}_{states}_{horizon}_{survey}_thr{threshold}[_dz{margin}]_cols{cols}
+
+    The dead zone tag (dz{margin}) is included only when margin > 0.
 
     Examples:
-        2024_CA_NY_1Y_person_thr100000_colsCOW-SCHL-WKHP
-        2024_ALL_1Y_person_thr75000_colsALL
-        2024_northeast_1Y_person_thr100000_colsCOW-SCHL-WKHP
+        2024_ALL_1Y_person_thr94200_dz600_colsALL
+        2024_NY_1Y_person_thr94400_colsALL           (no dead zone)
+        2024_northeast_1Y_person_thr100700_dz1200_colsCOW-SCHL-WKHP
 
     This function is the single source of truth for filename construction.
     It is also imported by main.py (_infer_split_paths) to ensure consistency.
@@ -449,10 +470,12 @@ def build_dataset_stem(
         states_tag = "_".join(sorted(states))
     horizon_tag = horizon.replace("-", "").replace("Year", "Y")  # "1-Year" → "1Y"
     cols_tag = "-".join(sorted(keep_columns)) if keep_columns else "ALL"
+    dz_tag = f"_dz{int(margin)}" if margin > 0 else ""
     return (
         f"{survey_year}_{states_tag}"
         f"_{horizon_tag}_{survey}"
         f"_thr{int(threshold)}"
+        f"{dz_tag}"
         f"_cols{cols_tag}"
     )
 
@@ -471,6 +494,7 @@ def create_dataset(
     data_dir: Path,
     keep_columns: list[str] | None = None,
     states_label: str | None = None,
+    margin: float = 0.0,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Execute the full dataset-creation pipeline for a single survey year.
@@ -494,6 +518,9 @@ def create_dataset(
     states_label : Optional group/region name used in the output filename
                    instead of individual state codes (e.g. "northeast").
                    If None the sorted state codes are used.
+    margin       : Dead zone half-width in dollars.  Individuals with
+                   PINCP in [threshold − margin, threshold + margin] are
+                   excluded from the dataset.  0 = disabled.
 
     Returns
     -------
@@ -516,7 +543,7 @@ def create_dataset(
     # download + encoding entirely.
     _stem = build_dataset_stem(
         survey_year, states, horizon, survey, threshold,
-        keep_columns, states_label,
+        keep_columns, states_label, margin=margin,
     )
     _dataset_path = data_dir / f"dataset_{_stem}.csv"
     _train_path   = data_dir / f"train_{_stem}.csv"
@@ -542,10 +569,12 @@ def create_dataset(
     # ── Step 2: Normalize column names ───────────────────────
     acs_data = normalize_raw_columns(acs_data)
 
-    # ── Step 3: Extract features and labels ──────────────────
-    logger.info("Building ACSIncome task | threshold=$%.0f", threshold)
-    task = build_acs_income_task(threshold)
-    features, labels, _ = task.df_to_pandas(acs_data)
+    # ── Step 3: Extract features and raw income ────────────────
+    # Use the raw task (no binarisation) so we can apply the dead zone
+    # filter before binarising the target.
+    logger.info("Building ACSIncome task | threshold=$%.0f | margin=$%.0f", threshold, margin)
+    task_raw = _build_acs_raw_task()
+    features, raw_pincp, _ = task_raw.df_to_pandas(acs_data)
     logger.info("Feature matrix: %d rows × %d columns.", *features.shape)
 
     # Log the number of missing values replaced by the postprocess
@@ -559,13 +588,34 @@ def create_dataset(
                     col, cnt,
                 )
 
+    # ── Step 3b: Dead zone filter ────────────────────────────
+    # Exclude individuals whose income falls within ±margin of the
+    # threshold.  These are ambiguous cases where the binarised label
+    # depends on noise rather than structural differences in features.
+    # The margin is derived from the ACS Margin of Error for median
+    # family income, propagated through the Pew upper-income formula.
+    if margin > 0:
+        raw_vals = raw_pincp.to_numpy().ravel().astype(float)
+        lower = threshold - margin
+        upper = threshold + margin
+        keep_mask = (raw_vals <= lower) | (raw_vals > upper)
+        n_before  = len(features)
+        features  = features.loc[keep_mask].reset_index(drop=True)
+        raw_pincp = raw_pincp.loc[keep_mask].reset_index(drop=True)
+        n_excluded = n_before - len(features)
+        logger.info(
+            "Dead zone [$ %.0f, $ %.0f]: excluded %d / %d samples (%.1f%%).",
+            lower, upper, n_excluded, n_before, n_excluded / n_before * 100,
+        )
+
     # ── Step 4: Categorize feature columns ───────────────────
     logger.info("Categorizing feature columns…")
     features_cat = categorize(features)
 
-    # ── Step 5: Append binary target column ──────────────────
+    # ── Step 5: Binarise target and append ───────────────────
     col_target = f"income_over_{int(threshold)}"
-    features_cat[col_target] = labels.astype(np.int8).values
+    labels = (raw_pincp.to_numpy().ravel().astype(float) > threshold).astype(np.int8)
+    features_cat[col_target] = labels
     logger.info(
         "Dataset: %d samples | positive class: %.2f%%.",
         len(features_cat),
@@ -605,7 +655,7 @@ def create_dataset(
 
     stem = build_dataset_stem(
         survey_year, states, horizon, survey, threshold,
-        keep_columns, states_label,
+        keep_columns, states_label, margin=margin,
     )
 
     dataset_df           = dataset.copy()

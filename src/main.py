@@ -66,6 +66,7 @@ from src.constants import (       # noqa: E402
     NATIONAL_THRESHOLD,
     GROUP_THRESHOLDS,
     STATE_THRESHOLDS,
+    resolve_default_margin,
 )
 from src.create_dataset import create_dataset, build_dataset_stem  # noqa: E402
 from src.macroscopic_data_mining import (      # noqa: E402
@@ -253,6 +254,7 @@ def _process_year(
     keep_columns: list[str] | None,
     log_level: str,
     states_label: str | None = None,
+    margin: float = 0.0,
 ) -> tuple[int, int, int]:
     """
     Worker function executed in a separate process for a single survey year.
@@ -279,6 +281,7 @@ def _process_year(
         data_dir=data_dir,
         keep_columns=keep_columns,
         states_label=states_label,
+        margin=margin,
     )
     return year, len(train_df), len(test_df)
 
@@ -549,6 +552,20 @@ Examples:
             "fallback ($94,200).  Pass an explicit value to override."
         ),
     )
+    task.add_argument(
+        "--margin", type=float, default=None, metavar="DOLLARS",
+        help=(
+            "Dead zone half-width in dollars.  Individuals with income in "
+            "[threshold − margin, threshold + margin] are excluded from the "
+            "dataset — they are ambiguous cases where the binary label depends "
+            "on noise rather than structural feature differences.  "
+            "Default: auto-computed from the ACS Margin of Error for median "
+            "family income, propagated through the Pew formula "
+            "(margin = 2 × MOE / √3).  "
+            "Pass 0 to disable the dead zone entirely.  "
+            "Pass an explicit dollar value to override the auto-selection."
+        ),
+    )
 
     # ── Output column selection (stage 1) ─────────────────────────────────────
     cols = parser.add_argument_group("Output column selection  (stage 1)")
@@ -677,18 +694,13 @@ def _infer_split_paths(
     survey: str,
     keep_columns: list[str] | None,
     states_label: str | None = None,
+    margin: float = 0.0,
 ) -> tuple[Path, Path]:
     """
     Reconstruct the train/test file paths that create_dataset writes.
 
     Uses build_dataset_stem() from create_dataset.py as single source of
     truth for the filename convention, ensuring consistency.
-
-    Examples
-    --------
-        train_2024_NY_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv
-        train_2024_northeast_1Y_person_thr100000_colsCOW-SCHL-WKHP.csv
-        test_2024_ALL_1Y_person_thr75000_colsALL.csv
     """
     stem = build_dataset_stem(
         survey_year=year,
@@ -698,6 +710,7 @@ def _infer_split_paths(
         threshold=threshold,
         keep_columns=keep_columns,
         states_label=states_label,
+        margin=margin,
     )
     return data_dir / f"train_{stem}.csv", data_dir / f"test_{stem}.csv"
 
@@ -833,6 +846,12 @@ def main() -> None:
 
     threshold = resolve_threshold(args.threshold, args.states, states)
 
+    # Resolve dead zone margin: None → auto from ACS MOE, 0 → disabled.
+    if args.margin is None:
+        margin = resolve_default_margin(states, args.states)
+    else:
+        margin = args.margin
+
     invalid_years = [y for y in args.years if not (2014 <= y <= 2024)]
     if invalid_years:
         logger.error("Year(s) out of supported range (2014–2024): %s", invalid_years)
@@ -853,6 +872,18 @@ def main() -> None:
         args.output_dir, states, args.states, args.years,
         keep_columns, threshold, args.percentile, args.classifier,
     )
+
+    # ── Log file handler: save a copy of all log output to the output dir ─────
+    xai_output_dir.mkdir(parents=True, exist_ok=True)
+    _log_path = xai_output_dir / "pipeline.log"
+    _file_handler = logging.FileHandler(_log_path, mode="a", encoding="utf-8")
+    _file_handler.setLevel(getattr(logging, args.log_level))
+    _file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s – %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    logging.getLogger().addHandler(_file_handler)
+    logger.info("Log file: %s", _log_path.resolve())
     logger.info("═" * 62)
     logger.info("  ACS INCOME PIPELINE")
     logger.info("═" * 62)
@@ -861,6 +892,7 @@ def main() -> None:
     logger.info("  Survey         : %s", args.survey)
     logger.info("  States         : %s (%d)", states or "ALL", n_states)
     logger.info("  Threshold      : $%.0f (auto)", threshold) if args.threshold is None else logger.info("  Threshold      : $%.0f (explicit)", threshold)
+    logger.info("  Dead zone      : ±$%.0f %s", margin, "(auto — ACS MOE)" if args.margin is None else "(explicit)") if margin > 0 else logger.info("  Dead zone      : disabled")
     logger.info("  Output columns : %s", keep_columns or "ALL")
     logger.info("  Workers        : %d (auto-detected: %d)", args.workers, _DEFAULT_WORKERS)
     logger.info("  Data dir       : %s", args.data_dir.resolve())
@@ -887,6 +919,7 @@ def main() -> None:
                 data_dir=args.data_dir,
                 keep_columns=keep_columns,
                 states_label=states_label,
+                margin=margin,
             )
             logger.info(
                 "Year %d complete → train=%d rows, test=%d rows.",
@@ -900,7 +933,7 @@ def main() -> None:
         train_path, test_path = _infer_split_paths(
             args.data_dir, year, states, threshold,
             args.horizon, args.survey, keep_columns,
-            states_label=states_label,
+            states_label=states_label, margin=margin,
         )
         _run_feature_importance(
             train_path=train_path,
@@ -969,6 +1002,7 @@ def main() -> None:
             keep_columns=keep_columns,
             log_level=args.log_level,
             states_label=states_label,
+            margin=margin,
         )
 
         completed: dict[int, tuple[int, int]] = {}
@@ -1002,7 +1036,7 @@ def main() -> None:
             train_path, test_path = _infer_split_paths(
                 args.data_dir, year, states, threshold,
                 args.horizon, args.survey, keep_columns,
-                states_label=states_label,
+                states_label=states_label, margin=margin,
             )
             year_output_dir = xai_output_dir / str(year)
             _run_feature_importance(

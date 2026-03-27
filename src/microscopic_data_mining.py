@@ -628,25 +628,77 @@ def _run_micro_for_k(
     all_rules_list:   list[pd.DataFrame] = []
     all_summary_list: list[pd.DataFrame] = []
 
-    for (_, macro_rule), label_set in zip(macro_rules.iterrows(), label_sets):
-        rules_i, summary_i = _run_micro_for_macro_rule(
-            macro_rule=macro_rule,
-            label_set=label_set,
-            exploded_tokens=exploded_tokens,
-            min_support=min_support,
-            max_support=max_support,
-            support_step=support_step,
-            min_confidence=min_confidence,
-            max_confidence=max_confidence,
-            confidence_step=confidence_step,
-            lift_independence_low=lift_independence_low,
-            lift_independence_high=lift_independence_high,
-            n_workers=n_workers,
+    # ── Parallel per-macro-rule processing ───────────────────────────────────
+    # Each macro rule generates an independent filtered transaction set and
+    # grid search — no shared mutable state.  ProcessPoolExecutor with fork
+    # inherits exploded_tokens in shared memory without serialisation.
+    #
+    # Inner grid search worker count is reduced to avoid oversubscription:
+    # total threads ≈ n_parallel × inner_workers ≤ cpu_count.
+    n_rules = len(macro_rules)
+    n_parallel = min(n_workers, n_rules)
+    inner_workers = max(1, n_workers // max(n_parallel, 1))
+
+    macro_rows = [row for _, row in macro_rules.iterrows()]
+
+    if n_parallel > 1 and n_rules > 1:
+        logger.info(
+            "    Parallel micro ARM: %d macro rules × %d workers "
+            "(inner grid workers: %d).",
+            n_rules, n_parallel, inner_workers,
         )
-        if not rules_i.empty:
-            all_rules_list.append(rules_i)
-        if not summary_i.empty:
-            all_summary_list.append(summary_i)
+        import multiprocessing
+        _fork_ctx = multiprocessing.get_context("fork")
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+
+        with ProcessPoolExecutor(
+            max_workers=n_parallel, mp_context=_fork_ctx
+        ) as executor:
+            futures = {
+                executor.submit(
+                    _run_micro_for_macro_rule,
+                    macro_rule=macro_rows[i],
+                    label_set=label_sets[i],
+                    exploded_tokens=exploded_tokens,
+                    min_support=min_support,
+                    max_support=max_support,
+                    support_step=support_step,
+                    min_confidence=min_confidence,
+                    max_confidence=max_confidence,
+                    confidence_step=confidence_step,
+                    lift_independence_low=lift_independence_low,
+                    lift_independence_high=lift_independence_high,
+                    n_workers=inner_workers,
+                ): i
+                for i in range(n_rules)
+            }
+            for future in as_completed(futures):
+                rules_i, summary_i = future.result()
+                if not rules_i.empty:
+                    all_rules_list.append(rules_i)
+                if not summary_i.empty:
+                    all_summary_list.append(summary_i)
+    else:
+        # Sequential fallback (single rule or single worker).
+        for macro_row, label_set in zip(macro_rows, label_sets):
+            rules_i, summary_i = _run_micro_for_macro_rule(
+                macro_rule=macro_row,
+                label_set=label_set,
+                exploded_tokens=exploded_tokens,
+                min_support=min_support,
+                max_support=max_support,
+                support_step=support_step,
+                min_confidence=min_confidence,
+                max_confidence=max_confidence,
+                confidence_step=confidence_step,
+                lift_independence_low=lift_independence_low,
+                lift_independence_high=lift_independence_high,
+                n_workers=n_workers,
+            )
+            if not rules_i.empty:
+                all_rules_list.append(rules_i)
+            if not summary_i.empty:
+                all_summary_list.append(summary_i)
 
     # Aggregate.
     if all_rules_list:
