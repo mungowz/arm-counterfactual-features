@@ -40,10 +40,11 @@ Adaptations for fully-categorical data
 * No interpolation of intermediate points (not meaningful for categorical
   features).  Instead of generating synthetic midpoints (Algorithm 1 of the
   paper), counterfactuals are the K nearest neighbours of the opposite class
-  in hybrid-encoded Manhattan space.  With all 10 feature columns (the
-  default), cross-class collisions (distance = 0) are extremely rare.
-  When they occur, the relevance check naturally skips them (no differing
-  features to substitute).
+  in hybrid-encoded Manhattan space **that differ in at least one feature**
+  (distance > 0).  Cross-class duplicates (identical feature vectors,
+  different label) are skipped by over-querying the BallTree and filtering.
+  This guarantees every counterfactual has ≥ 1 feature to substitute,
+  producing clean itemsets for downstream ARM (stages 3–4).
 
 * Feature substitution (Algorithm 2) creates synthetic instances just as in
   the paper: each modified counterfactual (one feature swapped back to the
@@ -480,11 +481,11 @@ def _process_boundary_chunk(
     Process one chunk of boundary instances in a worker process.
 
     For each boundary instance:
-      1. Find the k nearest neighbours from the counterfactual class
-         (Algorithm 1 — k-NN via BallTree in hybrid-encoded Manhattan space).
-         Counterfactuals with distance = 0 (identical features, different
-         class) are possible with few columns; the relevance check below
-         naturally skips them (no differing features to substitute).
+      1. Find the k nearest neighbours from the counterfactual class that
+         differ in at least one feature (distance > 0).  The BallTree is
+         over-queried and results are filtered to skip cross-class
+         duplicates (identical features, different label).  This guarantees
+         every counterfactual has ≥ 1 feature to substitute.
       2. Build a batch of all modified instances needed for the relevance
          check across all k counterfactuals, then call model.predict() once
          on the entire batch (batched Algorithm 2).
@@ -533,28 +534,38 @@ def _process_boundary_chunk(
 
     for b_idx in chunk_indices:
         # ── Algorithm 1: k-NN via BallTree — O(k log N_cf) ───────────────────
+        # With categorical data many cf-class instances share the exact same
+        # encoded feature vector as the boundary instance (distance = 0).
+        # These carry no BoCSoR signal: all features are identical so there
+        # is nothing to substitute in Algorithm 2.  We over-query the
+        # BallTree and keep only the first k neighbours with distance > 0.
         query_norm = (X_enc[b_idx].astype(np.float32)
                       / norm_factor).reshape(1, -1)
-        k_act = min(k, n_cf)
-        dists, top_local = cf_tree.query(query_norm, k=k_act)   # (1, k_act)
-        cf_idxs  = [int(cf_global_indices[i]) for i in top_local[0]]
-        cf_dists = dists[0].tolist()   # normalised Manhattan distances
 
-        if not cf_idxs:
-            continue
+        k_query = min(max(k * 50, 200), n_cf)
+        dists_raw, top_raw = cf_tree.query(query_norm, k=k_query)
+
+        # Filter: keep only counterfactuals that differ in ≥ 1 feature.
+        nonzero = dists_raw[0] > 0.0
+        top_nz  = top_raw[0][nonzero]
+        dist_nz = dists_raw[0][nonzero]
+
+        k_act = min(k, len(top_nz))
+        if k_act == 0:
+            continue   # all cf-class neighbours are identical — skip
+
+        cf_idxs  = [int(cf_global_indices[i]) for i in top_nz[:k_act]]
+        cf_dists = dist_nz[:k_act].tolist()
 
         instance_vals = X_train_values[b_idx]
 
         # Record one distance row per (boundary_instance, k_neighbour) pair.
-        # Distance = 0.0 means the counterfactual has identical feature values
-        # but a different class label — possible with few columns, very rare
-        # with all 10 columns.  These are recorded faithfully; the relevance
-        # check below naturally skips them (no differing features to substitute).
+        # All distances here are guaranteed > 0.
         for rank, (cf_idx, dist) in enumerate(zip(cf_idxs, cf_dists), start=1):
             distance_rows.append({
                 "instance_index":    int(b_idx),
                 "cf_index":          cf_idx,
-                "k_neighbour_rank":  rank,   # 1 = closest, 2 = second closest, …
+                "k_neighbour_rank":  rank,
                 "distance":          round(float(dist), 6),
             })
 
@@ -1641,6 +1652,12 @@ def plot_distance_histograms(
 
     if distances_df.empty:
         logger.info("No distances to plot (empty DataFrame).")
+        return
+
+    # Exclude distance = 0.0 (cross-class duplicates with identical features).
+    distances_df = distances_df[distances_df["distance"] > 0.0]
+    if distances_df.empty:
+        logger.info("No non-zero distances to plot — all counterfactuals were cross-class duplicates.")
         return
 
     output_dir.mkdir(parents=True, exist_ok=True)

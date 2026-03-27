@@ -883,10 +883,11 @@ adaptation preserves the spirit of the algorithm:
 For each boundary instance:
 
 1. Find the k nearest neighbours from the opposite class in hybrid-encoded
-   Manhattan space (**adapted Algorithm 1**).  With all 10 feature columns
-   (the default), cross-class collisions (distance = 0) are extremely rare.
-   When they occur, the relevance check naturally skips them (no differing
-   features to substitute).
+   Manhattan space that **differ in at least one feature** (distance > 0).
+   Cross-class duplicates (identical feature vectors, different label) are
+   skipped by over-querying the BallTree and filtering.  This guarantees
+   every counterfactual has ≥ 1 feature to substitute, producing clean
+   itemsets for downstream ARM (**adapted Algorithm 1**).
 2. For each counterfactual, substitute each differing feature value back to
    the original instance's value one at a time; if the model prediction flips
    back to the original class, that feature is **relevant** (**Algorithm 2**).
