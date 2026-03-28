@@ -275,12 +275,12 @@ with `--k 15 --percentile 20 --workers 14`.
 |---|---|---|---|---|
 | 1 state (NY) | 108K | ~3s | ~18s | Baseline measurement |
 | Northeast (9 states) | ~650K | ~35s | ~8–10 min | Boundary selection dominates |
-| South (16 states) | ~1.8M | ~90s | ~8–12 min | BallTree scales well |
+| South (16 states) | ~1.8M | ~90s | ~8–12 min | Brute-force NN scales linearly |
 | All 49 states (filtered) | ~1.4M | ~5 min | ~6 min | adult_filter reduces rows significantly |
 
-**Scaling note:** stage 2 boundary selection uses a BallTree with Manhattan
+**Scaling note:** stage 2 boundary selection uses brute-force NN with Manhattan
 distance, scaling as O(N log N) instead of the previous O(N²).
-The BallTree is built once in the main process and inherited by worker
+The NN index is built once in the main process and inherited by worker
 processes via `fork` — no serialisation overhead.  The same tree is reused
 for the k-NN step (Algorithm 1) inside each worker.
 For very large datasets, reducing `--percentile` (e.g. `--percentile 5`)
@@ -889,7 +889,7 @@ For each boundary instance:
 1. Find the k nearest neighbours from the opposite class in hybrid-encoded
    Manhattan space that **differ in at least one feature** (distance > 0).
    Cross-class duplicates (identical feature vectors, different label) are
-   skipped by over-querying the BallTree and filtering.  This guarantees
+   skipped by over-querying the NN index and filtering.  This guarantees
    every counterfactual has ≥ 1 feature to substitute, producing clean
    itemsets for downstream ARM (**adapted Algorithm 1**).
 2. For each counterfactual, substitute each differing feature value back to
@@ -994,7 +994,7 @@ importance ranking is as the counterfactual search becomes broader.
 - **Vectorised hybrid encoding**: ordinal columns use pre-normalised dict
   lookup via `pd.Series.map(dict)` (C-optimised in pandas) instead of a
   per-row Python lambda.  Nominal columns use numpy boolean vectorisation.
-- **BallTree boundary selection**: O(N log N) instead of O(N²) pairwise
+- **Brute-force NN boundary selection: BLAS-accelerated instead of pairwise
   matrix.  Built once on the cf-class instances, reused for all k values.
   For 650K rows this reduces boundary selection from ~8 min to ~2 min.
 - **Boundary instance selection**: computed once, reused for all k values.
@@ -1005,7 +1005,7 @@ importance ranking is as the counterfactual search becomes broader.
   overhead.
 - **Parallel processing**: boundary instances are split into chunks and
   processed with `ProcessPoolExecutor` using `fork` start method, so workers
-  inherit the loaded model, encoded arrays, and BallTree without reimporting.
+  inherit the loaded model, encoded arrays, and NN index without reimporting.
 - **Classifier thread control**: each worker uses `thread_count=1` (CatBoost) to avoid competing internal thread pools. The MLP wrapper silently drops this keyword argument.
 - **Worker auto-detection**: `max(1, min(14, cpu_count - 2))` — reserves
   2 logical CPUs for the OS and the main process, caps at 14 to avoid
@@ -1049,7 +1049,7 @@ on 1M+ rows).
 | Column categorisation | `ThreadPoolExecutor` | Independent per-column transforms; NumPy ops release GIL. |
 | CSV write (split) | 3 threads | Dataset, train and test written concurrently. |
 | Multi-year stage 1 | `ProcessPoolExecutor` | CPU-bound, bypasses GIL. |
-| BoCSoR boundary chunks | `ProcessPoolExecutor` (fork) | CPU-bound, inherits model/BallTree via fork. |
+| BoCSoR boundary chunks | `ProcessPoolExecutor` (fork) | CPU-bound, inherits model/NN index via fork. |
 | ARM grid search | `ThreadPoolExecutor` (adaptive) | Only activated when rule volume exceeds 500/support level. |
 | Micro ARM per-macro-rule | `ProcessPoolExecutor` (fork) | Each macro rule is independent; inherits exploded tokens via fork. Inner grid workers reduced to avoid oversubscription. |
 

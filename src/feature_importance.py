@@ -42,7 +42,7 @@ Adaptations for fully-categorical data
   paper), counterfactuals are the K nearest neighbours of the opposite class
   in hybrid-encoded Manhattan space **that differ in at least one feature**
   (distance > 0).  Cross-class duplicates (identical feature vectors,
-  different label) are skipped by over-querying the BallTree and filtering.
+  different label) are skipped by over-querying the NN index and filtering.
   This guarantees every counterfactual has ≥ 1 feature to substitute,
   producing clean itemsets for downstream ARM (stages 3–4).
 
@@ -101,9 +101,11 @@ Parallelism and performance
 ────────────────────────────
 * Start method: multiprocessing uses "fork" so worker processes inherit the
   parent's memory (rank maps, encoded arrays, model) without reimporting.
-* BallTree (sklearn, Manhattan metric): built once on the cf-class instances
-  and inherited by workers via fork.  Used for both boundary selection
-  (O(N log N) instead of O(N²)) and k-NN queries in each worker (O(k log N)).
+* Brute-force NN index (sklearn, Manhattan metric): built once on the cf-class
+  instances and inherited by workers via fork.  Uses BLAS-accelerated distance
+  computation — faster than BallTree at high dimensions (147 encoded columns)
+  due to the curse of dimensionality.  Used for both boundary selection and
+  k-NN queries in each worker.
 * Batch predict: for each boundary instance the relevance check builds a
   batch of all modified instances (one per differing feature, across all k
   counterfactuals) and calls model.predict() once, instead of one call per
@@ -129,7 +131,7 @@ import numpy as np
 import pandas as pd
 from catboost import CatBoostClassifier
 from sklearn.model_selection import train_test_split
-from sklearn.neighbors import BallTree
+from sklearn.neighbors import NearestNeighbors
 
 from src.constants import (
     AGEP_LABELS,
@@ -238,7 +240,7 @@ def encode_hybrid(
     category, bits identical) or 2 (different categories, two bits differ).
     Each one-hot column therefore contributes 0 or 1 after dividing by 2 — 
     still in [0, 1].  The /2 normalisation is applied here so that the
-    encoded values are 0.0 or 0.5 per bit; the BallTree Manhattan distance
+    encoded values are 0.0 or 0.5 per bit; the Manhattan distance
     then recovers values in {0, 1} per original nominal column.
 
     Column order
@@ -372,24 +374,27 @@ def expand_k(k_values: list[int]) -> list[int]:
 # Boundary instance selection (computed once, shared across all k values)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_balltree(X_enc: np.ndarray) -> BallTree:
+def build_nn_index(X_enc: np.ndarray) -> NearestNeighbors:
     """
-    Build a BallTree on hybrid-encoded data using raw Manhattan distance.
+    Build a brute-force nearest-neighbour index on hybrid-encoded data.
 
-    The tree is built once in the main process and inherited by worker
+    Uses sklearn NearestNeighbors with algorithm='brute' and Manhattan
+    metric.  At high dimensions (e.g. 147 encoded columns), brute-force
+    BLAS distance computation is significantly faster than tree-based
+    methods (BallTree/KDTree) which degrade due to the curse of
+    dimensionality.
+
+    The index is built once in the main process and inherited by worker
     processes via fork — no serialisation overhead.
 
-    Each encoded column already contributes values in [0, 1] (ordinal columns
-    are min-max normalised; nominal one-hot bits are divided by 2 during
-    encoding).  The BallTree computes the raw Manhattan distance:
-
+    Each encoded column contributes values in [0, 1]:
         dist(a, b) = Σ_i |enc_i(a) - enc_i(b)|
-
-    This is the sum of per-column distances — no global normalisation.
-    A single nominal feature change contributes 1.0 (0.5 + 0.5 from
-    one-hot/2); a single ordinal step contributes 1/(n_levels - 1).
+    A single nominal feature change contributes 1.0; a single ordinal
+    step contributes 1/(n_levels - 1).
     """
-    return BallTree(X_enc.astype(np.float32), metric="manhattan", leaf_size=40)
+    nn = NearestNeighbors(algorithm="brute", metric="manhattan", n_jobs=1)
+    nn.fit(X_enc.astype(np.float32))
+    return nn
 
 
 def select_boundary_instances(
@@ -399,9 +404,9 @@ def select_boundary_instances(
     percentile_th: float,
     original_class: int,
     cf_class: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, BallTree]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, NearestNeighbors]:
     """
-    Compute boundary instances and counterfactual indices once using a BallTree.
+    Compute boundary instances and counterfactual indices once.
 
     Mirrors the authors' original approach (CounterfactualExplainerByProximity):
     1. Separate instances by TRUE label (y_true), not model predictions, so
@@ -414,54 +419,54 @@ def select_boundary_instances(
        true-cf-class neighbour is <= the percentile_th-th percentile.
        (Original authors use <=; we align with that convention.)
 
-    The BallTree is built on the counterfactual-class instances and returned
+    The NN index is built on the counterfactual-class instances and returned
     so that worker processes can reuse it for the k-NN step (Algorithm 1).
 
     Returns
     -------
-    (boundary_indices, cf_indices, X_enc_cf, cf_tree)
+    (boundary_indices, cf_indices, X_enc_cf, cf_nn)
       boundary_indices : row indices in X_enc of boundary instances.
       cf_indices       : row indices in X_enc of true-cf-class instances.
       X_enc_cf         : encoded submatrix for cf-class instances.
-      cf_tree          : BallTree built on cf-class instances.
+      cf_nn            : NearestNeighbors index built on cf-class instances.
     """
     # Separate by TRUE label — same as the original authors.
     orig_indices_true = np.where(y_true == original_class)[0]
     cf_indices        = np.where(y_true == cf_class)[0]
 
     if len(orig_indices_true) == 0 or len(cf_indices) == 0:
-        empty_tree = BallTree(np.zeros((1, X_enc.shape[1]), dtype=np.float32),
-                              metric="manhattan")
+        empty_nn = NearestNeighbors(algorithm="brute", metric="manhattan")
+        empty_nn.fit(np.zeros((1, X_enc.shape[1]), dtype=np.float32))
         return (np.array([], dtype=int), cf_indices,
-                np.empty((0, X_enc.shape[1]), dtype=np.float32), empty_tree)
+                np.empty((0, X_enc.shape[1]), dtype=np.float32), empty_nn)
 
     # Keep only correctly classified orig-class instances.
     correct_mask  = y_pred_train[orig_indices_true] == original_class
     orig_indices  = orig_indices_true[correct_mask]
 
     if len(orig_indices) == 0:
-        empty_tree = BallTree(np.zeros((1, X_enc.shape[1]), dtype=np.float32),
-                              metric="manhattan")
+        empty_nn = NearestNeighbors(algorithm="brute", metric="manhattan")
+        empty_nn.fit(np.zeros((1, X_enc.shape[1]), dtype=np.float32))
         return (np.array([], dtype=int), cf_indices,
-                np.empty((0, X_enc.shape[1]), dtype=np.float32), empty_tree)
+                np.empty((0, X_enc.shape[1]), dtype=np.float32), empty_nn)
 
     X_enc_orig = X_enc[orig_indices]
     X_enc_cf   = X_enc[cf_indices]
 
-    # Build BallTree on the true-cf-class instances.
-    cf_tree = build_balltree(X_enc_cf)
+    # Build NN index on the true-cf-class instances.
+    cf_nn = build_nn_index(X_enc_cf)
 
     # Query k=1 to find each orig-class instance's nearest cf-class neighbour.
     X_orig_q = X_enc_orig.astype(np.float32)
-    min_dists, _ = cf_tree.query(X_orig_q, k=1)   # (N_orig, 1)
-    min_dists    = min_dists[:, 0]                   # (N_orig,)
+    min_dists, _ = cf_nn.kneighbors(X_orig_q, n_neighbors=1)   # (N_orig, 1)
+    min_dists    = min_dists[:, 0]                               # (N_orig,)
 
     # Use <= to match the original authors' convention.
     threshold = float(np.percentile(min_dists, percentile_th))
     b_local   = np.where(min_dists <= threshold)[0]
 
     boundary_indices = orig_indices[b_local]
-    return boundary_indices, cf_indices, X_enc_cf, cf_tree
+    return boundary_indices, cf_indices, X_enc_cf, cf_nn
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -478,14 +483,14 @@ def _process_boundary_chunk(
     model: CatBoostClassifier,
     k: int,
     original_class: int,
-    cf_tree: BallTree,
+    cf_nn: NearestNeighbors,
 ) -> tuple[dict[str, int], list[dict], list[dict], dict[str, int], dict[str, int], int]:
     """
     Process one chunk of boundary instances in a worker process.
 
     For each boundary instance:
       1. Find the k nearest neighbours from the counterfactual class that
-         differ in at least one feature (distance > 0).  The BallTree is
+         differ in at least one feature (distance > 0).  The NN index is
          over-queried and results are filtered to skip cross-class
          duplicates (identical features, different label).  This guarantees
          every counterfactual has ≥ 1 feature to substitute.
@@ -525,7 +530,7 @@ def _process_boundary_chunk(
         query = X_enc[b_idx].astype(np.float32).reshape(1, -1)
 
         k_query = min(max(k * 50, 200), n_cf)
-        dists_raw, top_raw = cf_tree.query(query, k=k_query)
+        dists_raw, top_raw = cf_nn.kneighbors(query, n_neighbors=k_query)
 
         # Filter: keep only counterfactuals that differ in ≥ 1 feature.
         nonzero = dists_raw[0] > 0.0
@@ -632,7 +637,7 @@ def run_bocsor_single_k(
     boundary_indices: np.ndarray,
     cf_indices: np.ndarray,
     X_enc_cf: np.ndarray,
-    cf_tree: BallTree,
+    cf_nn: NearestNeighbors,
     feature_cols: list[str],
     k: int,
     original_class: int,
@@ -702,7 +707,7 @@ def run_bocsor_single_k(
                 model,
                 k,
                 original_class,
-                cf_tree,
+                cf_nn,
             ): chunk
             for chunk in chunks
         }
@@ -812,12 +817,13 @@ def run_bocsor_multi_k(
     - Hybrid encoding of X_train: computed once, reused for all k values.
       Ordinal columns: rank-based, min-max normalised to [0,1].
       Nominal columns: one-hot / 2, each bit in {0.0, 0.5}.
-    - Boundary selection via BallTree: O(N log N) instead of O(N²).
+    - Boundary selection via brute-force NN: BLAS-accelerated distance
+      computation, efficient at 147 encoded dimensions.
       Pools separated by TRUE label; only correctly-classified orig-class
       instances are candidates.  Built once, reused for all k values.
-    - k-NN (Algorithm 1) in workers: BallTree query O(k log N_cf)
+    - k-NN (Algorithm 1) in workers: brute-force query O(k × N_cf)
       instead of a linear scan O(N_cf) per boundary instance.
-    - Workers inherit the BallTree from the main process via fork.
+    - Workers inherit the NN index from the main process via fork.
     - If zero boundary instances are found, all k values are skipped
       immediately without any tree query per k.
     - Relevance check uses batched model.predict() instead of one call
@@ -851,7 +857,7 @@ def run_bocsor_multi_k(
 
     # ── Compute boundary instances once for all k ─────────────────────────────
     t0 = time.perf_counter()
-    boundary_indices, cf_indices, X_enc_cf, cf_tree = select_boundary_instances(
+    boundary_indices, cf_indices, X_enc_cf, cf_nn = select_boundary_instances(
         X_enc=X_enc,
         y_true=y_train.to_numpy().astype(int),
         y_pred_train=y_pred_train,
@@ -913,7 +919,7 @@ def run_bocsor_multi_k(
             boundary_indices=boundary_indices,
             cf_indices=cf_indices,
             X_enc_cf=X_enc_cf,
-            cf_tree=cf_tree,
+            cf_nn=cf_nn,
             feature_cols=feature_cols,
             k=k,
             original_class=original_class,
