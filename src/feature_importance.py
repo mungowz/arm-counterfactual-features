@@ -562,11 +562,15 @@ def _process_boundary_chunk(
         # Record one distance row per (boundary_instance, k_neighbour) pair.
         # All distances here are guaranteed > 0.
         for rank, (cf_idx, dist) in enumerate(zip(cf_idxs, cf_dists), start=1):
+            cf_vals = X_train_values[cf_idx]
+            n_diff = int(sum(1 for fi in range(n_features)
+                             if cf_vals[fi] != instance_vals[fi]))
             distance_rows.append({
                 "instance_index":    int(b_idx),
                 "cf_index":          cf_idx,
                 "k_neighbour_rank":  rank,
                 "distance":          round(float(dist), 6),
+                "n_diff_features":   n_diff,
             })
 
         # ── Algorithm 2: batched relevance check ─────────────────────────────
@@ -656,7 +660,7 @@ def run_bocsor_single_k(
             pd.DataFrame(columns=["instance_index", "features", "itemset"]),
             pd.Series(0.0, index=feature_cols, name="BoCSoR_importance"),
             pd.DataFrame(columns=["instance_index", "cf_index",
-                                   "k_neighbour_rank", "distance"]),
+                                   "k_neighbour_rank", "distance", "n_diff_features"]),
         )
 
     # ── Chunk and dispatch ────────────────────────────────────────────────────
@@ -715,7 +719,7 @@ def run_bocsor_single_k(
     ).sort_values(ascending=False)
 
     dist_df = pd.DataFrame(all_dist_rows) if all_dist_rows else pd.DataFrame(
-        columns=["instance_index", "cf_index", "k_neighbour_rank", "distance"]
+        columns=["instance_index", "cf_index", "k_neighbour_rank", "distance", "n_diff_features"]
     )
     # Sort so that within each boundary instance the nearest counterfactual
     # comes first (k_neighbour_rank = 1, 2, …, k).
@@ -817,7 +821,7 @@ def run_bocsor_multi_k(
         ).rename_axis("feature")
         empty_dist = pd.DataFrame(
             columns=["k_value", "instance_index", "cf_index",
-                     "k_neighbour_rank", "distance"]
+                     "k_neighbour_rank", "distance", "n_diff_features"]
         )
         return empty_df, imp_df, {k: empty_df.copy() for k in k_values}, empty_dist
 
@@ -858,7 +862,7 @@ def run_bocsor_multi_k(
         else:
             dist_df = pd.DataFrame(
                 columns=["k_value", "instance_index", "cf_index",
-                         "k_neighbour_rank", "distance"]
+                         "k_neighbour_rank", "distance", "n_diff_features"]
             )
         all_itemsets.append(itemsets_df)
         all_distances.append(dist_df)
@@ -1663,21 +1667,55 @@ def plot_distance_histograms(
     output_dir.mkdir(parents=True, exist_ok=True)
     k_values = sorted(distances_df["k_value"].unique())
 
-    # ── One PNG per k ────────────────────────────────────────────────────────
-    for k_val in k_values:
-        dists = distances_df.loc[
-            distances_df["k_value"] == k_val, "distance"
+    # Use the largest k run — it contains ranks 1 through max_k,
+    # so we can show how the distance grows from the 1st to the k-th
+    # nearest counterfactual.
+    max_k = max(k_values)
+    max_k_df = distances_df[distances_df["k_value"] == max_k]
+    ranks = sorted(max_k_df["k_neighbour_rank"].unique())
+
+    if not ranks:
+        logger.info("No distance data for k=%d — skipping plots.", max_k)
+        return
+
+    # Global log-bin edges across all ranks for consistent axes.
+    global_min = max_k_df["distance"].min()
+    global_max = max_k_df["distance"].max()
+    log_bin_edges = np.logspace(
+        np.log10(global_min), np.log10(global_max), bins + 1,
+    )
+
+    # ── One PNG per neighbour rank ───────────────────────────────────────────
+    for rank in ranks:
+        dists = max_k_df.loc[
+            max_k_df["k_neighbour_rank"] == rank, "distance"
         ].to_numpy()
 
+        ordinal = f"{rank}{'st' if rank == 1 else 'nd' if rank == 2 else 'rd' if rank == 3 else 'th'}"
+
         fig, ax = plt.subplots(figsize=(8, 5))
-        ax.hist(dists, bins=bins, edgecolor="black", alpha=0.75, color="#4C72B0")
-        ax.set_xlabel("Normalised Manhattan distance")
-        ax.set_ylabel("Count")
+        ax.hist(dists, bins=log_bin_edges, edgecolor="black", alpha=0.75, color="#4C72B0")
+        ax.set_xscale("log")
+        # Force explicit tick positions with decimal labels.
+        from matplotlib.ticker import FixedLocator, FuncFormatter
+        _tick_candidates = [
+            0.0003, 0.0005, 0.0006, 0.001, 0.002, 0.003, 0.005,
+            0.01, 0.02, 0.03, 0.05, 0.1, 0.2, 0.5, 1.0,
+        ]
+        _ticks = [t for t in _tick_candidates
+                  if global_min * 0.8 <= t <= global_max * 1.2]
+        ax.xaxis.set_major_locator(FixedLocator(_ticks))
+        ax.xaxis.set_major_formatter(FuncFormatter(
+            lambda v, _: f"{v:g}"
+        ))
+        ax.tick_params(axis="x", labelrotation=30)
+        ax.set_xlabel("Hybrid Manhattan distance to counterfactual (log scale)")
+        ax.set_ylabel("Number of instances")
+        n_inst = len(dists)
         ax.set_title(
-            f"BoCSoR counterfactual distances — k = {k_val}\n"
-            f"({len(dists):,} distances from "
-            f"{distances_df.loc[distances_df['k_value'] == k_val, 'instance_index'].nunique():,} "
-            f"boundary instances)"
+            f"BoCSoR: distance to the {ordinal} nearest counterfactual\n"
+            f"({n_inst:,} instances, "
+            f"range [{dists.min():.4f}, {dists.max():.4f}])"
         )
         ax.axvline(
             float(np.median(dists)), color="red", linestyle="--", linewidth=1,
@@ -1686,51 +1724,110 @@ def plot_distance_histograms(
         ax.legend()
         fig.tight_layout()
 
-        path = output_dir / f"bocsor_distance_histogram_k{k_val}{suffix}.png"
+        path = output_dir / f"bocsor_distance_histogram_rank{rank}{suffix}.png"
         fig.savefig(path, dpi=150)
         plt.close(fig)
-        logger.info("Distance histogram k=%d -> %s", k_val, path.name)
+        logger.info("Distance histogram rank=%d -> %s", rank, path.name)
 
-    # ── Combined figure: one subplot per k ───────────────────────────────────
-    if len(k_values) > 1:
-        n_k = len(k_values)
-        n_cols = min(3, n_k)
-        n_rows = math.ceil(n_k / n_cols)
+    # ── Combined figure: one subplot per rank ────────────────────────────────
+    if len(ranks) > 1:
+        from matplotlib.ticker import FixedLocator, FuncFormatter
+        _tick_candidates = [
+            0.0003, 0.0005, 0.0006, 0.001, 0.002, 0.003, 0.005,
+            0.01, 0.02, 0.03, 0.05, 0.1, 0.2, 0.5, 1.0,
+        ]
+        _ticks = [t for t in _tick_candidates
+                  if global_min * 0.8 <= t <= global_max * 1.2]
+        _dec_fmt = FuncFormatter(lambda v, _: f"{v:g}")
+
+        n_r = len(ranks)
+        n_cols = min(3, n_r)
+        n_rows = math.ceil(n_r / n_cols)
         fig, axes = plt.subplots(
             n_rows, n_cols, figsize=(6 * n_cols, 4.5 * n_rows),
             squeeze=False,
         )
 
-        for idx, k_val in enumerate(k_values):
+        for idx, rank in enumerate(ranks):
             ax = axes[idx // n_cols][idx % n_cols]
-            dists = distances_df.loc[
-                distances_df["k_value"] == k_val, "distance"
+            dists = max_k_df.loc[
+                max_k_df["k_neighbour_rank"] == rank, "distance"
             ].to_numpy()
 
-            ax.hist(dists, bins=bins, edgecolor="black", alpha=0.75, color="#4C72B0")
-            ax.set_title(f"k = {k_val}  (n = {len(dists):,})")
-            ax.set_xlabel("Distance")
-            ax.set_ylabel("Count")
-            ax.axvline(
-                float(np.median(dists)), color="red", linestyle="--", linewidth=1,
-                label=f"med = {np.median(dists):.4f}",
-            )
-            ax.legend(fontsize=8)
+            ax.hist(dists, bins=log_bin_edges, edgecolor="black", alpha=0.75, color="#4C72B0")
+            ax.set_xscale("log")
+            ax.xaxis.set_major_locator(FixedLocator(_ticks))
+            ax.xaxis.set_major_formatter(_dec_fmt)
+            ax.tick_params(axis="x", labelrotation=30, labelsize=7)
+            ordinal = f"{rank}{'st' if rank == 1 else 'nd' if rank == 2 else 'rd' if rank == 3 else 'th'}"
+            ax.set_title(f"{ordinal} nearest CF  (n={len(dists):,}, med={np.median(dists):.4f})")
+            ax.set_xlabel("Distance to CF (log)")
+            ax.set_ylabel("Instances")
 
         # Hide unused subplots.
-        for idx in range(n_k, n_rows * n_cols):
+        for idx in range(n_r, n_rows * n_cols):
             axes[idx // n_cols][idx % n_cols].set_visible(False)
 
         fig.suptitle(
-            f"BoCSoR counterfactual distance distributions{suffix}",
+            f"BoCSoR: distance to k-th nearest counterfactual (k=1…{max_k}){suffix}",
             fontsize=14, fontweight="bold",
         )
         fig.tight_layout(rect=[0, 0, 1, 0.96])
 
-        path = output_dir / f"bocsor_distance_histograms_all_k{suffix}.png"
+        path = output_dir / f"bocsor_distance_histograms_per_rank{suffix}.png"
         fig.savefig(path, dpi=150)
         plt.close(fig)
-        logger.info("Combined distance histograms -> %s", path.name)
+        logger.info("Per-rank distance histograms -> %s", path.name)
+
+    # ── Stacked bars: % of counterfactuals by n_diff at each rank ────────────
+    has_ndiff = "n_diff_features" in max_k_df.columns
+    if has_ndiff and len(ranks) > 1:
+        max_diff = int(max_k_df["n_diff_features"].max())
+        diff_range = list(range(1, max_diff + 1))
+
+        pct_data: dict[int, list[float]] = {d: [] for d in diff_range}
+        for rank in ranks:
+            sub = max_k_df.loc[max_k_df["k_neighbour_rank"] == rank, "n_diff_features"]
+            total = len(sub)
+            counts = sub.value_counts()
+            for d in diff_range:
+                pct_data[d].append(counts.get(d, 0) / total * 100 if total else 0)
+
+        fig, ax = plt.subplots(figsize=(max(8, len(ranks) * 0.8), 6))
+        x = np.arange(len(ranks))
+        bar_width = 0.65
+
+        colors = ["#4C72B0", "#DD8452", "#55A868", "#C44E52",
+                  "#8172B3", "#937860", "#DA8BC3", "#8C8C8C",
+                  "#CCB974", "#64B5CD"]
+        bottom = np.zeros(len(ranks))
+
+        for i, d in enumerate(diff_range):
+            vals = np.array(pct_data[d])
+            color = colors[i % len(colors)]
+            ax.bar(x, vals, bar_width, bottom=bottom,
+                   label=f"{d} feature{'s' if d > 1 else ''}",
+                   color=color, alpha=0.85, edgecolor="white", linewidth=0.5)
+            for j, v in enumerate(vals):
+                if v > 5:
+                    ax.text(x[j], bottom[j] + v / 2, f"{v:.0f}%",
+                            ha="center", va="center", fontsize=7, fontweight="bold",
+                            color="white")
+            bottom += vals
+
+        ax.set_xticks(x)
+        ax.set_xticklabels([str(r) for r in ranks])
+        ax.set_xlabel("k-th nearest counterfactual")
+        ax.set_ylabel("Percentage of counterfactuals")
+        ax.set_title(f"Differing features: 1st → {max_k}th nearest counterfactual{suffix}")
+        ax.set_ylim(0, 105)
+        ax.legend(loc="upper right", fontsize=8)
+        fig.tight_layout()
+
+        path = output_dir / f"bocsor_diff_features_pct{suffix}.png"
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        logger.info("Diff features stacked bars -> %s", path.name)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
