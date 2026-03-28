@@ -105,7 +105,8 @@ Parallelism and performance
   instances and inherited by workers via fork.  Uses BLAS-accelerated distance
   computation — faster than BallTree at high dimensions (147 encoded columns)
   due to the curse of dimensionality.  Used for both boundary selection and
-  k-NN queries in each worker.
+  batched k-NN queries in each worker (one BLAS call per chunk, not per
+  instance).
 * Batch predict: for each boundary instance the relevance check builds a
   batch of all modified instances (one per differing feature, across all k
   counterfactuals) and calls model.predict() once, instead of one call per
@@ -491,9 +492,10 @@ def _process_boundary_chunk(
     For each boundary instance:
       1. Find the k nearest neighbours from the counterfactual class that
          differ in at least one feature (distance > 0).  The NN index is
-         over-queried and results are filtered to skip cross-class
-         duplicates (identical features, different label).  This guarantees
-         every counterfactual has ≥ 1 feature to substitute.
+         queried once for the ENTIRE chunk in a single BLAS call, then
+         results are filtered per-instance to skip cross-class duplicates
+         (identical features, different label).  This guarantees every
+         counterfactual has ≥ 1 feature to substitute.
       2. Build a batch of all modified instances needed for the relevance
          check across all k counterfactuals, then call model.predict() once
          on the entire batch (batched Algorithm 2).
@@ -526,16 +528,22 @@ def _process_boundary_chunk(
 
     feat_to_idx: dict[str, int] = {f: i for i, f in enumerate(feature_cols)}
 
-    for b_idx in chunk_indices:
-        query = X_enc[b_idx].astype(np.float32).reshape(1, -1)
+    # ── Batch k-NN query for ALL instances in this chunk at once ──────────
+    # A single BLAS call computes the entire (chunk_size × n_cf) distance
+    # matrix, which is orders of magnitude faster than chunk_size separate
+    # single-row queries.
+    k_query = min(max(k * 50, 200), n_cf)
+    chunk_queries = X_enc[chunk_indices].astype(np.float32)
+    all_dists, all_tops = cf_nn.kneighbors(chunk_queries, n_neighbors=k_query)
 
-        k_query = min(max(k * 50, 200), n_cf)
-        dists_raw, top_raw = cf_nn.kneighbors(query, n_neighbors=k_query)
+    for row_i, b_idx in enumerate(chunk_indices):
+        dists_row = all_dists[row_i]
+        tops_row  = all_tops[row_i]
 
         # Filter: keep only counterfactuals that differ in ≥ 1 feature.
-        nonzero = dists_raw[0] > 0.0
-        top_nz  = top_raw[0][nonzero]
-        dist_nz = dists_raw[0][nonzero]
+        nonzero = dists_row > 0.0
+        top_nz  = tops_row[nonzero]
+        dist_nz = dists_row[nonzero]
 
         k_act = min(k, len(top_nz))
         if k_act == 0:
@@ -821,8 +829,8 @@ def run_bocsor_multi_k(
       computation, efficient at 147 encoded dimensions.
       Pools separated by TRUE label; only correctly-classified orig-class
       instances are candidates.  Built once, reused for all k values.
-    - k-NN (Algorithm 1) in workers: brute-force query O(k × N_cf)
-      instead of a linear scan O(N_cf) per boundary instance.
+    - k-NN (Algorithm 1) in workers: batched brute-force query — one BLAS
+      call per chunk instead of one per boundary instance.
     - Workers inherit the NN index from the main process via fork.
     - If zero boundary instances are found, all k values are skipped
       immediately without any tree query per k.
