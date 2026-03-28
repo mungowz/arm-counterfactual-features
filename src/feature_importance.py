@@ -55,16 +55,19 @@ Adaptations for fully-categorical data
 * Hybrid encoding (new):
     - Ordinal columns (AGEP, SCHL, WKHP, ...): rank-based encoding
       normalised per-column via min-max to [0, 1].
-    - Nominal columns (all others): one-hot encoding.  Within a single
-      nominal column two samples either share the same category (distance 0)
-      or differ (distance 2 in Manhattan / Hamming).  The per-column
-      contribution is normalised to [0, 1] by dividing by 2.
-    Both groups therefore contribute values in [0, 1] per column before
-    the global sum, making ordinal and nominal columns commensurable.
+    - Nominal columns (all others): one-hot encoding divided by 2.
+      Within a single nominal column two samples either share the same
+      category (Manhattan distance 0) or differ (Manhattan distance
+      0.5 + 0.5 = 1.0, equivalent to Hamming distance 1).
+    Both groups therefore contribute values in [0, 1] per original column,
+    making ordinal and nominal columns commensurable.
 
-* Manhattan distance normalised to [0, 2]:
-      dist(a,b) = 2 × Σ_i  d_i(a,b)  /  n_cols
-    where d_i ∈ [0,1] for every column i (see hybrid encoding above).
+* Hybrid Manhattan distance (raw sum, no global normalisation):
+      dist(a,b) = Σ_i |enc_i(a) - enc_i(b)|
+    where enc_i ∈ [0, 1] for every encoded column i.  A single nominal
+    feature change contributes 1.0; a single ordinal step contributes
+    1/(n_levels - 1).  No division by n_cols — the sum is interpretable
+    directly as "how many feature-equivalent changes apart".
 
 * Multi-k evaluation via --k:
       Single value K  -> auto-expanded to all odd integers 1..K (plus K if
@@ -300,8 +303,8 @@ def n_encoded_cols(
     """
     Return the total number of columns produced by encode_hybrid.
 
-    Used to compute the normalisation factor (n_cols) for the global
-    Manhattan distance without actually materialising the encoded matrix.
+    Utility function — not currently called by the pipeline but retained
+    for diagnostics and potential future use.
     """
     total = 0
     for col in feature_cols:
@@ -351,34 +354,30 @@ def expand_k(k_values: list[int]) -> list[int]:
 # Boundary instance selection (computed once, shared across all k values)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_balltree(X_enc: np.ndarray, n_cols: int) -> BallTree:
+def build_balltree(X_enc: np.ndarray) -> BallTree:
     """
-    Build a BallTree on hybrid-encoded data using normalised Manhattan distance.
+    Build a BallTree on hybrid-encoded data using raw Manhattan distance.
 
     The tree is built once in the main process and inherited by worker
     processes via fork — no serialisation overhead.
 
     Each encoded column already contributes values in [0, 1] (ordinal columns
     are min-max normalised; nominal one-hot bits are divided by 2 during
-    encoding).  The global normalisation factor is therefore simply n_cols,
-    so that the tree returns distances in [0, 2]:
+    encoding).  The BallTree computes the raw Manhattan distance:
 
-        dist(a, b) = 2 × Σ_i |enc_i(a) - enc_i(b)|  /  n_cols
+        dist(a, b) = Σ_i |enc_i(a) - enc_i(b)|
 
-    X_enc is already in [0, 1] per column, so we divide by (n_cols / 2)
-    before inserting into the tree; the raw Manhattan distances reported by
-    the tree then equal the normalised distance above.
+    This is the sum of per-column distances — no global normalisation.
+    A single nominal feature change contributes 1.0 (0.5 + 0.5 from
+    one-hot/2); a single ordinal step contributes 1/(n_levels - 1).
     """
-    norm_factor = float(n_cols) / 2.0    # divide by this → distances in [0, 2]
-    X_norm = X_enc.astype(np.float32) / norm_factor
-    return BallTree(X_norm, metric="manhattan", leaf_size=40)
+    return BallTree(X_enc.astype(np.float32), metric="manhattan", leaf_size=40)
 
 
 def select_boundary_instances(
     X_enc: np.ndarray,
     y_true: np.ndarray,
     y_pred_train: np.ndarray,
-    n_enc_cols: int,
     percentile_th: float,
     original_class: int,
     cf_class: int,
@@ -400,23 +399,13 @@ def select_boundary_instances(
     The BallTree is built on the counterfactual-class instances and returned
     so that worker processes can reuse it for the k-NN step (Algorithm 1).
 
-    Parameters
-    ----------
-    X_enc       : Hybrid-encoded matrix produced by encode_hybrid (float32,
-                  values in [0, 1] per column).
-    y_true      : True class labels (used to separate class pools).
-    y_pred_train: Model predictions on the training set (used to filter
-                  misclassified instances from the boundary candidates).
-    n_enc_cols  : Total number of encoded columns (= X_enc.shape[1]).
-                  Used as the normalisation factor for distance computation.
-
     Returns
     -------
     (boundary_indices, cf_indices, X_enc_cf, cf_tree)
       boundary_indices : row indices in X_enc of boundary instances.
       cf_indices       : row indices in X_enc of true-cf-class instances.
       X_enc_cf         : encoded submatrix for cf-class instances.
-      cf_tree          : BallTree built on cf-class instances (normalised).
+      cf_tree          : BallTree built on cf-class instances.
     """
     # Separate by TRUE label — same as the original authors.
     orig_indices_true = np.where(y_true == original_class)[0]
@@ -441,16 +430,13 @@ def select_boundary_instances(
     X_enc_orig = X_enc[orig_indices]
     X_enc_cf   = X_enc[cf_indices]
 
-    # Build BallTree on the true-cf-class instances (normalised coordinates).
-    cf_tree = build_balltree(X_enc_cf, n_enc_cols)
+    # Build BallTree on the true-cf-class instances.
+    cf_tree = build_balltree(X_enc_cf)
 
     # Query k=1 to find each orig-class instance's nearest cf-class neighbour.
-    # X_enc is already in [0,1] per column; the BallTree was built with the
-    # same /norm_factor scaling, so we apply the same transform to query rows.
-    norm_factor = float(n_enc_cols) / 2.0
-    X_orig_norm = X_enc_orig.astype(np.float32) / norm_factor
-    min_dists, _ = cf_tree.query(X_orig_norm, k=1)   # (N_orig, 1)
-    min_dists    = min_dists[:, 0]                     # (N_orig,)
+    X_orig_q = X_enc_orig.astype(np.float32)
+    min_dists, _ = cf_tree.query(X_orig_q, k=1)   # (N_orig, 1)
+    min_dists    = min_dists[:, 0]                   # (N_orig,)
 
     # Use <= to match the original authors' convention.
     threshold = float(np.percentile(min_dists, percentile_th))
@@ -474,7 +460,6 @@ def _process_boundary_chunk(
     model: CatBoostClassifier,
     k: int,
     original_class: int,
-    n_enc_cols: int,
     cf_tree: BallTree,
 ) -> tuple[dict[str, int], list[dict], list[dict]]:
     """
@@ -493,34 +478,7 @@ def _process_boundary_chunk(
          and emit one row per boundary instance with all relevant features.
 
     The model is inherited from the parent process via fork — no disk I/O.
-
-    Parameters
-    ----------
-    chunk_indices     : Row indices (in X_enc / X_train_values) to process.
-    X_enc             : Full hybrid-encoded training matrix (float32, [0,1] per col).
-    X_enc_cf          : Hybrid-encoded submatrix of counterfactual-class rows.
-    cf_global_indices : Maps position in X_enc_cf -> row in X_enc.
-    X_train_values    : (n_train, n_features) object array of string labels.
-    feature_cols      : Ordered ORIGINAL feature column names.
-    model             : CatBoostClassifier inherited from parent via fork.
-    k                 : Number of nearest counterfactuals to consider.
-    original_class    : Class label of the boundary instances.
-    n_enc_cols        : Number of columns in X_enc (= n_orig + n_ohe_extra).
-                        Used to compute the BallTree query normalisation factor.
-    cf_tree           : BallTree built on cf-class instances (normalised coords).
-                        Inherited via fork — used for O(k log N) k-NN queries.
-
-    Returns
-    -------
-    (importance_counts, itemset_rows)
-      importance_counts : {feature -> count of boundary instances in this
-                           chunk for which the feature is in the relevant union}.
-      itemset_rows      : one dict per boundary instance with relevant features.
-      distance_rows     : one dict per (boundary_instance, k_neighbour) pair
-                          with fields instance_index, cf_index,
-                          k_neighbour_rank (1=closest), distance.
     """
-    norm_factor = float(n_enc_cols) / 2.0   # same as used in build_balltree
     n_features = len(feature_cols)
     importance_counts: dict[str, int] = {f: 0 for f in feature_cols}
     itemset_rows: list[dict] = []
@@ -528,22 +486,13 @@ def _process_boundary_chunk(
 
     n_cf = len(cf_global_indices)
 
-    # Pre-compute once: {feature_name: column_index} — constant across all
-    # boundary instances, avoids O(n) list.index() inside the inner loop.
     feat_to_idx: dict[str, int] = {f: i for i, f in enumerate(feature_cols)}
 
     for b_idx in chunk_indices:
-        # ── Algorithm 1: k-NN via BallTree — O(k log N_cf) ───────────────────
-        # With categorical data many cf-class instances share the exact same
-        # encoded feature vector as the boundary instance (distance = 0).
-        # These carry no BoCSoR signal: all features are identical so there
-        # is nothing to substitute in Algorithm 2.  We over-query the
-        # BallTree and keep only the first k neighbours with distance > 0.
-        query_norm = (X_enc[b_idx].astype(np.float32)
-                      / norm_factor).reshape(1, -1)
+        query = X_enc[b_idx].astype(np.float32).reshape(1, -1)
 
         k_query = min(max(k * 50, 200), n_cf)
-        dists_raw, top_raw = cf_tree.query(query_norm, k=k_query)
+        dists_raw, top_raw = cf_tree.query(query, k=k_query)
 
         # Filter: keep only counterfactuals that differ in ≥ 1 feature.
         nonzero = dists_raw[0] > 0.0
@@ -635,7 +584,6 @@ def run_bocsor_single_k(
     X_enc_cf: np.ndarray,
     cf_tree: BallTree,
     feature_cols: list[str],
-    n_enc_cols: int,
     k: int,
     original_class: int,
     n_workers: int,
@@ -690,7 +638,6 @@ def run_bocsor_single_k(
                 model,
                 k,
                 original_class,
-                n_enc_cols,
                 cf_tree,
             ): chunk
             for chunk in chunks
@@ -707,6 +654,15 @@ def run_bocsor_single_k(
         "  k=%d | instances with >=1 counterfactual: %d / %d",
         k, n_with_cf, len(boundary_indices),
     )
+    n_filtered = len(boundary_indices) - len(
+        {r["instance_index"] for r in all_dist_rows}
+    )
+    if n_filtered > 0:
+        logger.info(
+            "  k=%d | instances skipped (all %d neighbours at distance 0): %d / %d (%.1f%%)",
+            k, k, n_filtered, len(boundary_indices),
+            n_filtered / len(boundary_indices) * 100,
+        )
 
     # Normalise by n_with_cf (instances that produced ≥ 1 relevant feature)
     # rather than len(boundary_indices).  Instances for which no feature swap
@@ -786,7 +742,6 @@ def run_bocsor_multi_k(
     # ── Hybrid encoding: built once, reused for all k values ─────────────────
     nominal_maps = build_nominal_maps(X_train[feature_cols])
     X_enc        = encode_hybrid(X_train[feature_cols], rank_maps, nominal_maps, feature_cols)
-    _n_enc_cols  = n_encoded_cols(feature_cols, rank_maps, nominal_maps)
     X_train_values = (
         X_train[feature_cols].reset_index(drop=True).to_numpy(dtype=object)
     )
@@ -797,7 +752,6 @@ def run_bocsor_multi_k(
         X_enc=X_enc,
         y_true=y_train.to_numpy().astype(int),
         y_pred_train=y_pred_train,
-        n_enc_cols=_n_enc_cols,
         percentile_th=percentile_th,
         original_class=original_class,
         cf_class=cf_class,
@@ -843,7 +797,6 @@ def run_bocsor_multi_k(
             X_enc_cf=X_enc_cf,
             cf_tree=cf_tree,
             feature_cols=feature_cols,
-            n_enc_cols=_n_enc_cols,
             k=k,
             original_class=original_class,
             n_workers=n_workers,
@@ -1630,46 +1583,47 @@ def plot_distance_histograms(
     distances_df: pd.DataFrame,
     output_dir: Path,
     suffix: str = "",
-    bins: int = 50,
+    bins: int = 60,
 ) -> None:
     """
-    Plot one histogram of counterfactual distances per k value.
+    Plot per-rank distance histograms and differing-feature breakdowns.
 
-    For k = 3 each boundary instance contributes 3 distances (to its 1st,
-    2nd, and 3rd nearest counterfactual).  All distances for that k are
-    pooled and binned into a single histogram.
+    Uses the max-k run data (which contains ranks 1 through max_k) to
+    show how distance and feature differences grow from the 1st to the
+    k-th nearest counterfactual.
 
-    One PNG is saved per k value, plus one combined PNG with all k values
-    as subplots on the same figure for easy comparison.
+    Produces 3 types of PNG:
+      - Per-rank histogram (stacked by n_diff_features): one PNG per rank.
+      - Combined grid: all ranks on a single figure.
+      - Stacked percentage bars: % of counterfactuals with 1, 2, 3, …
+        differing features, one bar per rank.
 
     Parameters
     ----------
     distances_df : DataFrame with columns [k_value, instance_index,
-                   cf_index, k_neighbour_rank, distance].
+                   cf_index, k_neighbour_rank, distance, n_diff_features].
     output_dir   : Directory where PNGs are saved.
     suffix       : Filename suffix (e.g. "_class0", "_class1").
     bins         : Number of histogram bins.
     """
     import matplotlib
-    matplotlib.use("Agg")          # non-interactive backend
+    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     if distances_df.empty:
         logger.info("No distances to plot (empty DataFrame).")
         return
 
-    # Exclude distance = 0.0 (cross-class duplicates with identical features).
+    # Defensive: exclude any residual distance = 0 rows.
     distances_df = distances_df[distances_df["distance"] > 0.0]
     if distances_df.empty:
-        logger.info("No non-zero distances to plot — all counterfactuals were cross-class duplicates.")
+        logger.info("No non-zero distances to plot.")
         return
 
     output_dir.mkdir(parents=True, exist_ok=True)
     k_values = sorted(distances_df["k_value"].unique())
 
-    # Use the largest k run — it contains ranks 1 through max_k,
-    # so we can show how the distance grows from the 1st to the k-th
-    # nearest counterfactual.
+    # Use the largest k run — contains ranks 1 through max_k.
     max_k = max(k_values)
     max_k_df = distances_df[distances_df["k_value"] == max_k]
     ranks = sorted(max_k_df["k_neighbour_rank"].unique())
@@ -1678,95 +1632,103 @@ def plot_distance_histograms(
         logger.info("No distance data for k=%d — skipping plots.", max_k)
         return
 
-    # Global log-bin edges across all ranks for consistent axes.
+    # Shared bin edges (linear scale) across all ranks for visual comparison.
     global_min = max_k_df["distance"].min()
     global_max = max_k_df["distance"].max()
-    log_bin_edges = np.logspace(
-        np.log10(global_min), np.log10(global_max), bins + 1,
-    )
+    bin_edges = np.linspace(global_min, global_max, bins + 1)
 
-    # ── One PNG per neighbour rank ───────────────────────────────────────────
+    has_ndiff = "n_diff_features" in max_k_df.columns
+
+    # Color palette for n_diff_features stacking.
+    _colors = ["#4C72B0", "#DD8452", "#55A868", "#C44E52",
+               "#8172B3", "#937860", "#DA8BC3", "#8C8C8C",
+               "#CCB974", "#64B5CD"]
+    if has_ndiff:
+        max_diff = int(max_k_df["n_diff_features"].max())
+        diff_values = list(range(1, max_diff + 1))
+    else:
+        diff_values = []
+
+    # ── One PNG per neighbour rank (stacked by n_diff_features) ──────────
     for rank in ranks:
-        dists = max_k_df.loc[
-            max_k_df["k_neighbour_rank"] == rank, "distance"
-        ].to_numpy()
-
+        rank_df = max_k_df[max_k_df["k_neighbour_rank"] == rank]
+        dists = rank_df["distance"].to_numpy()
         ordinal = f"{rank}{'st' if rank == 1 else 'nd' if rank == 2 else 'rd' if rank == 3 else 'th'}"
 
-        fig, ax = plt.subplots(figsize=(8, 5))
-        ax.hist(dists, bins=log_bin_edges, edgecolor="black", alpha=0.75, color="#4C72B0")
-        ax.set_xscale("log")
-        # Force explicit tick positions with decimal labels.
-        from matplotlib.ticker import FixedLocator, FuncFormatter
-        _tick_candidates = [
-            0.0003, 0.0005, 0.0006, 0.001, 0.002, 0.003, 0.005,
-            0.01, 0.02, 0.03, 0.05, 0.1, 0.2, 0.5, 1.0,
-        ]
-        _ticks = [t for t in _tick_candidates
-                  if global_min * 0.8 <= t <= global_max * 1.2]
-        ax.xaxis.set_major_locator(FixedLocator(_ticks))
-        ax.xaxis.set_major_formatter(FuncFormatter(
-            lambda v, _: f"{v:g}"
-        ))
-        ax.tick_params(axis="x", labelrotation=30)
-        ax.set_xlabel("Hybrid Manhattan distance to counterfactual (log scale)")
+        fig, ax = plt.subplots(figsize=(12, 7))
+
+        if has_ndiff and len(diff_values) > 1:
+            # Stacked histogram: one layer per n_diff_features value.
+            layers = []
+            labels = []
+            for d in diff_values:
+                layer = rank_df.loc[rank_df["n_diff_features"] == d, "distance"].to_numpy()
+                if len(layer) > 0:
+                    layers.append(layer)
+                    labels.append(f"{d} feat.")
+            ax.hist(layers, bins=bin_edges, stacked=True, edgecolor="black",
+                    linewidth=0.4, alpha=0.85,
+                    color=_colors[:len(layers)], label=labels)
+            ax.legend(fontsize=8, title="Diff. features")
+        else:
+            ax.hist(dists, bins=bin_edges, edgecolor="black", alpha=0.75,
+                    color="#4C72B0")
+
+        ax.axvline(float(np.median(dists)), color="red", linestyle="--",
+                   linewidth=1, label=f"median = {np.median(dists):.3f}")
+        ax.legend(fontsize=8)
+        ax.set_xlabel("Hybrid Manhattan distance to counterfactual (1.0 = one nominal change)")
         ax.set_ylabel("Number of instances")
-        n_inst = len(dists)
         ax.set_title(
             f"BoCSoR: distance to the {ordinal} nearest counterfactual\n"
-            f"({n_inst:,} instances, "
-            f"range [{dists.min():.4f}, {dists.max():.4f}])"
+            f"({len(dists):,} instances, "
+            f"range [{dists.min():.3f}, {dists.max():.3f}])"
         )
-        ax.axvline(
-            float(np.median(dists)), color="red", linestyle="--", linewidth=1,
-            label=f"median = {np.median(dists):.4f}",
-        )
-        ax.legend()
         fig.tight_layout()
 
         path = output_dir / f"bocsor_distance_histogram_rank{rank}{suffix}.png"
-        fig.savefig(path, dpi=150)
+        fig.savefig(path, dpi=200)
         plt.close(fig)
         logger.info("Distance histogram rank=%d -> %s", rank, path.name)
 
-    # ── Combined figure: one subplot per rank ────────────────────────────────
+    # ── Combined figure: one subplot per rank ────────────────────────────
     if len(ranks) > 1:
-        from matplotlib.ticker import FixedLocator, FuncFormatter
-        _tick_candidates = [
-            0.0003, 0.0005, 0.0006, 0.001, 0.002, 0.003, 0.005,
-            0.01, 0.02, 0.03, 0.05, 0.1, 0.2, 0.5, 1.0,
-        ]
-        _ticks = [t for t in _tick_candidates
-                  if global_min * 0.8 <= t <= global_max * 1.2]
-        _dec_fmt = FuncFormatter(lambda v, _: f"{v:g}")
-
         n_r = len(ranks)
-        n_cols = min(3, n_r)
-        n_rows = math.ceil(n_r / n_cols)
+        n_cols_grid = min(3, n_r)
+        n_rows = math.ceil(n_r / n_cols_grid)
         fig, axes = plt.subplots(
-            n_rows, n_cols, figsize=(6 * n_cols, 4.5 * n_rows),
+            n_rows, n_cols_grid, figsize=(7 * n_cols_grid, 5.5 * n_rows),
             squeeze=False,
         )
 
         for idx, rank in enumerate(ranks):
-            ax = axes[idx // n_cols][idx % n_cols]
-            dists = max_k_df.loc[
-                max_k_df["k_neighbour_rank"] == rank, "distance"
-            ].to_numpy()
+            ax = axes[idx // n_cols_grid][idx % n_cols_grid]
+            rank_df = max_k_df[max_k_df["k_neighbour_rank"] == rank]
+            dists = rank_df["distance"].to_numpy()
 
-            ax.hist(dists, bins=log_bin_edges, edgecolor="black", alpha=0.75, color="#4C72B0")
-            ax.set_xscale("log")
-            ax.xaxis.set_major_locator(FixedLocator(_ticks))
-            ax.xaxis.set_major_formatter(_dec_fmt)
-            ax.tick_params(axis="x", labelrotation=30, labelsize=7)
+            if has_ndiff and len(diff_values) > 1:
+                layers = []
+                labels = []
+                for d in diff_values:
+                    layer = rank_df.loc[rank_df["n_diff_features"] == d, "distance"].to_numpy()
+                    if len(layer) > 0:
+                        layers.append(layer)
+                        labels.append(f"{d}f")
+                ax.hist(layers, bins=bin_edges, stacked=True, edgecolor="black",
+                        linewidth=0.3, alpha=0.85,
+                        color=_colors[:len(layers)], label=labels)
+                ax.legend(fontsize=6)
+            else:
+                ax.hist(dists, bins=bin_edges, edgecolor="black", alpha=0.75,
+                        color="#4C72B0")
+
             ordinal = f"{rank}{'st' if rank == 1 else 'nd' if rank == 2 else 'rd' if rank == 3 else 'th'}"
-            ax.set_title(f"{ordinal} nearest CF  (n={len(dists):,}, med={np.median(dists):.4f})")
-            ax.set_xlabel("Distance to CF (log)")
+            ax.set_title(f"{ordinal} nearest CF  (n={len(dists):,}, med={np.median(dists):.3f})")
+            ax.set_xlabel("Distance (1.0 = 1 nom. change)")
             ax.set_ylabel("Instances")
 
-        # Hide unused subplots.
-        for idx in range(n_r, n_rows * n_cols):
-            axes[idx // n_cols][idx % n_cols].set_visible(False)
+        for idx in range(n_r, n_rows * n_cols_grid):
+            axes[idx // n_cols_grid][idx % n_cols_grid].set_visible(False)
 
         fig.suptitle(
             f"BoCSoR: distance to k-th nearest counterfactual (k=1…{max_k}){suffix}",
@@ -1775,36 +1737,28 @@ def plot_distance_histograms(
         fig.tight_layout(rect=[0, 0, 1, 0.96])
 
         path = output_dir / f"bocsor_distance_histograms_per_rank{suffix}.png"
-        fig.savefig(path, dpi=150)
+        fig.savefig(path, dpi=200)
         plt.close(fig)
         logger.info("Per-rank distance histograms -> %s", path.name)
 
-    # ── Stacked bars: % of counterfactuals by n_diff at each rank ────────────
-    has_ndiff = "n_diff_features" in max_k_df.columns
+    # ── Stacked bars: % of counterfactuals by n_diff at each rank ────────
     if has_ndiff and len(ranks) > 1:
-        max_diff = int(max_k_df["n_diff_features"].max())
-        diff_range = list(range(1, max_diff + 1))
-
-        pct_data: dict[int, list[float]] = {d: [] for d in diff_range}
+        pct_data: dict[int, list[float]] = {d: [] for d in diff_values}
         for rank in ranks:
             sub = max_k_df.loc[max_k_df["k_neighbour_rank"] == rank, "n_diff_features"]
             total = len(sub)
             counts = sub.value_counts()
-            for d in diff_range:
+            for d in diff_values:
                 pct_data[d].append(counts.get(d, 0) / total * 100 if total else 0)
 
-        fig, ax = plt.subplots(figsize=(max(8, len(ranks) * 0.8), 6))
+        fig, ax = plt.subplots(figsize=(max(10, len(ranks) * 0.9), 7))
         x = np.arange(len(ranks))
         bar_width = 0.65
-
-        colors = ["#4C72B0", "#DD8452", "#55A868", "#C44E52",
-                  "#8172B3", "#937860", "#DA8BC3", "#8C8C8C",
-                  "#CCB974", "#64B5CD"]
         bottom = np.zeros(len(ranks))
 
-        for i, d in enumerate(diff_range):
+        for i, d in enumerate(diff_values):
             vals = np.array(pct_data[d])
-            color = colors[i % len(colors)]
+            color = _colors[i % len(_colors)]
             ax.bar(x, vals, bar_width, bottom=bottom,
                    label=f"{d} feature{'s' if d > 1 else ''}",
                    color=color, alpha=0.85, edgecolor="white", linewidth=0.5)
@@ -1825,7 +1779,7 @@ def plot_distance_histograms(
         fig.tight_layout()
 
         path = output_dir / f"bocsor_diff_features_pct{suffix}.png"
-        fig.savefig(path, dpi=150)
+        fig.savefig(path, dpi=200)
         plt.close(fig)
         logger.info("Diff features stacked bars -> %s", path.name)
 

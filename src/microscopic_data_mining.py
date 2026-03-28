@@ -532,6 +532,14 @@ def _run_micro_for_macro_rule(
         )
         return pd.DataFrame(), pd.DataFrame()
 
+    # Skip grid search if too few transactions to produce meaningful rules.
+    if len(transactions) < 2:
+        logger.info(
+            "      Only %d transaction — need ≥ 2 for association rules, skipping.",
+            len(transactions),
+        )
+        return pd.DataFrame(), pd.DataFrame()
+
     logger.info("      %d transactions selected for microscopic ARM.", len(transactions))
 
     all_rules, grid_summary, _freq_micro = run_grid_search(

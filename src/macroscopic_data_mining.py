@@ -614,6 +614,13 @@ def run_grid_search(
     freq_cache: dict[float, pd.DataFrame] = {}
     for sup in unique_supports:
         freq_cache[sup] = _mine_frequent_itemsets(bool_df, min_support=sup)
+        # Monotonicity: if support S yields 0 frequent itemsets, all S' > S
+        # will too.  Short-circuit the remaining (higher) support levels.
+        if freq_cache[sup].empty:
+            for sup2 in unique_supports:
+                if sup2 > sup and sup2 not in freq_cache:
+                    freq_cache[sup2] = pd.DataFrame(columns=["support", "itemsets"])
+            break
 
     # Lazy import — kept here to avoid catboost/sklearn overhead on stage-1 runs.
     try:
