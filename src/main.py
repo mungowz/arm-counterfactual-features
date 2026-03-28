@@ -423,7 +423,8 @@ def _run_feature_importance(
             "== BoCSoR: class %d boundary (counterfactual class %d) ==",
             orig_cls, cf_cls,
         )
-        all_itemsets_df, importance_df, per_k_itemsets, distances_df, filter_stats_df = run_bocsor_multi_k(
+        (all_itemsets_df, importance_df, per_k_itemsets, distances_df,
+         filter_stats_df, label_imp_df, value_imp_df) = run_bocsor_multi_k(
             model=model,
             X_train=X_train,
             y_train=y_train,
@@ -446,15 +447,24 @@ def _run_feature_importance(
             k_df.to_csv(k_path, index=False)
             logger.info("  k=%d -> %s  (%d rows)", k_val, k_path.name, len(k_df))
 
+        # Old union-based index (backward compatibility).
         imp_path = output_dir / f"feature_importance{suffix}.csv"
         importance_df.reset_index().to_csv(imp_path, index=False)
-        logger.info("Importance -> %s", imp_path)
+        logger.info("Importance (union) -> %s", imp_path)
+
+        # New BoCSoR indices: per-CF label and value level.
+        label_path = output_dir / f"bocsor_label_importance{suffix}.csv"
+        label_imp_df.reset_index().to_csv(label_path, index=False)
+        logger.info("BoCSoR label importance -> %s", label_path)
+
+        value_path = output_dir / f"bocsor_value_importance{suffix}.csv"
+        value_imp_df.reset_index().to_csv(value_path, index=False)
+        logger.info("BoCSoR value importance -> %s", value_path)
 
         dist_path = output_dir / f"bocsor_distances{suffix}.csv"
         distances_df.to_csv(dist_path, index=False)
         logger.info("Distances -> %s  (%d rows)", dist_path, len(distances_df))
 
-        # Filter stats: one row per k with boundary/filtered/relevant counts.
         fstats_path = output_dir / f"bocsor_filter_stats{suffix}.csv"
         filter_stats_df.to_csv(fstats_path, index=False)
         logger.info("Filter stats -> %s", fstats_path)

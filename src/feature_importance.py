@@ -79,6 +79,24 @@ Adaptations for fully-categorical data
   features (space-separated names), itemset (space-separated FEATURE=value
   tokens, ARM-ready).  One combined file plus one file per k value.
 
+* Two BoCSoR indices (computed per k):
+
+  1. Per-CF label-level index (bocsor_label_importance.csv):
+     For each feature LABEL, counts how many times it is relevant across
+     ALL (boundary_instance, counterfactual) swap-and-restore tests,
+     divided by the total number of counterfactuals tested.
+         BoCSoR_label_k(SCHL) = n_times_SCHL_relevant / n_total_CFs
+     This distinguishes a feature relevant for every CF (strong signal)
+     from one relevant for a single distant CF (weak signal).
+
+  2. Per-CF value-level index (bocsor_value_importance.csv):
+     Same as above but keyed on LABEL=value tokens:
+         BoCSoR_value_k(SCHL=Bachelors) = n_times_relevant / n_total_CFs
+
+  The old union-based index (feature_importance.csv) is retained for
+  backward compatibility.  It counts boundary instances (not CFs) and
+  uses the union of relevant features across all k CFs per instance.
+
 Parallelism and performance
 ────────────────────────────
 * Start method: multiprocessing uses "fork" so worker processes inherit the
@@ -461,7 +479,7 @@ def _process_boundary_chunk(
     k: int,
     original_class: int,
     cf_tree: BallTree,
-) -> tuple[dict[str, int], list[dict], list[dict]]:
+) -> tuple[dict[str, int], list[dict], list[dict], dict[str, int], dict[str, int], int]:
     """
     Process one chunk of boundary instances in a worker process.
 
@@ -474,15 +492,30 @@ def _process_boundary_chunk(
       2. Build a batch of all modified instances needed for the relevance
          check across all k counterfactuals, then call model.predict() once
          on the entire batch (batched Algorithm 2).
-      3. Take the UNION of relevant features across all k counterfactuals
-         and emit one row per boundary instance with all relevant features.
+      3. For each CF independently, record which features are relevant
+         (per-CF tracking for the new BoCSoR index).
+      4. Take the UNION of relevant features across all k counterfactuals
+         and emit one itemset row per boundary instance (input for ARM).
 
     The model is inherited from the parent process via fork — no disk I/O.
+
+    Returns
+    -------
+    (importance_counts, itemset_rows, distance_rows,
+     label_relevance, value_relevance, n_cf_tested)
     """
     n_features = len(feature_cols)
     importance_counts: dict[str, int] = {f: 0 for f in feature_cols}
     itemset_rows: list[dict] = []
     distance_rows: list[dict] = []
+
+    # New per-CF counters for the reformulated BoCSoR index.
+    # label_relevance:  {feature_label: count of (instance, CF) pairs where relevant}
+    # value_relevance:  {"LABEL=value": count of (instance, CF) pairs where relevant}
+    # n_cf_tested:      total number of counterfactuals tested across all instances
+    label_relevance: dict[str, int] = {f: 0 for f in feature_cols}
+    value_relevance: dict[str, int] = {}
+    n_cf_tested: int = 0
 
     n_cf = len(cf_global_indices)
 
@@ -545,7 +578,24 @@ def _process_boundary_chunk(
         batch_array = np.array(batch_rows, dtype=object)
         preds       = model.predict(batch_array, thread_count=1).ravel()
 
-        # Collect relevant features (union across all k counterfactuals).
+        # Track CFs tested for the reformulated index denominator.
+        n_cf_tested += k_act
+
+        # ── Per-CF relevance tracking (new BoCSoR index) ─────────────────
+        # For each CF independently, record which features are relevant.
+        # This feeds the reformulated index: count / total_CFs_tested.
+        per_cf_relevant: dict[int, set[str]] = {}  # cf_idx → {relevant features}
+        for pred, (cf_idx, fi) in zip(preds, batch_meta):
+            if int(pred) == original_class:
+                per_cf_relevant.setdefault(cf_idx, set()).add(feature_cols[fi])
+
+        for cf_idx, feats in per_cf_relevant.items():
+            for feat in feats:
+                label_relevance[feat] += 1
+                token = f"{feat}={instance_vals[feat_to_idx[feat]]}"
+                value_relevance[token] = value_relevance.get(token, 0) + 1
+
+        # ── Union across all k CFs (existing logic for itemsets / ARM) ───
         relevant_union: set[str] = set()
         for pred, (_, fi) in zip(preds, batch_meta):
             if int(pred) == original_class:
@@ -567,7 +617,7 @@ def _process_boundary_chunk(
             for feat in relevant_union:
                 importance_counts[feat] += 1
 
-    return importance_counts, itemset_rows, distance_rows
+    return importance_counts, itemset_rows, distance_rows, label_relevance, value_relevance, n_cf_tested
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -587,28 +637,37 @@ def run_bocsor_single_k(
     k: int,
     original_class: int,
     n_workers: int,
-) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame, dict]:
+) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame, dict, pd.Series, pd.Series]:
     """
     Run BoCSoR for a single k value.
 
-    Boundary instances and counterfactual indices are passed in (precomputed
-    by the caller) so that the expensive boundary distance computation is not
-    recomputed for every k.
-
     Returns
     -------
-    (itemsets_df, feature_importance, distances_df, filter_stats)
+    (itemsets_df, feat_imp, distances_df, filter_stats, label_imp, value_imp)
+      itemsets_df   : union-based itemsets for ARM (stages 3-4).
+      feat_imp      : old union-based BoCSoR index (backward compat).
+      distances_df  : per (instance, CF) distances.
+      filter_stats  : dict with boundary/filtered/relevant counts.
+      label_imp     : new per-CF BoCSoR index at LABEL level.
+      value_imp     : new per-CF BoCSoR index at LABEL=value level.
     """
     logger.info(
         "  k=%d | boundary instances: %d (class %d)",
         k, len(boundary_indices), original_class,
     )
     if len(boundary_indices) == 0:
+        empty_label = pd.Series(0.0, index=feature_cols, name="BoCSoR_label")
+        empty_value = pd.Series(dtype=float, name="BoCSoR_value")
         return (
             pd.DataFrame(columns=["instance_index", "features", "itemset"]),
             pd.Series(0.0, index=feature_cols, name="BoCSoR_importance"),
             pd.DataFrame(columns=["instance_index", "cf_index",
                                    "k_neighbour_rank", "distance", "n_diff_features"]),
+            {"k": k, "boundary_instances": 0, "instances_with_cf": 0,
+             "instances_filtered_dist0": 0, "pct_filtered": 0.0,
+             "instances_with_relevant_features": 0, "total_cf_tested": 0},
+            empty_label,
+            empty_value,
         )
 
     # ── Chunk and dispatch ────────────────────────────────────────────────────
@@ -623,6 +682,11 @@ def run_bocsor_single_k(
     all_rows:      list[dict] = []
     all_dist_rows: list[dict] = []
     n_with_cf = 0
+
+    # Aggregators for the reformulated per-CF BoCSoR index.
+    total_label_rel: dict[str, int] = {f: 0 for f in feature_cols}
+    total_value_rel: dict[str, int] = {}
+    total_cf_tested: int = 0
 
     _fork_ctx = multiprocessing.get_context("fork")
     with ProcessPoolExecutor(max_workers=n_chunks, mp_context=_fork_ctx) as executor:
@@ -643,12 +707,18 @@ def run_bocsor_single_k(
             for chunk in chunks
         }
         for future in as_completed(futures):
-            imp_c, rows_c, dist_c = future.result()
+            imp_c, rows_c, dist_c, lab_c, val_c, ncf_c = future.result()
             for feat, cnt in imp_c.items():
                 total_importance[feat] += cnt
             all_rows.extend(rows_c)
             all_dist_rows.extend(dist_c)
             n_with_cf += len({r["instance_index"] for r in rows_c})
+            # Aggregate per-CF counters.
+            for feat, cnt in lab_c.items():
+                total_label_rel[feat] = total_label_rel.get(feat, 0) + cnt
+            for token, cnt in val_c.items():
+                total_value_rel[token] = total_value_rel.get(token, 0) + cnt
+            total_cf_tested += ncf_c
 
     logger.info(
         "  k=%d | instances with >=1 counterfactual: %d / %d",
@@ -671,30 +741,50 @@ def run_bocsor_single_k(
         "instances_filtered_dist0": n_filtered,
         "pct_filtered": round(n_filtered / max(len(boundary_indices), 1) * 100, 2),
         "instances_with_relevant_features": n_with_cf,
+        "total_cf_tested": total_cf_tested,
     }
 
-    # Normalise by n_with_cf (instances that produced ≥ 1 relevant feature)
-    # rather than len(boundary_indices).  Instances for which no feature swap
-    # changed the prediction contribute no signal, so excluding them from the
-    # denominator keeps scores comparable across datasets with different
-    # counterfactual densities.  This choice is intentional and documented here.
+    # ── Old index (union-based, kept for backward compatibility) ──────────
     feat_imp = (
         pd.Series(total_importance, name="BoCSoR_importance")
         / max(n_with_cf, 1)
     ).sort_values(ascending=False)
 
+    # ── New BoCSoR index: per-CF label-level ──────────────────────────────
+    # BoCSoR_k(LABEL) = times LABEL was relevant across all (instance, CF)
+    #                    pairs / total CFs tested.
+    label_imp = (
+        pd.Series(total_label_rel, name="BoCSoR_label")
+        / max(total_cf_tested, 1)
+    ).sort_values(ascending=False)
+
+    # ── New BoCSoR index: per-CF value-level ──────────────────────────────
+    # BoCSoR_k(LABEL=value) = times that specific value was relevant /
+    #                          total CFs tested.
+    value_imp = (
+        pd.Series(total_value_rel, name="BoCSoR_value")
+        / max(total_cf_tested, 1)
+    ).sort_values(ascending=False)
+
+    logger.info(
+        "  k=%d | total CFs tested: %d | label index top: %s=%.4f | value index top: %s=%.4f",
+        k, total_cf_tested,
+        label_imp.index[0] if len(label_imp) > 0 else "N/A",
+        label_imp.iloc[0] if len(label_imp) > 0 else 0,
+        value_imp.index[0] if len(value_imp) > 0 else "N/A",
+        value_imp.iloc[0] if len(value_imp) > 0 else 0,
+    )
+
     dist_df = pd.DataFrame(all_dist_rows) if all_dist_rows else pd.DataFrame(
         columns=["instance_index", "cf_index", "k_neighbour_rank", "distance", "n_diff_features"]
     )
-    # Sort so that within each boundary instance the nearest counterfactual
-    # comes first (k_neighbour_rank = 1, 2, …, k).
     if not dist_df.empty:
         dist_df = (
             dist_df
             .sort_values(["instance_index", "k_neighbour_rank"], ascending=True)
             .reset_index(drop=True)
         )
-    return pd.DataFrame(all_rows), feat_imp, dist_df, filter_stats
+    return pd.DataFrame(all_rows), feat_imp, dist_df, filter_stats, label_imp, value_imp
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -713,7 +803,8 @@ def run_bocsor_multi_k(
     original_class: int = 0,
     cf_class: int = 1,
     n_workers: int = _DEFAULT_WORKERS,
-) -> tuple[pd.DataFrame, pd.DataFrame, dict[int, pd.DataFrame], pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[int, pd.DataFrame], pd.DataFrame,
+           pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Run BoCSoR once per value in k_values on the training set.
 
@@ -734,13 +825,16 @@ def run_bocsor_multi_k(
 
     Returns
     -------
-    (all_itemsets_df, importance_df, per_k_itemsets, distances_df, filter_stats_df)
+    (all_itemsets_df, importance_df, per_k_itemsets, distances_df,
+     filter_stats_df, label_imp_df, value_imp_df)
       all_itemsets_df  : columns [k_value, instance_index, features, itemset].
-      importance_df    : features x k_values wide table (columns k_1, k_3, ...).
+      importance_df    : old union-based BoCSoR (backward compat), columns k_1…k_N.
       per_k_itemsets   : {k -> itemset DataFrame for that k only}.
       distances_df     : columns [k_value, instance_index, cf_index,
                          k_neighbour_rank, distance, n_diff_features].
       filter_stats_df  : one row per k with boundary/filtered/relevant counts.
+      label_imp_df     : new per-CF BoCSoR at LABEL level, columns k_1…k_N.
+      value_imp_df     : new per-CF BoCSoR at LABEL=value level, columns k_1…k_N.
     """
     logger.info(
         "BoCSoR on TRAINING SET: k=%s  class %d->%d  "
@@ -789,20 +883,29 @@ def run_bocsor_multi_k(
         empty_fstats = pd.DataFrame(
             columns=["k", "boundary_instances", "instances_with_cf",
                      "instances_filtered_dist0", "pct_filtered",
-                     "instances_with_relevant_features"]
+                     "instances_with_relevant_features", "total_cf_tested"]
         )
-        return empty_df, imp_df, {k: empty_df.copy() for k in k_values}, empty_dist, empty_fstats
+        empty_label_imp = pd.DataFrame(
+            {f"k_{k}": pd.Series(0.0, index=feature_cols) for k in k_values}
+        ).rename_axis("feature")
+        empty_value_imp = pd.DataFrame(
+            columns=[f"k_{k}" for k in k_values]
+        ).rename_axis("feature_value")
+        return (empty_df, imp_df, {k: empty_df.copy() for k in k_values},
+                empty_dist, empty_fstats, empty_label_imp, empty_value_imp)
 
     # ── Run once per k (boundary instances reused) ────────────────────────────
     all_itemsets:    list[pd.DataFrame]   = []
     all_distances:   list[pd.DataFrame]   = []
     all_filter_stats: list[dict]          = []
     importance_dict: dict[int, pd.Series] = {}
+    label_imp_dict:  dict[int, pd.Series] = {}
+    value_imp_dict:  dict[int, pd.Series] = {}
 
     for k in k_values:
         logger.info("── k=%d ──────────────────────────────────────────────", k)
         t_k = time.perf_counter()
-        itemsets_df, feat_imp, dist_df, fstats = run_bocsor_single_k(
+        itemsets_df, feat_imp, dist_df, fstats, label_imp, value_imp = run_bocsor_single_k(
             model=model,
             X_train=X_train,
             X_enc=X_enc,
@@ -836,20 +939,28 @@ def run_bocsor_multi_k(
         all_itemsets.append(itemsets_df)
         all_distances.append(dist_df)
         importance_dict[k] = feat_imp
+        label_imp_dict[k]  = label_imp
+        value_imp_dict[k]  = value_imp
 
     combined = pd.concat(all_itemsets, ignore_index=True)
     imp_df   = pd.DataFrame(importance_dict).rename_axis("feature")
     imp_df.columns = [f"k_{k}" for k in imp_df.columns]
 
-    # per_k_itemsets: {k -> itemset DataFrame for that k only}
+    # New BoCSoR indices: label-level and value-level, one column per k.
+    label_imp_df = pd.DataFrame(label_imp_dict).rename_axis("feature")
+    label_imp_df.columns = [f"k_{k}" for k in label_imp_df.columns]
+
+    # Value-level: union of all tokens seen across all k, fill missing with 0.
+    all_tokens = sorted({t for s in value_imp_dict.values() for t in s.index})
+    value_imp_df = pd.DataFrame(
+        {f"k_{k}": pd.Series(v, dtype=float).reindex(all_tokens, fill_value=0.0)
+         for k, v in value_imp_dict.items()}
+    ).rename_axis("feature_value")
+
     per_k_itemsets: dict[int, pd.DataFrame] = {
         k: df for k, df in zip(k_values, all_itemsets)
     }
 
-    # distances_df: all k merged, columns [k_value, instance_index,
-    # cf_index, k_neighbour_rank, distance].
-    # Sorted so that within each (k_value, instance_index) group the nearest
-    # counterfactual comes first (k_neighbour_rank ascending).
     distances_df = pd.concat(all_distances, ignore_index=True)
     if not distances_df.empty:
         distances_df = (
@@ -862,7 +973,8 @@ def run_bocsor_multi_k(
         )
 
     filter_stats_df = pd.DataFrame(all_filter_stats)
-    return combined, imp_df, per_k_itemsets, distances_df, filter_stats_df
+    return (combined, imp_df, per_k_itemsets, distances_df,
+            filter_stats_df, label_imp_df, value_imp_df)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1497,7 +1609,8 @@ def main() -> None:
             orig_cls, cf_cls,
         )
         t_dir = time.perf_counter()
-        all_itemsets_df, importance_df, per_k_itemsets, distances_df, filter_stats_df = run_bocsor_multi_k(
+        (all_itemsets_df, importance_df, per_k_itemsets, distances_df,
+         filter_stats_df, label_imp_df, value_imp_df) = run_bocsor_multi_k(
             model=model,
             X_train=X_train,
             y_train=y_train,
@@ -1513,31 +1626,35 @@ def main() -> None:
         elapsed_dir = time.perf_counter() - t_dir
 
         # ── Save itemsets ──────────────────────────────────────────────────
-        # Combined file: all k merged.  Columns: [k_value, instance_index,
-        # features, itemset].  One row per boundary instance per k value.
         itemsets_path = args.output_dir / f"feature_importance_itemsets{suffix}.csv"
         all_itemsets_df.to_csv(itemsets_path, index=False)
         logger.info("Itemsets (all k) -> %s  (%d rows)", itemsets_path, len(all_itemsets_df))
 
-        # Per-k files: feature_importance_itemsets_k<N>[_class<C>].csv
-        # Columns: [k_value, instance_index, features, itemset].
         for k_val, k_df in per_k_itemsets.items():
             k_path = args.output_dir / f"feature_importance_itemsets_k{k_val}{suffix}.csv"
             k_df.to_csv(k_path, index=False)
             logger.info("  k=%d -> %s  (%d rows)", k_val, k_path.name, len(k_df))
 
-        # ── Save feature importance table ──────────────────────────────────
-        # Columns: [feature, k_1, k_3, …, k_N].  One row per feature.
+        # ── Save feature importance (old union-based, backward compat) ────
         imp_path = args.output_dir / f"feature_importance{suffix}.csv"
         importance_df.reset_index().to_csv(imp_path, index=False)
-        logger.info("Importance -> %s", imp_path)
+        logger.info("Importance (union) -> %s", imp_path)
 
-        # Distances: one row per (boundary_instance, k_neighbour) pair.
+        # ── Save new BoCSoR indices ───────────────────────────────────────
+        label_path = args.output_dir / f"bocsor_label_importance{suffix}.csv"
+        label_imp_df.reset_index().to_csv(label_path, index=False)
+        logger.info("BoCSoR label importance -> %s", label_path)
+
+        value_path = args.output_dir / f"bocsor_value_importance{suffix}.csv"
+        value_imp_df.reset_index().to_csv(value_path, index=False)
+        logger.info("BoCSoR value importance -> %s", value_path)
+
+        # Distances
         dist_path = args.output_dir / f"bocsor_distances{suffix}.csv"
         distances_df.to_csv(dist_path, index=False)
         logger.info("Distances -> %s  (%d rows)", dist_path, len(distances_df))
 
-        # Filter stats: one row per k with boundary/filtered/relevant counts.
+        # Filter stats
         fstats_path = args.output_dir / f"bocsor_filter_stats{suffix}.csv"
         filter_stats_df.to_csv(fstats_path, index=False)
         logger.info("Filter stats -> %s", fstats_path)

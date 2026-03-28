@@ -196,11 +196,13 @@ sub-directory inside the cols/thr/pct folder: `results/ALL/2021-2024/colsALL/thr
 
 | File | Description |
 |---|---|
-| `feature_importance.csv` | BoCSoR importance scores. Rows: features. Columns: `feature`, `k_1`, `k_3`, …, `k_N`. |
+| `feature_importance.csv` | Old union-based BoCSoR index (backward compatibility). Rows: features. Columns: `feature`, `k_1`, …, `k_N`. For each k, fraction of boundary instances where the feature appears in the union of relevant features across all k CFs. |
+| `bocsor_label_importance.csv` | **New per-CF BoCSoR index (LABEL level).** Rows: feature labels (SCHL, OCCP, …). Columns: `feature`, `k_1`, …, `k_N`. For each k, number of times the feature is relevant across all (instance, CF) swap-and-restore tests, divided by total CFs tested. |
+| `bocsor_value_importance.csv` | **New per-CF BoCSoR index (LABEL=value level).** Rows: feature tokens (SCHL=Bachelors-Degree, …). Columns: `feature_value`, `k_1`, …, `k_N`. Same denominator as label index. Shows which specific values drive the class boundary. |
 | `feature_importance_itemsets.csv` | All k values merged. Columns: `k_value`, `instance_index`, `features`, `itemset`. One row per boundary instance per k. |
 | `feature_importance_itemsets_k<N>.csv` | Same format, one file per k value (e.g. `_k1.csv`, `_k3.csv`, …). |
 | `bocsor_distances.csv` | One row per `(boundary_instance, k_neighbour)` pair. Columns: `k_value`, `instance_index`, `cf_index`, `k_neighbour_rank` (1 = closest), `distance` (hybrid Manhattan, raw sum, guaranteed > 0; 1.0 = one nominal feature change), `n_diff_features` (number of original features that differ).  Sorted by `k_value`, `instance_index`, `k_neighbour_rank` ascending. |
-| `bocsor_filter_stats.csv` | One row per k value. Columns: `k`, `boundary_instances`, `instances_with_cf`, `instances_filtered_dist0`, `pct_filtered`, `instances_with_relevant_features`. Shows how many boundary instances were discarded by the distance > 0 filter at each k. |
+| `bocsor_filter_stats.csv` | One row per k value. Columns: `k`, `boundary_instances`, `instances_with_cf`, `instances_filtered_dist0`, `pct_filtered`, `instances_with_relevant_features`, `total_cf_tested`. Shows how many boundary instances were discarded by the distance > 0 filter at each k and how many counterfactuals were tested in total. |
 | `plots/bocsor_distance_histogram_rank<N>.png` | Histogram of distances to the N-th nearest counterfactual, stacked by number of differing features.  X-axis: hybrid Manhattan distance (1.0 = one nominal change). Y-axis: number of instances. Red dashed line: median. |
 | `plots/bocsor_distance_histograms_per_rank.png` | Combined figure with one subplot per neighbour rank (1st through k-th), stacked by differing features, for side-by-side comparison of how distance grows with rank. |
 | `plots/bocsor_diff_features_pct.png` | Stacked percentage bars showing, for each neighbour rank, what fraction of counterfactuals differ in 1, 2, 3, … features. Percentages > 5% are labelled inside the bars. |
@@ -897,16 +899,48 @@ For each boundary instance:
    The modified counterfactual is a **synthetic instance** that likely does
    not exist in the training set — the model is probed on unseen data, just
    as in the original paper.
-3. Take the **union** of relevant features across all k counterfactuals and
-   record one itemset row for this boundary instance.
+3. For each CF **independently**, record which features are relevant
+   (per-CF tracking for the BoCSoR index).  Then take the **union** of
+   relevant features across all k counterfactuals and record one itemset
+   row for this boundary instance (input for stages 3–4 ARM).
 
-The BoCSoR score for a feature is the fraction of boundary instances for
-which it appears in the relevant union:
+### BoCSoR indices
+
+Two indices are computed per k value:
+
+**Per-CF index (label level)** — `bocsor_label_importance.csv`:
 
 ```
-BoCSoR(feature_i) = count of boundary instances where feature_i is relevant
-                  ÷ n_boundary_instances_with_counterfactual
+BoCSoR_label_k(feature) = n_times_feature_relevant_across_all_(instance,CF)_tests
+                        ÷ total_counterfactuals_tested_at_k
 ```
+
+For k = 3, each boundary instance contributes 3 swap-and-restore tests per
+feature (one per CF).  If SCHL is relevant for CF 1 and CF 3 but not CF 2,
+it contributes 2 to the numerator and 3 to the denominator for that
+instance.  Aggregated across all boundary instances, this index distinguishes
+a feature that is relevant for **every** CF (strong, consistent signal) from
+one that is relevant only for a single distant CF (weak signal).
+
+**Per-CF index (value level)** — `bocsor_value_importance.csv`:
+
+Same formula but keyed on LABEL=value tokens:
+
+```
+BoCSoR_value_k(SCHL=Bachelors) = n_times_Bachelors_relevant / total_CFs_tested
+```
+
+Shows which specific feature values drive the class boundary.
+
+**Old union-based index (backward compatibility)** — `feature_importance.csv`:
+
+```
+BoCSoR_union_k(feature) = n_boundary_instances_where_feature_in_union
+                        ÷ n_instances_with_at_least_one_relevant_feature
+```
+
+Counts boundary instances (not individual CFs).  A feature that is relevant
+for 1 of 15 CFs counts the same as one relevant for all 15.
 
 ### Hybrid distance encoding
 
