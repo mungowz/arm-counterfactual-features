@@ -423,7 +423,7 @@ def _run_feature_importance(
             "== BoCSoR: class %d boundary (counterfactual class %d) ==",
             orig_cls, cf_cls,
         )
-        all_itemsets_df, importance_df, per_k_itemsets, distances_df = run_bocsor_multi_k(
+        all_itemsets_df, importance_df, per_k_itemsets, distances_df, filter_stats_df = run_bocsor_multi_k(
             model=model,
             X_train=X_train,
             y_train=y_train,
@@ -450,13 +450,16 @@ def _run_feature_importance(
         importance_df.reset_index().to_csv(imp_path, index=False)
         logger.info("Importance -> %s", imp_path)
 
-        # Distances: one row per (boundary_instance, k_neighbour) pair.
-        # Columns: k_value, instance_index, cf_index, k_neighbour_rank, distance.
         dist_path = output_dir / f"bocsor_distances{suffix}.csv"
         distances_df.to_csv(dist_path, index=False)
         logger.info("Distances -> %s  (%d rows)", dist_path, len(distances_df))
 
-        # ── Distance histograms ───────────────────────────────────────────
+        # Filter stats: one row per k with boundary/filtered/relevant counts.
+        fstats_path = output_dir / f"bocsor_filter_stats{suffix}.csv"
+        filter_stats_df.to_csv(fstats_path, index=False)
+        logger.info("Filter stats -> %s", fstats_path)
+
+        # ── Distance histograms (saved to plots/ subfolder) ───────────────
         plot_distance_histograms(
             distances_df, output_dir, suffix=suffix,
         )

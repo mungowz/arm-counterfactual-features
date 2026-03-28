@@ -199,9 +199,11 @@ sub-directory inside the cols/thr/pct folder: `results/ALL/2021-2024/colsALL/thr
 | `feature_importance.csv` | BoCSoR importance scores. Rows: features. Columns: `feature`, `k_1`, `k_3`, …, `k_N`. |
 | `feature_importance_itemsets.csv` | All k values merged. Columns: `k_value`, `instance_index`, `features`, `itemset`. One row per boundary instance per k. |
 | `feature_importance_itemsets_k<N>.csv` | Same format, one file per k value (e.g. `_k1.csv`, `_k3.csv`, …). |
-| `bocsor_distances.csv` | One row per `(boundary_instance, k_neighbour)` pair. Columns: `k_value`, `instance_index`, `cf_index`, `k_neighbour_rank` (1 = closest), `distance` (normalised Manhattan in [0, 2]).  Sorted by `k_value`, `instance_index`, `k_neighbour_rank` (ascending) so that within each instance the nearest counterfactual comes first. |
-| `bocsor_distance_histogram_k<N>.png` | Histogram of counterfactual distances for k = N.  X-axis: normalised Manhattan distance. Y-axis: count of (instance, k-neighbour) pairs. Red dashed line: median. |
-| `bocsor_distance_histograms_all_k.png` | Combined figure with one subplot per k value for side-by-side comparison. |
+| `bocsor_distances.csv` | One row per `(boundary_instance, k_neighbour)` pair. Columns: `k_value`, `instance_index`, `cf_index`, `k_neighbour_rank` (1 = closest), `distance` (hybrid Manhattan, raw sum, guaranteed > 0; 1.0 = one nominal feature change), `n_diff_features` (number of original features that differ).  Sorted by `k_value`, `instance_index`, `k_neighbour_rank` ascending. |
+| `bocsor_filter_stats.csv` | One row per k value. Columns: `k`, `boundary_instances`, `instances_with_cf`, `instances_filtered_dist0`, `pct_filtered`, `instances_with_relevant_features`. Shows how many boundary instances were discarded by the distance > 0 filter at each k. |
+| `plots/bocsor_distance_histogram_rank<N>.png` | Histogram of distances to the N-th nearest counterfactual, stacked by number of differing features.  X-axis: hybrid Manhattan distance (1.0 = one nominal change). Y-axis: number of instances. Red dashed line: median. |
+| `plots/bocsor_distance_histograms_per_rank.png` | Combined figure with one subplot per neighbour rank (1st through k-th), stacked by differing features, for side-by-side comparison of how distance grows with rank. |
+| `plots/bocsor_diff_features_pct.png` | Stacked percentage bars showing, for each neighbour rank, what fraction of counterfactuals differ in 1, 2, 3, … features. Percentages > 5% are labelled inside the bars. |
 | `bocsor_summary.md` | Human-readable run summary with importance tables, stability notes, and timing. |
 | `pipeline.log` | Full pipeline log (all stages, append mode across re-runs). |
 | `arm_rules.csv` | All unique association rules surviving the grid search (support, confidence, lift, lift filter). |
@@ -920,19 +922,22 @@ commensurable — each column contributes values in [0, 1]:
 - **Nominal columns** (all others) — **one-hot encoding**, with each bit
   divided by 2 (values in {0.0, 0.5}).  Within a single nominal column, two
   samples either share the same category (Manhattan distance = 0) or differ
-  (distance = 2 × (0.5 + 0.5) = 1.0 after the /2 normalisation).  This
-  ensures nominal columns also contribute values in [0, 1] per column,
-  identical to ordinal columns.
+  (distance = 0.5 + 0.5 = 1.0, equivalent to Hamming distance = 1).  This
+  ensures nominal columns also contribute values in [0, 1] per original
+  column, identical to ordinal columns.
 
 Encoding maps are built **from the training set only** to prevent data leakage.
 
-Distance formula:
+Distance formula (raw hybrid Manhattan, no global normalisation):
 
 ```
-dist(a, b) = 2 × Σ_i d_i(a, b) / n_cols
+dist(a, b) = Σ_i |enc_i(a) - enc_i(b)|
 ```
 
-where `d_i ∈ [0, 1]` for every column `i`.  Result is in [0, 2].
+where `enc_i ∈ [0, 1]` for every encoded column `i`.  A single nominal
+feature change contributes exactly **1.0**; a single ordinal step in SCHL
+(23 levels) contributes **1/22 ≈ 0.045**.  The distance is directly
+interpretable as "how many feature-equivalent changes apart".
 
 ### Multi-k evaluation
 

@@ -587,7 +587,7 @@ def run_bocsor_single_k(
     k: int,
     original_class: int,
     n_workers: int,
-) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame, dict]:
     """
     Run BoCSoR for a single k value.
 
@@ -597,7 +597,7 @@ def run_bocsor_single_k(
 
     Returns
     -------
-    (itemsets_df, feature_importance, distances_df)
+    (itemsets_df, feature_importance, distances_df, filter_stats)
     """
     logger.info(
         "  k=%d | boundary instances: %d (class %d)",
@@ -664,6 +664,15 @@ def run_bocsor_single_k(
             n_filtered / len(boundary_indices) * 100,
         )
 
+    filter_stats = {
+        "k": k,
+        "boundary_instances": len(boundary_indices),
+        "instances_with_cf": len({r["instance_index"] for r in all_dist_rows}),
+        "instances_filtered_dist0": n_filtered,
+        "pct_filtered": round(n_filtered / max(len(boundary_indices), 1) * 100, 2),
+        "instances_with_relevant_features": n_with_cf,
+    }
+
     # Normalise by n_with_cf (instances that produced ≥ 1 relevant feature)
     # rather than len(boundary_indices).  Instances for which no feature swap
     # changed the prediction contribute no signal, so excluding them from the
@@ -685,7 +694,7 @@ def run_bocsor_single_k(
             .sort_values(["instance_index", "k_neighbour_rank"], ascending=True)
             .reset_index(drop=True)
         )
-    return pd.DataFrame(all_rows), feat_imp, dist_df
+    return pd.DataFrame(all_rows), feat_imp, dist_df, filter_stats
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -704,7 +713,7 @@ def run_bocsor_multi_k(
     original_class: int = 0,
     cf_class: int = 1,
     n_workers: int = _DEFAULT_WORKERS,
-) -> tuple[pd.DataFrame, pd.DataFrame, dict[int, pd.DataFrame], pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[int, pd.DataFrame], pd.DataFrame, pd.DataFrame]:
     """
     Run BoCSoR once per value in k_values on the training set.
 
@@ -725,13 +734,13 @@ def run_bocsor_multi_k(
 
     Returns
     -------
-    (all_itemsets_df, importance_df, per_k_itemsets, distances_df)
-      all_itemsets_df : columns [k_value, instance_index, features, itemset].
-      importance_df   : features x k_values wide table (columns k_1, k_3, ...).
-      per_k_itemsets  : {k -> itemset DataFrame for that k only}.
-      distances_df    : columns [k_value, instance_index, cf_index,
-                        k_neighbour_rank, distance] — one row per
-                        (boundary_instance, k_neighbour) pair.
+    (all_itemsets_df, importance_df, per_k_itemsets, distances_df, filter_stats_df)
+      all_itemsets_df  : columns [k_value, instance_index, features, itemset].
+      importance_df    : features x k_values wide table (columns k_1, k_3, ...).
+      per_k_itemsets   : {k -> itemset DataFrame for that k only}.
+      distances_df     : columns [k_value, instance_index, cf_index,
+                         k_neighbour_rank, distance, n_diff_features].
+      filter_stats_df  : one row per k with boundary/filtered/relevant counts.
     """
     logger.info(
         "BoCSoR on TRAINING SET: k=%s  class %d->%d  "
@@ -777,17 +786,23 @@ def run_bocsor_multi_k(
             columns=["k_value", "instance_index", "cf_index",
                      "k_neighbour_rank", "distance", "n_diff_features"]
         )
-        return empty_df, imp_df, {k: empty_df.copy() for k in k_values}, empty_dist
+        empty_fstats = pd.DataFrame(
+            columns=["k", "boundary_instances", "instances_with_cf",
+                     "instances_filtered_dist0", "pct_filtered",
+                     "instances_with_relevant_features"]
+        )
+        return empty_df, imp_df, {k: empty_df.copy() for k in k_values}, empty_dist, empty_fstats
 
     # ── Run once per k (boundary instances reused) ────────────────────────────
     all_itemsets:    list[pd.DataFrame]   = []
     all_distances:   list[pd.DataFrame]   = []
+    all_filter_stats: list[dict]          = []
     importance_dict: dict[int, pd.Series] = {}
 
     for k in k_values:
         logger.info("── k=%d ──────────────────────────────────────────────", k)
         t_k = time.perf_counter()
-        itemsets_df, feat_imp, dist_df = run_bocsor_single_k(
+        itemsets_df, feat_imp, dist_df, fstats = run_bocsor_single_k(
             model=model,
             X_train=X_train,
             X_enc=X_enc,
@@ -801,6 +816,7 @@ def run_bocsor_multi_k(
             original_class=original_class,
             n_workers=n_workers,
         )
+        all_filter_stats.append(fstats)
         logger.info("  k=%d | elapsed: %.1fs", k, time.perf_counter() - t_k)
         # Always tag with k_value — even if empty — so pd.concat produces
         # a consistent column schema across all k values.
@@ -845,7 +861,8 @@ def run_bocsor_multi_k(
             .reset_index(drop=True)
         )
 
-    return combined, imp_df, per_k_itemsets, distances_df
+    filter_stats_df = pd.DataFrame(all_filter_stats)
+    return combined, imp_df, per_k_itemsets, distances_df, filter_stats_df
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1480,7 +1497,7 @@ def main() -> None:
             orig_cls, cf_cls,
         )
         t_dir = time.perf_counter()
-        all_itemsets_df, importance_df, per_k_itemsets, distances_df = run_bocsor_multi_k(
+        all_itemsets_df, importance_df, per_k_itemsets, distances_df, filter_stats_df = run_bocsor_multi_k(
             model=model,
             X_train=X_train,
             y_train=y_train,
@@ -1516,12 +1533,16 @@ def main() -> None:
         logger.info("Importance -> %s", imp_path)
 
         # Distances: one row per (boundary_instance, k_neighbour) pair.
-        # Columns: [k_value, instance_index, cf_index, k_neighbour_rank, distance].
         dist_path = args.output_dir / f"bocsor_distances{suffix}.csv"
         distances_df.to_csv(dist_path, index=False)
         logger.info("Distances -> %s  (%d rows)", dist_path, len(distances_df))
 
-        # ── Distance histograms ───────────────────────────────────────────
+        # Filter stats: one row per k with boundary/filtered/relevant counts.
+        fstats_path = args.output_dir / f"bocsor_filter_stats{suffix}.csv"
+        filter_stats_df.to_csv(fstats_path, index=False)
+        logger.info("Filter stats -> %s", fstats_path)
+
+        # ── Distance histograms (saved to plots/ subfolder) ───────────────
         plot_distance_histograms(
             distances_df, args.output_dir, suffix=suffix,
         )
@@ -1583,7 +1604,7 @@ def plot_distance_histograms(
     distances_df: pd.DataFrame,
     output_dir: Path,
     suffix: str = "",
-    bins: int = 60,
+    bins: int = 80,
 ) -> None:
     """
     Plot per-rank distance histograms and differing-feature breakdowns.
@@ -1620,7 +1641,8 @@ def plot_distance_histograms(
         logger.info("No non-zero distances to plot.")
         return
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    plots_dir = output_dir / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
     k_values = sorted(distances_df["k_value"].unique())
 
     # Use the largest k run — contains ranks 1 through max_k.
@@ -1655,7 +1677,7 @@ def plot_distance_histograms(
         dists = rank_df["distance"].to_numpy()
         ordinal = f"{rank}{'st' if rank == 1 else 'nd' if rank == 2 else 'rd' if rank == 3 else 'th'}"
 
-        fig, ax = plt.subplots(figsize=(12, 7))
+        fig, ax = plt.subplots(figsize=(16, 9))
 
         if has_ndiff and len(diff_values) > 1:
             # Stacked histogram: one layer per n_diff_features value.
@@ -1669,35 +1691,48 @@ def plot_distance_histograms(
             ax.hist(layers, bins=bin_edges, stacked=True, edgecolor="black",
                     linewidth=0.4, alpha=0.85,
                     color=_colors[:len(layers)], label=labels)
-            ax.legend(fontsize=8, title="Diff. features")
+            ax.legend(fontsize=10, title="Diff. features")
         else:
             ax.hist(dists, bins=bin_edges, edgecolor="black", alpha=0.75,
                     color="#4C72B0")
 
         ax.axvline(float(np.median(dists)), color="red", linestyle="--",
                    linewidth=1, label=f"median = {np.median(dists):.3f}")
-        ax.legend(fontsize=8)
-        ax.set_xlabel("Hybrid Manhattan distance to counterfactual (1.0 = one nominal change)")
-        ax.set_ylabel("Number of instances")
+        ax.legend(fontsize=10)
+
+        # Dense ticks + grid for readability.
+        from matplotlib.ticker import MultipleLocator, AutoMinorLocator
+        ax.xaxis.set_major_locator(MultipleLocator(0.1))
+        ax.xaxis.set_minor_locator(AutoMinorLocator(2))
+        ax.yaxis.set_minor_locator(AutoMinorLocator(2))
+        ax.tick_params(which="minor", length=3)
+        ax.tick_params(which="major", length=6)
+        ax.grid(axis="both", which="major", alpha=0.25, linewidth=0.5)
+
+        ax.set_xlabel("Hybrid Manhattan distance to counterfactual (1.0 = one nominal change)",
+                       fontsize=12)
+        ax.set_ylabel("Number of instances", fontsize=12)
         ax.set_title(
             f"BoCSoR: distance to the {ordinal} nearest counterfactual\n"
             f"({len(dists):,} instances, "
-            f"range [{dists.min():.3f}, {dists.max():.3f}])"
+            f"range [{dists.min():.3f}, {dists.max():.3f}])",
+            fontsize=14,
         )
         fig.tight_layout()
 
-        path = output_dir / f"bocsor_distance_histogram_rank{rank}{suffix}.png"
-        fig.savefig(path, dpi=200)
+        path = plots_dir / f"bocsor_distance_histogram_rank{rank}{suffix}.png"
+        fig.savefig(path, dpi=250)
         plt.close(fig)
         logger.info("Distance histogram rank=%d -> %s", rank, path.name)
 
     # ── Combined figure: one subplot per rank ────────────────────────────
     if len(ranks) > 1:
+        from matplotlib.ticker import MultipleLocator, AutoMinorLocator
         n_r = len(ranks)
         n_cols_grid = min(3, n_r)
         n_rows = math.ceil(n_r / n_cols_grid)
         fig, axes = plt.subplots(
-            n_rows, n_cols_grid, figsize=(7 * n_cols_grid, 5.5 * n_rows),
+            n_rows, n_cols_grid, figsize=(8 * n_cols_grid, 6 * n_rows),
             squeeze=False,
         )
 
@@ -1717,10 +1752,15 @@ def plot_distance_histograms(
                 ax.hist(layers, bins=bin_edges, stacked=True, edgecolor="black",
                         linewidth=0.3, alpha=0.85,
                         color=_colors[:len(layers)], label=labels)
-                ax.legend(fontsize=6)
+                ax.legend(fontsize=7)
             else:
                 ax.hist(dists, bins=bin_edges, edgecolor="black", alpha=0.75,
                         color="#4C72B0")
+
+            ax.xaxis.set_major_locator(MultipleLocator(0.2))
+            ax.xaxis.set_minor_locator(AutoMinorLocator(2))
+            ax.yaxis.set_minor_locator(AutoMinorLocator(2))
+            ax.grid(axis="both", which="major", alpha=0.2, linewidth=0.5)
 
             ordinal = f"{rank}{'st' if rank == 1 else 'nd' if rank == 2 else 'rd' if rank == 3 else 'th'}"
             ax.set_title(f"{ordinal} nearest CF  (n={len(dists):,}, med={np.median(dists):.3f})")
@@ -1736,8 +1776,8 @@ def plot_distance_histograms(
         )
         fig.tight_layout(rect=[0, 0, 1, 0.96])
 
-        path = output_dir / f"bocsor_distance_histograms_per_rank{suffix}.png"
-        fig.savefig(path, dpi=200)
+        path = plots_dir / f"bocsor_distance_histograms_per_rank{suffix}.png"
+        fig.savefig(path, dpi=250)
         plt.close(fig)
         logger.info("Per-rank distance histograms -> %s", path.name)
 
@@ -1778,8 +1818,8 @@ def plot_distance_histograms(
         ax.legend(loc="upper right", fontsize=8)
         fig.tight_layout()
 
-        path = output_dir / f"bocsor_diff_features_pct{suffix}.png"
-        fig.savefig(path, dpi=200)
+        path = plots_dir / f"bocsor_diff_features_pct{suffix}.png"
+        fig.savefig(path, dpi=250)
         plt.close(fig)
         logger.info("Diff features stacked bars -> %s", path.name)
 
