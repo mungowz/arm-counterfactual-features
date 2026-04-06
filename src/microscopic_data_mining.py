@@ -96,8 +96,14 @@ Performance design
   3. Per-rule transaction filtering uses a vectorised pandas mask on the
      exploded token frame — no Python loop over rows.
   4. Grid search reuses the adaptive strategy from stage 3 (vectorised path
-     for few items, threaded path for many items).
-  5. Results across all macroscopic rules are concatenated and deduplicated
+     for few items, threaded path for many items), including the static mask
+     cache optimisation.
+  5. Parallel per-k processing: when multiple k values are present, each k is
+     dispatched to a ThreadPoolExecutor worker.  Each k loads its own itemset
+     CSV, its own macroscopic rules, and writes to its own micro/ directory.
+     Inner workers (per-macro-rule parallelism and grid search) are reduced
+     proportionally to avoid over-subscription.
+  6. Results across all macroscopic rules are concatenated and deduplicated
      before writing.
 
 Dependencies
@@ -638,8 +644,14 @@ def _run_micro_for_k(
 
     # ── Parallel per-macro-rule processing ───────────────────────────────────
     # Each macro rule generates an independent filtered transaction set and
-    # grid search — no shared mutable state.  ProcessPoolExecutor with fork
-    # inherits exploded_tokens in shared memory without serialisation.
+    # grid search — no shared mutable state.  ThreadPoolExecutor is used
+    # instead of ProcessPoolExecutor(fork) because:
+    #   - fork causes deadlocks on macOS when Apple Accelerate/BLAS mutex
+    #     state is duplicated in an inconsistent state.
+    #   - The work is mostly NumPy/pandas (GIL released) + mlxtend FP-Growth
+    #     (C-extension, GIL released), so threads achieve true concurrency.
+    #   - Shared data (exploded_tokens, macro_rules) stays in-process with
+    #     zero serialisation overhead.
     #
     # Inner grid search worker count is reduced to avoid oversubscription:
     # total threads ≈ n_parallel × inner_workers ≤ cpu_count.
@@ -655,13 +667,9 @@ def _run_micro_for_k(
             "(inner grid workers: %d).",
             n_rules, n_parallel, inner_workers,
         )
-        import multiprocessing
-        _fork_ctx = multiprocessing.get_context("fork")
-        from concurrent.futures import ProcessPoolExecutor, as_completed
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        with ProcessPoolExecutor(
-            max_workers=n_parallel, mp_context=_fork_ctx
-        ) as executor:
+        with ThreadPoolExecutor(max_workers=n_parallel) as executor:
             futures = {
                 executor.submit(
                     _run_micro_for_macro_rule,
@@ -916,7 +924,14 @@ def run_microscopic_mining(
         all_micro_rules_list:   list[pd.DataFrame] = []
         all_micro_summary_list: list[pd.DataFrame] = []
 
-        for k_val in k_values_to_run:
+        # ── Worker function: process one k value (thread-safe) ───────────────
+        # Each k reads from its own per-k CSV, writes to its own directory,
+        # and runs an independent grid search.  Heatmap rendering uses
+        # Figure() directly (thread-safe, no pyplot global state).
+        def _process_one_micro_k(
+            k_val: int, inner_workers: int,
+        ) -> tuple[pd.DataFrame, pd.DataFrame]:
+            """Process one k for microscopic ARM; returns (rules, summary)."""
             k_out        = _k_dir(output_dir, k_val)
             micro_out    = _micro_dir(k_out)
             micro_rules_path = micro_out / f"micro{suffix}_rules.csv"
@@ -935,13 +950,12 @@ def run_microscopic_mining(
                         if _summary_path.exists()
                         else pd.DataFrame()
                     )
-                    if not ex_rules.empty:
-                        all_micro_rules_list.append(ex_rules)
-                    if not ex_summary.empty:
-                        all_micro_summary_list.append(ex_summary)
+                    return (
+                        ex_rules if not ex_rules.empty else pd.DataFrame(),
+                        ex_summary if not ex_summary.empty else pd.DataFrame(),
+                    )
                 except (pd.errors.EmptyDataError, FileNotFoundError):
-                    pass
-                continue
+                    return pd.DataFrame(), pd.DataFrame()
 
             # Locate macroscopic rules for this k.
             macro_path = _find_macro_rules_path(output_dir, k_val, suffix)
@@ -950,14 +964,14 @@ def run_microscopic_mining(
                     "  No macroscopic rules found for k=%d suffix='%s' — skipping.",
                     k_val, suffix,
                 )
-                continue
+                return pd.DataFrame(), pd.DataFrame()
 
             macro_rules = _load_macro_rules(macro_path)
             if macro_rules.empty:
                 logger.warning("  Macroscopic rules file is empty for k=%d.", k_val)
-                continue
+                return pd.DataFrame(), pd.DataFrame()
 
-            rules_k, summary_k = _run_micro_for_k(
+            return _run_micro_for_k(
                 k_val=k_val,
                 output_dir=output_dir,
                 suffix=suffix,
@@ -968,13 +982,38 @@ def run_microscopic_mining(
                 confidence_step=confidence_step,
                 lift_independence_low=lift_independence_low,
                 lift_independence_high=lift_independence_high,
-                n_workers=n_workers,
+                n_workers=inner_workers,
             )
 
-            if not rules_k.empty:
-                all_micro_rules_list.append(rules_k)
-            if not summary_k.empty:
-                all_micro_summary_list.append(summary_k)
+        # ── Dispatch: parallel if multiple k values, sequential otherwise ─────
+        n_k = len(k_values_to_run)
+        if n_k > 1:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            k_workers   = min(n_workers, n_k)
+            inner_per_k = max(1, n_workers // k_workers)
+            logger.info(
+                "  Parallel micro ARM: %d k values × %d workers "
+                "(inner workers per k: %d).",
+                n_k, k_workers, inner_per_k,
+            )
+            with ThreadPoolExecutor(max_workers=k_workers) as executor:
+                futures = {
+                    executor.submit(_process_one_micro_k, k_val, inner_per_k): k_val
+                    for k_val in k_values_to_run
+                }
+                for future in as_completed(futures):
+                    rules_k, summary_k = future.result()
+                    if not rules_k.empty:
+                        all_micro_rules_list.append(rules_k)
+                    if not summary_k.empty:
+                        all_micro_summary_list.append(summary_k)
+        else:
+            for k_val in k_values_to_run:
+                rules_k, summary_k = _process_one_micro_k(k_val, n_workers)
+                if not rules_k.empty:
+                    all_micro_rules_list.append(rules_k)
+                if not summary_k.empty:
+                    all_micro_summary_list.append(summary_k)
 
         # ── Aggregate all-k micro results ─────────────────────────────────────
         logger.info("── Aggregating all-k micro results for class %d …", orig_cls)

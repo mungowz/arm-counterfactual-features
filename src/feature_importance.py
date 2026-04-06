@@ -57,8 +57,8 @@ Adaptations for fully-categorical data
       normalised per-column via min-max to [0, 1].
     - Nominal columns (all others): one-hot encoding divided by 2.
       Within a single nominal column two samples either share the same
-      category (Manhattan distance 0) or differ (Manhattan distance
-      0.5 + 0.5 = 1.0, equivalent to Hamming distance 1).
+      category (distance 0) or differ (raw Hamming distance 2, divided
+      by 2 = 1.0, computed as Manhattan on the ×0.5 encoded bits).
     Both groups therefore contribute values in [0, 1] per original column,
     making ordinal and nominal columns commensurable.
 
@@ -99,19 +99,33 @@ Adaptations for fully-categorical data
 
 Parallelism and performance
 ────────────────────────────
-* Start method: multiprocessing uses "fork" so worker processes inherit the
-  parent's memory (rank maps, encoded arrays, model) without reimporting.
+* Precomputed NN query: the brute-force k-NN query (the most expensive step)
+  is executed ONCE with k_query sized for the maximum k value.  The resulting
+  (distances, indices) arrays are shared across all per-k runs, eliminating
+  len(k_values)-1 redundant O(N × M) distance computations.
+* Pre-allocated hybrid encoding: encode_hybrid() pre-allocates one contiguous
+  output array via n_encoded_cols() and writes columns in-place, instead of
+  building ~150 small arrays and concatenating.
+* ThreadPoolExecutor for boundary chunk processing: CatBoost.predict() and
+  MLPClassifier.predict() are implemented in C++/Cython and release the GIL,
+  enabling true thread-level concurrency without the fork-safety issues that
+  cause deadlocks on macOS (Apple Accelerate's internal mutex state is not
+  fork-safe).
 * Brute-force NN index (sklearn, Manhattan metric): built once on the cf-class
-  instances and inherited by workers via fork.  Uses BLAS-accelerated distance
-  computation — faster than BallTree at high dimensions (147 encoded columns)
-  due to the curse of dimensionality.  Used for both boundary selection and
-  batched k-NN queries in each worker (one BLAS call per chunk, not per
-  instance).
+  instances and shared across threads (no serialisation overhead).  Manhattan
+  distance is computed via SciPy cdist (Cython), which also releases the GIL.
+  Brute-force is faster than BallTree at high dimensions (147 encoded columns)
+  due to the curse of dimensionality.
+* Boundary selection (k=1 query): uses n_jobs=-1 for multi-core parallelism
+  via joblib (loky backend, spawn-like — safe after BLAS/Accelerate usage).
 * Batch predict: for each boundary instance the relevance check builds a
   batch of all modified instances (one per differing feature, across all k
   counterfactuals) and calls model.predict() once, instead of one call per
-  feature per counterfactual.
-* Boundary instance processing: chunks dispatched via ProcessPoolExecutor.
+  feature per counterfactual.  Batch array is pre-allocated with np.empty()
+  instead of building a list and converting.
+* Vectorised n_diff: numpy element-wise comparison replaces Python generator.
+* Derived relevant_union: computed from per_cf_relevant dict, not re-iterated.
+* Thread-safe histograms: Figure() instead of plt.subplots() (no pyplot state).
 * CatBoost inference uses thread_count=1 per worker to avoid competing pools.
 * Worker count defaults to (cpu_count - 2), capped at 14.
 """
@@ -123,11 +137,10 @@ import logging
 import math
 import os
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
-import multiprocessing
 import numpy as np
 import pandas as pd
 from catboost import CatBoostClassifier
@@ -237,12 +250,12 @@ def encode_hybrid(
     Nominal columns (in nominal_maps)
     ──────────────────────────────────
     One-hot encoding, one column per category.  Within a single original
-    column the Manhattan distance between two samples is either 0 (same
-    category, bits identical) or 2 (different categories, two bits differ).
-    Each one-hot column therefore contributes 0 or 1 after dividing by 2 — 
-    still in [0, 1].  The /2 normalisation is applied here so that the
-    encoded values are 0.0 or 0.5 per bit; the Manhattan distance
-    then recovers values in {0, 1} per original nominal column.
+    column the raw Hamming distance between two samples is either 0 (same
+    category) or 2 (different category — exactly two bits differ).
+    Dividing by 2 gives a per-column distance of 0 or 1.  This is
+    implemented by encoding each one-hot bit as 0.0 or 0.5, so that
+    Manhattan distance on the encoded values recovers Hamming/2:
+        |0.5 - 0.0| + |0.0 - 0.5| = 1.0  (= Hamming 2 / 2)
 
     Column order
     ────────────
@@ -262,7 +275,15 @@ def encode_hybrid(
     (n_samples, n_encoded_cols) float32 array.
     """
     n = len(df)
-    cols_out: list[np.ndarray] = []
+    total_cols = n_encoded_cols(feature_cols, rank_maps, nominal_maps)
+    if total_cols == 0:
+        return np.empty((n, 0), dtype=np.float32)
+
+    # Pre-allocate output: one contiguous block instead of many small arrays
+    # concatenated at the end.  Reduces allocation overhead and improves cache
+    # locality on large datasets (1M+ rows × 150+ encoded columns).
+    out = np.empty((n, total_cols), dtype=np.float32)
+    col_ptr = 0
 
     for col in feature_cols:
         if col in rank_maps:
@@ -275,24 +296,22 @@ def encode_hybrid(
             fallback = 0.5
             # Build a pre-normalised mapping: {category -> normalised_rank}.
             norm_map = {cat: (rank - 1) / denom for cat, rank in rmap.items()}
-            vals = (
+            out[:, col_ptr] = (
                 df[col]
                 .map(norm_map)          # C-optimised dict lookup
                 .fillna(fallback)       # unknown categories → mid-range
                 .to_numpy(dtype=np.float32)
             )
-            cols_out.append(vals.reshape(-1, 1))
+            col_ptr += 1
         else:
             # ── Nominal: one-hot / 2  → each bit in {0.0, 0.5} ──────────────
             cats = nominal_maps.get(col, [])
             col_vals = df[col].to_numpy()
             for cat in cats:
-                bit = (col_vals == cat).astype(np.float32) * 0.5
-                cols_out.append(bit.reshape(-1, 1))
+                out[:, col_ptr] = (col_vals == cat).astype(np.float32) * 0.5
+                col_ptr += 1
 
-    if not cols_out:
-        return np.empty((n, 0), dtype=np.float32)
-    return np.concatenate(cols_out, axis=1)
+    return out
 
 
 def encoded_col_names(
@@ -324,8 +343,8 @@ def n_encoded_cols(
     """
     Return the total number of columns produced by encode_hybrid.
 
-    Utility function — not currently called by the pipeline but retained
-    for diagnostics and potential future use.
+    Used by encode_hybrid() to pre-allocate the output array, and available
+    for diagnostics.
     """
     total = 0
     for col in feature_cols:
@@ -381,17 +400,19 @@ def build_nn_index(X_enc: np.ndarray) -> NearestNeighbors:
 
     Uses sklearn NearestNeighbors with algorithm='brute' and Manhattan
     metric.  At high dimensions (e.g. 147 encoded columns), brute-force
-    BLAS distance computation is significantly faster than tree-based
-    methods (BallTree/KDTree) which degrade due to the curse of
-    dimensionality.
+    distance computation is faster than tree-based methods (BallTree/KDTree)
+    which degrade due to the curse of dimensionality.
 
-    The index is built once in the main process and inherited by worker
-    processes via fork — no serialisation overhead.
+    n_jobs=1 because this index is shared across ThreadPoolExecutor workers:
+    each thread calls kneighbors() concurrently, and the underlying SciPy
+    cdist (Cython) releases the GIL, enabling true thread-level parallelism.
+    Using n_jobs > 1 here would cause over-subscription (joblib threads
+    inside ThreadPoolExecutor threads).
 
-    Each encoded column contributes values in [0, 1]:
+    Hybrid distance:
         dist(a, b) = Σ_i |enc_i(a) - enc_i(b)|
-    A single nominal feature change contributes 1.0; a single ordinal
-    step contributes 1/(n_levels - 1).
+    Ordinal columns: rank-normalised to [0, 1] → one step = 1/(n_levels-1).
+    Nominal columns: one-hot × 0.5 → Hamming/2, i.e. 0 or 1 per column.
     """
     nn = NearestNeighbors(algorithm="brute", metric="manhattan", n_jobs=1)
     nn.fit(X_enc.astype(np.float32))
@@ -454,19 +475,40 @@ def select_boundary_instances(
     X_enc_orig = X_enc[orig_indices]
     X_enc_cf   = X_enc[cf_indices]
 
-    # Build NN index on the true-cf-class instances.
-    cf_nn = build_nn_index(X_enc_cf)
+    # ── Boundary selection: k=1 query ────────────────────────────────────
+    # Manhattan distance uses SciPy cdist (Cython), NOT BLAS — unlike
+    # Euclidean distance, Apple Accelerate is not involved.  n_jobs=-1
+    # enables joblib parallelism: sklearn splits query points across
+    # multiple workers, each computing a subset of pairwise distances.
+    # This is safe here because joblib uses the "loky" backend (spawn-
+    # like), not raw fork.
+    logger.info(
+        "  Boundary k=1: building NN index on %d cf-class instances …",
+        len(X_enc_cf),
+    )
+    cf_nn_boundary = NearestNeighbors(
+        algorithm="brute", metric="manhattan", n_jobs=-1,
+    )
+    cf_nn_boundary.fit(X_enc_cf.astype(np.float32))
 
-    # Query k=1 to find each orig-class instance's nearest cf-class neighbour.
     X_orig_q = X_enc_orig.astype(np.float32)
-    min_dists, _ = cf_nn.kneighbors(X_orig_q, n_neighbors=1)   # (N_orig, 1)
-    min_dists    = min_dists[:, 0]                               # (N_orig,)
+    logger.info(
+        "  Boundary k=1: querying %d orig-class instances (multi-core via joblib) …",
+        len(X_orig_q),
+    )
+    min_dists, _ = cf_nn_boundary.kneighbors(X_orig_q, n_neighbors=1)
+    min_dists    = min_dists[:, 0]
+    del cf_nn_boundary   # free memory — no longer needed
 
     # Use <= to match the original authors' convention.
     threshold = float(np.percentile(min_dists, percentile_th))
     b_local   = np.where(min_dists <= threshold)[0]
 
     boundary_indices = orig_indices[b_local]
+
+    # ── Build the worker NN index (n_jobs=1, shared by ThreadPoolExecutor) ──
+    cf_nn = build_nn_index(X_enc_cf)
+
     return boundary_indices, cf_indices, X_enc_cf, cf_nn
 
 
@@ -485,14 +527,16 @@ def _process_boundary_chunk(
     k: int,
     original_class: int,
     cf_nn: NearestNeighbors,
+    precomputed_dists: np.ndarray | None = None,
+    precomputed_tops: np.ndarray | None = None,
 ) -> tuple[dict[str, int], list[dict], list[dict], dict[str, int], dict[str, int], int]:
     """
-    Process one chunk of boundary instances in a worker process.
+    Process one chunk of boundary instances in a worker thread.
 
     For each boundary instance:
       1. Find the k nearest neighbours from the counterfactual class that
          differ in at least one feature (distance > 0).  The NN index is
-         queried once for the ENTIRE chunk in a single BLAS call, then
+         queried once for the ENTIRE chunk in a single batched call, then
          results are filtered per-instance to skip cross-class duplicates
          (identical features, different label).  This guarantees every
          counterfactual has ≥ 1 feature to substitute.
@@ -504,7 +548,14 @@ def _process_boundary_chunk(
       4. Take the UNION of relevant features across all k counterfactuals
          and emit one itemset row per boundary instance (input for ARM).
 
-    The model is inherited from the parent process via fork — no disk I/O.
+    Called from ThreadPoolExecutor — model, NN index and encoded arrays
+    are shared in-process (no serialisation overhead).
+
+    Parameters
+    ----------
+    precomputed_dists : If provided, skip the NN query and use these
+                        precomputed distances (shape: chunk_size × k_query).
+    precomputed_tops  : Corresponding NN indices for precomputed_dists.
 
     Returns
     -------
@@ -529,12 +580,17 @@ def _process_boundary_chunk(
     feat_to_idx: dict[str, int] = {f: i for i, f in enumerate(feature_cols)}
 
     # ── Batch k-NN query for ALL instances in this chunk at once ──────────
-    # A single BLAS call computes the entire (chunk_size × n_cf) distance
-    # matrix, which is orders of magnitude faster than chunk_size separate
-    # single-row queries.
-    k_query = min(max(k * 50, 200), n_cf)
-    chunk_queries = X_enc[chunk_indices].astype(np.float32)
-    all_dists, all_tops = cf_nn.kneighbors(chunk_queries, n_neighbors=k_query)
+    # When precomputed_dists/precomputed_tops are provided (multi-k mode),
+    # the expensive NN query was already performed once in run_bocsor_multi_k
+    # and is reused across all k values — avoiding redundant O(N×M) distance
+    # computations.  Otherwise, query on-the-fly (single-k standalone mode).
+    if precomputed_dists is not None and precomputed_tops is not None:
+        all_dists = precomputed_dists
+        all_tops  = precomputed_tops
+    else:
+        k_query = min(max(k * 50, 200), n_cf)
+        chunk_queries = X_enc[chunk_indices].astype(np.float32)
+        all_dists, all_tops = cf_nn.kneighbors(chunk_queries, n_neighbors=k_query)
 
     for row_i, b_idx in enumerate(chunk_indices):
         dists_row = all_dists[row_i]
@@ -556,10 +612,11 @@ def _process_boundary_chunk(
 
         # Record one distance row per (boundary_instance, k_neighbour) pair.
         # All distances here are guaranteed > 0.
+        # Vectorised n_diff: numpy element-wise comparison instead of
+        # a Python-level generator expression (avoids per-element overhead).
         for rank, (cf_idx, dist) in enumerate(zip(cf_idxs, cf_dists), start=1):
             cf_vals = X_train_values[cf_idx]
-            n_diff = int(sum(1 for fi in range(n_features)
-                             if cf_vals[fi] != instance_vals[fi]))
+            n_diff = int(np.sum(cf_vals != instance_vals))
             distance_rows.append({
                 "instance_index":    int(b_idx),
                 "cf_index":          cf_idx,
@@ -571,25 +628,26 @@ def _process_boundary_chunk(
         # ── Algorithm 2: batched relevance check ─────────────────────────────
         # Build one modified instance per (counterfactual, differing_feature)
         # pair, collect their (cf_idx, fi) metadata, then call predict once.
-        batch_rows:  list[np.ndarray] = []
+        # Pre-count differing features to pre-allocate the batch array,
+        # avoiding intermediate list + costly np.array(list, dtype=object).
         batch_meta:  list[tuple[int, int]] = []   # (cf_idx, feature_index)
-
         for cf_idx in cf_idxs:
             cf_vals = X_train_values[cf_idx]
             for fi in range(n_features):
-                if cf_vals[fi] == instance_vals[fi]:
-                    continue
-                modified    = cf_vals.copy()
-                modified[fi] = instance_vals[fi]
-                batch_rows.append(modified)
-                batch_meta.append((cf_idx, fi))
+                if cf_vals[fi] != instance_vals[fi]:
+                    batch_meta.append((cf_idx, fi))
 
-        if not batch_rows:
+        if not batch_meta:
             continue
 
+        batch_array = np.empty((len(batch_meta), n_features), dtype=object)
+        for i, (cf_idx, fi) in enumerate(batch_meta):
+            row = X_train_values[cf_idx].copy()
+            row[fi] = instance_vals[fi]
+            batch_array[i] = row
+
         # Single predict call for all (counterfactual, feature) pairs.
-        batch_array = np.array(batch_rows, dtype=object)
-        preds       = model.predict(batch_array, thread_count=1).ravel()
+        preds = model.predict(batch_array, thread_count=1).ravel()
 
         # Track CFs tested for the reformulated index denominator.
         n_cf_tested += k_act
@@ -609,10 +667,11 @@ def _process_boundary_chunk(
                 value_relevance[token] = value_relevance.get(token, 0) + 1
 
         # ── Union across all k CFs (existing logic for itemsets / ARM) ───
+        # Derived from per_cf_relevant (already computed above) instead of
+        # re-iterating over all (pred, batch_meta) pairs a second time.
         relevant_union: set[str] = set()
-        for pred, (_, fi) in zip(preds, batch_meta):
-            if int(pred) == original_class:
-                relevant_union.add(feature_cols[fi])
+        for feats in per_cf_relevant.values():
+            relevant_union |= feats
 
         if relevant_union:
             # One row per boundary instance — all relevant features on the same
@@ -650,9 +709,20 @@ def run_bocsor_single_k(
     k: int,
     original_class: int,
     n_workers: int,
+    precomputed_chunks: list[list[int]] | None = None,
+    precomputed_nn: list[tuple[np.ndarray, np.ndarray]] | None = None,
 ) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame, dict, pd.Series, pd.Series]:
     """
     Run BoCSoR for a single k value.
+
+    Parameters
+    ----------
+    precomputed_chunks : If provided, reuse these chunk index lists instead
+                         of recomputing them (shared across all k values).
+    precomputed_nn     : If provided, a list of (dists, tops) arrays — one
+                         per chunk — from a single NN query with the maximum
+                         k_query.  Avoids redundant NN computation across
+                         multiple k values.
 
     Returns
     -------
@@ -684,12 +754,18 @@ def run_bocsor_single_k(
         )
 
     # ── Chunk and dispatch ────────────────────────────────────────────────────
-    n_chunks   = min(n_workers, len(boundary_indices))
-    chunk_size = math.ceil(len(boundary_indices) / n_chunks)
-    chunks     = [
-        boundary_indices[i : i + chunk_size].tolist()
-        for i in range(0, len(boundary_indices), chunk_size)
-    ]
+    # When precomputed_chunks is provided (multi-k mode) the chunking was
+    # already computed once in run_bocsor_multi_k — reuse it.
+    if precomputed_chunks is not None:
+        chunks = precomputed_chunks
+    else:
+        n_chunks   = min(n_workers, len(boundary_indices))
+        chunk_size = math.ceil(len(boundary_indices) / n_chunks)
+        chunks     = [
+            boundary_indices[i : i + chunk_size].tolist()
+            for i in range(0, len(boundary_indices), chunk_size)
+        ]
+    n_chunks = len(chunks)
 
     total_importance: dict[str, int] = {f: 0 for f in feature_cols}
     all_rows:      list[dict] = []
@@ -701,10 +777,21 @@ def run_bocsor_single_k(
     total_value_rel: dict[str, int] = {}
     total_cf_tested: int = 0
 
-    _fork_ctx = multiprocessing.get_context("fork")
-    with ProcessPoolExecutor(max_workers=n_chunks, mp_context=_fork_ctx) as executor:
-        futures = {
-            executor.submit(
+    # ThreadPoolExecutor instead of ProcessPoolExecutor: CatBoost.predict()
+    # and MLPClassifier.predict() are implemented in C++/Cython and release
+    # the GIL, enabling true thread-level concurrency.  ProcessPoolExecutor
+    # with fork causes deadlocks on macOS because Apple Accelerate's internal
+    # mutex state is duplicated in an inconsistent state by fork().
+    with ThreadPoolExecutor(max_workers=n_chunks) as executor:
+        futures = {}
+        for ci, chunk in enumerate(chunks):
+            # When precomputed NN data is available, pass the chunk's
+            # (dists, tops) arrays so the worker skips the NN query.
+            if precomputed_nn is not None:
+                pc_dists, pc_tops = precomputed_nn[ci]
+            else:
+                pc_dists, pc_tops = None, None
+            futures[executor.submit(
                 _process_boundary_chunk,
                 chunk,
                 X_enc,
@@ -716,9 +803,9 @@ def run_bocsor_single_k(
                 k,
                 original_class,
                 cf_nn,
-            ): chunk
-            for chunk in chunks
-        }
+                pc_dists,
+                pc_tops,
+            )] = chunk
         for future in as_completed(futures):
             imp_c, rows_c, dist_c, lab_c, val_c, ncf_c = future.result()
             for feat, cnt in imp_c.items():
@@ -824,14 +911,15 @@ def run_bocsor_multi_k(
     Key optimisations vs. the naive loop:
     - Hybrid encoding of X_train: computed once, reused for all k values.
       Ordinal columns: rank-based, min-max normalised to [0,1].
-      Nominal columns: one-hot / 2, each bit in {0.0, 0.5}.
-    - Boundary selection via brute-force NN: BLAS-accelerated distance
-      computation, efficient at 147 encoded dimensions.
+      Nominal columns: one-hot / 2 (Hamming/2), each bit in {0.0, 0.5}.
+    - Boundary selection via brute-force NN: multi-core distance computation
+      (n_jobs=-1 via joblib), efficient at 147 encoded dimensions.
       Pools separated by TRUE label; only correctly-classified orig-class
       instances are candidates.  Built once, reused for all k values.
-    - k-NN (Algorithm 1) in workers: batched brute-force query — one BLAS
-      call per chunk instead of one per boundary instance.
-    - Workers inherit the NN index from the main process via fork.
+    - k-NN (Algorithm 1) in workers: batched brute-force query — one call
+      per chunk instead of one per boundary instance.
+    - Workers run in ThreadPoolExecutor (GIL released by SciPy cdist and
+      CatBoost/MLP predict); model and NN index shared in-process.
     - If zero boundary instances are found, all k values are skipped
       immediately without any tree query per k.
     - Relevance check uses batched model.predict() instead of one call
@@ -909,6 +997,39 @@ def run_bocsor_multi_k(
                 empty_dist, empty_fstats, empty_label_imp, empty_value_imp)
 
     # ── Run once per k (boundary instances reused) ────────────────────────────
+
+    # ── Precompute chunks and NN query ONCE for all k values ─────────────────
+    # The k-NN query is the most expensive step per chunk.  Because the top-k₁
+    # neighbours are always a prefix of the top-k₂ results (k₁ < k₂), a single
+    # query with k_query sized for the MAXIMUM k suffices for all k values.
+    # Each per-k run then simply slices the first k valid (dist > 0) neighbours
+    # from the same precomputed arrays.  This eliminates len(k_values)-1
+    # redundant O(N × M) brute-force distance computations.
+    n_chunks   = min(n_workers, len(boundary_indices))
+    chunk_size = math.ceil(len(boundary_indices) / n_chunks)
+    shared_chunks: list[list[int]] = [
+        boundary_indices[i : i + chunk_size].tolist()
+        for i in range(0, len(boundary_indices), chunk_size)
+    ]
+    max_k = max(k_values)
+    n_cf  = len(cf_indices)
+    k_query_global = min(max(max_k * 50, 200), n_cf)
+
+    t_nn = time.perf_counter()
+    logger.info(
+        "Precomputing NN query once for all k values: k_query=%d, %d chunks …",
+        k_query_global, len(shared_chunks),
+    )
+    shared_nn: list[tuple[np.ndarray, np.ndarray]] = []
+    for chunk in shared_chunks:
+        chunk_q = X_enc[chunk].astype(np.float32)
+        dists_c, tops_c = cf_nn.kneighbors(chunk_q, n_neighbors=k_query_global)
+        shared_nn.append((dists_c, tops_c))
+    logger.info(
+        "NN precomputation done (%.1fs).  Reused across %d k values.",
+        time.perf_counter() - t_nn, len(k_values),
+    )
+
     all_itemsets:    list[pd.DataFrame]   = []
     all_distances:   list[pd.DataFrame]   = []
     all_filter_stats: list[dict]          = []
@@ -932,6 +1053,8 @@ def run_bocsor_multi_k(
             k=k,
             original_class=original_class,
             n_workers=n_workers,
+            precomputed_chunks=shared_chunks,
+            precomputed_nn=shared_nn,
         )
         all_filter_stats.append(fstats)
         logger.info("  k=%d | elapsed: %.1fs", k, time.perf_counter() - t_k)
@@ -1499,7 +1622,6 @@ Examples:
 
 
 def main() -> None:
-    multiprocessing.set_start_method("fork", force=True)
 
     parser = build_parser()
     args   = parser.parse_args()
@@ -1760,7 +1882,8 @@ def plot_distance_histograms(
     """
     import matplotlib
     matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
 
     if distances_df.empty:
         logger.info("No distances to plot (empty DataFrame).")
@@ -1808,7 +1931,9 @@ def plot_distance_histograms(
         dists = rank_df["distance"].to_numpy()
         ordinal = f"{rank}{'st' if rank == 1 else 'nd' if rank == 2 else 'rd' if rank == 3 else 'th'}"
 
-        fig, ax = plt.subplots(figsize=(16, 9))
+        fig = Figure(figsize=(16, 9))
+        FigureCanvasAgg(fig)
+        ax = fig.add_subplot(111)
 
         if has_ndiff and len(diff_values) > 1:
             # Stacked histogram: one layer per n_diff_features value.
@@ -1853,7 +1978,6 @@ def plot_distance_histograms(
 
         path = plots_dir / f"bocsor_distance_histogram_rank{rank}{suffix}.png"
         fig.savefig(path, dpi=250)
-        plt.close(fig)
         logger.info("Distance histogram rank=%d -> %s", rank, path.name)
 
     # ── Combined figure: one subplot per rank ────────────────────────────
@@ -1862,10 +1986,9 @@ def plot_distance_histograms(
         n_r = len(ranks)
         n_cols_grid = min(3, n_r)
         n_rows = math.ceil(n_r / n_cols_grid)
-        fig, axes = plt.subplots(
-            n_rows, n_cols_grid, figsize=(8 * n_cols_grid, 6 * n_rows),
-            squeeze=False,
-        )
+        fig = Figure(figsize=(8 * n_cols_grid, 6 * n_rows))
+        FigureCanvasAgg(fig)
+        axes = fig.subplots(n_rows, n_cols_grid, squeeze=False)
 
         for idx, rank in enumerate(ranks):
             ax = axes[idx // n_cols_grid][idx % n_cols_grid]
@@ -1909,7 +2032,6 @@ def plot_distance_histograms(
 
         path = plots_dir / f"bocsor_distance_histograms_per_rank{suffix}.png"
         fig.savefig(path, dpi=250)
-        plt.close(fig)
         logger.info("Per-rank distance histograms -> %s", path.name)
 
     # ── Stacked bars: % of counterfactuals by n_diff at each rank ────────
@@ -1922,7 +2044,9 @@ def plot_distance_histograms(
             for d in diff_values:
                 pct_data[d].append(counts.get(d, 0) / total * 100 if total else 0)
 
-        fig, ax = plt.subplots(figsize=(max(10, len(ranks) * 0.9), 7))
+        fig = Figure(figsize=(max(10, len(ranks) * 0.9), 7))
+        FigureCanvasAgg(fig)
+        ax = fig.add_subplot(111)
         x = np.arange(len(ranks))
         bar_width = 0.65
         bottom = np.zeros(len(ranks))
@@ -1951,7 +2075,6 @@ def plot_distance_histograms(
 
         path = plots_dir / f"bocsor_diff_features_pct{suffix}.png"
         fig.savefig(path, dpi=250)
-        plt.close(fig)
         logger.info("Diff features stacked bars -> %s", path.name)
 
 

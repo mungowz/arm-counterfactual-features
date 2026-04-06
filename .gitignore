@@ -8,3 +8,5 @@ test.py
 results copy/
 catboost_info/
 *.sh
+*.csv
+*.log

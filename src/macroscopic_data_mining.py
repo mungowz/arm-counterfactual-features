@@ -92,8 +92,17 @@ Performance design
        • Many rules (> 500 per support level, typical with many columns):
          ThreadPoolExecutor evaluates each (support, confidence) cell
          concurrently; rule generation cost justifies parallelism.
-  5. Vectorised deduplication via serialised frozenset keys + drop_duplicates.
-  6. Single-pass filter: support, confidence, lift combined in one boolean mask.
+  5. Static mask cache: in the vectorised path, support-upper, confidence-upper,
+     and lift masks are pre-computed once per support level and reused across
+     all confidence cells via a single bitwise AND.
+  6. Vectorised deduplication via serialised frozenset keys + drop_duplicates.
+  7. Parallel per-k processing: when multiple k values are present, each k is
+     dispatched to a ThreadPoolExecutor worker.  Each k loads its own CSV,
+     runs its own grid search, and writes to its own directory.  Inner grid
+     workers are reduced proportionally to avoid over-subscription.
+  8. Thread-safe heatmaps: _make_heatmap() uses matplotlib.figure.Figure()
+     with FigureCanvasAgg instead of plt.subplots(), enabling concurrent
+     heatmap generation across k values without pyplot state conflicts.
 
 Dependencies
 ────────────
@@ -693,7 +702,16 @@ def run_grid_search(
         # ── Vectorised path ───────────────────────────────────────────────────
         # Call association_rules() once per support level at global min_confidence,
         # then filter each cell with numpy boolean masks — no thread overhead.
+        #
+        # Optimisation: the support-upper, confidence-upper, and lift masks are
+        # constant across all confidence levels for a given support.  They are
+        # pre-computed once and combined with the per-cell confidence-lower mask
+        # via a cheap bitwise AND — avoiding len(unique_confidences)-1 redundant
+        # mask re-evaluations per support level.
         rules_cache: dict[float, pd.DataFrame] = {}
+        static_mask_cache: dict[float, np.ndarray] = {}
+        conf_vals_cache: dict[float, np.ndarray] = {}
+
         for sup in unique_supports:
             fi = freq_cache[sup]
             if fi.empty:
@@ -707,21 +725,24 @@ def run_grid_search(
                 except Exception:
                     r = pd.DataFrame()
             rules_cache[sup] = r
+            if not r.empty:
+                # Pre-compute the static mask (constant across confidence levels).
+                static_mask_cache[sup] = (
+                    (r["support"].values    <= max_support)
+                    & (r["confidence"].values <= max_confidence)
+                    & (
+                        (r["lift"].values < lift_independence_low)
+                        | (r["lift"].values > lift_independence_high)
+                    )
+                )
+                conf_vals_cache[sup] = r["confidence"].values
 
         for sup, conf in grid:
             base = rules_cache[sup]
             if base.empty:
                 cell_results[(sup, conf)] = base
                 continue
-            mask = (
-                (base["support"]    <= max_support)
-                & (base["confidence"] >= conf)
-                & (base["confidence"] <= max_confidence)
-                & (
-                    (base["lift"] < lift_independence_low)
-                    | (base["lift"] > lift_independence_high)
-                )
-            )
+            mask = static_mask_cache[sup] & (conf_vals_cache[sup] >= conf)
             filtered = base.loc[mask]
             if not filtered.empty:
                 # assign() returns a copy only when there are actual rows,
@@ -901,18 +922,24 @@ def _make_heatmap(
     try:
         import matplotlib
         matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
         import matplotlib.patches as mpatches
         import seaborn as sns
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
     except ImportError as exc:
         raise ImportError(
             "matplotlib and seaborn are required for heatmaps.\n"
             "  pip install matplotlib seaborn"
         ) from exc
 
-    fig, ax = plt.subplots(
+    # Use Figure() directly instead of plt.subplots() to avoid the pyplot
+    # global state machine — this makes heatmap rendering thread-safe and
+    # enables concurrent generation across k values.
+    fig = Figure(
         figsize=(max(10, pivot.shape[1] * 0.35), max(8, pivot.shape[0] * 0.28))
     )
+    FigureCanvasAgg(fig)    # attach Agg renderer so fig.savefig() works
+    ax = fig.add_subplot(111)
 
     # Disable per-cell annotation when the grid is too dense to be readable.
     annotate = pivot.shape[0] * pivot.shape[1] <= 400
@@ -1008,9 +1035,10 @@ def _make_heatmap(
                 framealpha=0.85,
             )
 
-    plt.tight_layout()
+    fig.tight_layout()
     fig.savefig(save_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
+    # No plt.close() needed — Figure is not registered in the pyplot state
+    # machine, so it will be garbage-collected normally.
     logger.info("    Heatmap saved → %s", save_path.name)
 
 
@@ -1640,21 +1668,23 @@ def run_macroscopic_mining(
         all_rules_list:   list[pd.DataFrame] = []
         all_summary_list: list[pd.DataFrame] = []
 
-        for k_val in k_values_to_run:
-            # For the fallback (k=0) we use the combined file.
+        # ── Worker function: process a single k value (thread-safe) ──────────
+        # Each k writes to its own directory and loads its own CSV, so there
+        # is no shared mutable state.  _make_heatmap uses Figure() directly
+        # (not plt.subplots()) to avoid the pyplot global state machine.
+        def _process_one_k(
+            k_val: int, inner_workers: int,
+        ) -> tuple[pd.DataFrame, pd.DataFrame]:
+            """Process one k value, returning (rules_df, summary_df)."""
             effective_k = k_val if k_val != 0 else None
 
             if effective_k is not None:
                 k_out = _k_dir(output_dir, k_val)
                 k_rules_path   = k_out / f"arm{suffix}_rules.csv"
                 k_summary_path = k_out / f"arm{suffix}_grid_summary.csv"
-                # Sentinel file written when a k is processed but yields no rules.
                 k_sentinel     = k_out / f".arm{suffix}_done"
 
                 if k_rules_path.exists():
-                    # Safe reload: treat 0-row files as non-existing so the
-                    # k is reprocessed (can happen if a previous run crashed
-                    # after _save_rules but before generate_heatmaps).
                     try:
                         existing = pd.read_csv(k_rules_path)
                         existing_summary = (
@@ -1671,17 +1701,13 @@ def run_macroscopic_mining(
                             "  k=%d: existing rules file is empty — reprocessing.",
                             k_val,
                         )
-                        # Fall through to _run_for_k below.
                     else:
                         logger.info("  Skipping k=%d: output already exists.", k_val)
-                        all_rules_list.append(existing)
-                        if not existing_summary.empty:
-                            all_summary_list.append(existing_summary)
-                        continue
+                        return existing, existing_summary
 
                 if k_sentinel.exists():
                     logger.info("  Skipping k=%d: previously processed, no rules found.", k_val)
-                    continue
+                    return pd.DataFrame(), pd.DataFrame()
 
             try:
                 if effective_k is not None:
@@ -1695,19 +1721,17 @@ def run_macroscopic_mining(
                         confidence_step=confidence_step,
                         lift_independence_low=lift_independence_low,
                         lift_independence_high=lift_independence_high,
-                        n_workers=n_workers,
+                        n_workers=inner_workers,
                     )
-                    # Write sentinel so empty-result k values are not reprocessed.
                     if rules_k.empty:
                         k_sentinel.touch()
                 else:
-                    # Combined-file fallback.
                     logger.info("  ── combined (all k) ──────────────────────────────")
                     csv_path = _build_input_path(output_dir, suffix, None)
                     transactions = load_itemsets(csv_path)
                     if not transactions:
                         logger.warning("  No transactions; skipping.")
-                        continue
+                        return pd.DataFrame(), pd.DataFrame()
                     rules_k, summary_k, _freq_combined = run_grid_search(
                         transactions=transactions,
                         min_support=min_support, max_support=max_support,
@@ -1716,23 +1740,50 @@ def run_macroscopic_mining(
                         confidence_step=confidence_step,
                         lift_independence_low=lift_independence_low,
                         lift_independence_high=lift_independence_high,
-                        n_workers=n_workers,
+                        n_workers=inner_workers,
                     )
 
             except FileNotFoundError as exc:
                 logger.error("  %s", exc)
-                continue
+                return pd.DataFrame(), pd.DataFrame()
             except Exception as exc:
                 logger.error(
                     "  Unexpected error processing k=%d: %s — skipping.", k_val, exc,
                     exc_info=True,
                 )
-                continue
+                return pd.DataFrame(), pd.DataFrame()
 
-            if not rules_k.empty:
-                all_rules_list.append(rules_k)
-            if not summary_k.empty:
-                all_summary_list.append(summary_k)
+            return rules_k, summary_k
+
+        # ── Dispatch: parallel if multiple k values, sequential otherwise ─────
+        n_k = len(k_values_to_run)
+        if n_k > 1:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            k_workers    = min(n_workers, n_k)
+            inner_per_k  = max(1, n_workers // k_workers)
+            logger.info(
+                "  Parallel macro ARM: %d k values × %d workers "
+                "(inner grid workers per k: %d).",
+                n_k, k_workers, inner_per_k,
+            )
+            with ThreadPoolExecutor(max_workers=k_workers) as executor:
+                futures = {
+                    executor.submit(_process_one_k, k_val, inner_per_k): k_val
+                    for k_val in k_values_to_run
+                }
+                for future in as_completed(futures):
+                    rules_k, summary_k = future.result()
+                    if not rules_k.empty:
+                        all_rules_list.append(rules_k)
+                    if not summary_k.empty:
+                        all_summary_list.append(summary_k)
+        else:
+            for k_val in k_values_to_run:
+                rules_k, summary_k = _process_one_k(k_val, n_workers)
+                if not rules_k.empty:
+                    all_rules_list.append(rules_k)
+                if not summary_k.empty:
+                    all_summary_list.append(summary_k)
 
         # ── Aggregate and save combined all-k results ─────────────────────────
         logger.info("── Aggregating all-k results for class %d …", orig_cls)

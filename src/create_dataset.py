@@ -277,8 +277,14 @@ def _map_column(
     Codes absent from `mapping` are replaced by `fallback`.
     The result is stored as pd.Categorical to reduce memory usage and
     accelerate downstream groupby and value_counts operations.
+
+    Uses an integer-keyed mapping internally: this avoids the expensive
+    .astype(str) step which creates ~1M Python string objects on large
+    datasets.  Integer hashing is also faster than string hashing inside
+    pandas .map().
     """
-    decoded = series.astype(np.int32).astype(str).map(mapping).fillna(fallback)
+    int_mapping = {int(k): v for k, v in mapping.items()}
+    decoded = series.astype(np.int32).map(int_mapping).fillna(fallback)
     categories = sorted(set(mapping.values()) | {fallback})
     return pd.Categorical(decoded, categories=categories)
 

@@ -279,10 +279,11 @@ with `--k 15 --percentile 20 --workers 14`.
 | All 49 states (filtered) | ~1.4M | ~5 min | ~6 min | adult_filter reduces rows significantly |
 
 **Scaling note:** stage 2 boundary selection uses brute-force NN with Manhattan
-distance, scaling as O(N log N) instead of the previous O(N²).
-The NN index is built once in the main process and inherited by worker
-processes via `fork` — no serialisation overhead.  The same tree is reused
-for the k-NN step (Algorithm 1) inside each worker.
+distance (SciPy cdist, Cython-accelerated).  The NN index is built once on the
+cf-class instances and shared across all `ThreadPoolExecutor` workers in-process
+(no serialisation overhead).  The k-NN query is precomputed **once** for the
+maximum k and reused across all k values — with `--k 11` this eliminates 5
+redundant O(N × M) brute-force distance computations.
 For very large datasets, reducing `--percentile` (e.g. `--percentile 5`)
 further cuts the number of boundary instances to process.
 
@@ -991,27 +992,83 @@ importance ranking is as the counterfactual search becomes broader.
 
 ### Performance optimisations
 
+#### Stage 1
+
+- **Integer-keyed column mapping**: `_map_column()` converts string-keyed ACS
+  code maps to integer keys before calling `pd.Series.map()`, eliminating the
+  expensive `.astype(str)` step that would create ~1 M Python string objects on
+  large datasets.  Integer hashing is also faster than string hashing in pandas.
+
+#### Stage 2
+
+- **Precomputed NN query (shared across all k values)**: the brute-force k-NN
+  query — the most expensive step per chunk — is executed **once** with
+  `k_query` sized for the maximum k.  The (distances, indices) arrays are then
+  reused by every per-k run, which slices the first k valid (distance > 0)
+  neighbours from the same precomputed results.  With `--k 11` (6 values)
+  this eliminates 5 redundant O(N × M) distance computations.
+- **Pre-allocated hybrid encoding**: `encode_hybrid()` pre-allocates a single
+  contiguous `np.empty((n, total_cols), dtype=float32)` output array via
+  `n_encoded_cols()` and writes each column in-place, instead of building
+  ~150 small arrays and concatenating them.  Reduces allocation overhead and
+  improves cache locality on 1M+ row datasets.
+- **Vectorised n_diff**: the number of differing features between an instance
+  and its counterfactual is computed as `np.sum(cf_vals != instance_vals)`
+  (single numpy call) instead of a Python-level generator expression.
+- **Pre-allocated batch array**: the modified-instance batch for
+  `model.predict()` is allocated as `np.empty((n, n_features), dtype=object)`
+  and filled in-place, avoiding the costly `np.array(list_of_arrays)` copy.
+- **Derived relevant_union**: the union of relevant features across all k CFs
+  is derived directly from the `per_cf_relevant` dictionary (already computed
+  for the new BoCSoR index) instead of re-iterating over all predictions.
 - **Vectorised hybrid encoding**: ordinal columns use pre-normalised dict
   lookup via `pd.Series.map(dict)` (C-optimised in pandas) instead of a
   per-row Python lambda.  Nominal columns use numpy boolean vectorisation.
-- **Brute-force NN boundary selection: BLAS-accelerated instead of pairwise
-  matrix.  Built once on the cf-class instances, reused for all k values.
-  For 650K rows this reduces boundary selection from ~8 min to ~2 min.
 - **Boundary instance selection**: computed once, reused for all k values.
   If no boundary instances exist, all k values are skipped immediately.
 - **Batched predict**: for each boundary instance, all modified instances
   across all k counterfactuals are collected into a single NumPy array and
   passed to `model.predict()` in one call, eliminating Python round-trip
   overhead.
-- **Parallel processing**: boundary instances are split into chunks and
-  processed with `ProcessPoolExecutor` using `fork` start method, so workers
-  inherit the loaded model, encoded arrays, and NN index without reimporting.
-- **Classifier thread control**: each worker uses `thread_count=1` (CatBoost) to avoid competing internal thread pools. The MLP wrapper silently drops this keyword argument.
+- **Thread-based parallel processing**: boundary instances are split into
+  chunks and processed with `ThreadPoolExecutor`.  CatBoost `.predict()` and
+  sklearn MLP `.predict()` are implemented in C++/Cython and release the GIL,
+  enabling true thread-level concurrency.  `ThreadPoolExecutor` avoids the
+  fork-safety issues that cause deadlocks on macOS (Apple Accelerate's
+  internal mutex state is not fork-safe).
+- **Thread-safe histograms**: `plot_distance_histograms()` uses
+  `matplotlib.figure.Figure()` directly instead of `plt.subplots()`, avoiding
+  the pyplot global state machine.
+- **Classifier thread control**: each worker uses `thread_count=1` (CatBoost)
+  to avoid competing internal thread pools.  The MLP wrapper silently drops
+  this keyword argument.
 - **Worker auto-detection**: `max(1, min(14, cpu_count - 2))` — reserves
   2 logical CPUs for the OS and the main process, caps at 14 to avoid
-  diminishing returns from the classifier's internal thread pools.  The same
-  formula is used for both stage-1 multi-year workers and stage-2 BoCSoR
-  boundary processing.  Override with `--workers N` if needed.
+  diminishing returns from the classifier's internal thread pools.  Override
+  with `--workers N` if needed.
+
+#### Stages 3 and 4
+
+- **Parallel per-k processing**: when multiple k values are processed, each k
+  is dispatched to a `ThreadPoolExecutor` worker.  Each k loads its own CSV,
+  runs its own grid search, generates its own heatmaps, and writes to its own
+  directory — no shared mutable state.  Inner grid-search worker counts are
+  reduced proportionally (`inner_workers = n_workers // k_workers`) to avoid
+  over-subscription.
+- **Thread-safe heatmaps**: `_make_heatmap()` uses `matplotlib.figure.Figure()`
+  with `FigureCanvasAgg` directly instead of `plt.subplots()`, enabling
+  concurrent heatmap generation across k values.
+- **Static mask cache (vectorised grid path)**: in the vectorised grid search
+  path, the support-upper, confidence-upper, and lift masks are constant across
+  all confidence levels for a given support.  They are pre-computed once per
+  support level and combined with the per-cell confidence-lower mask via a
+  cheap bitwise AND, avoiding `len(unique_confidences) - 1` redundant mask
+  re-evaluations per support level.
+- **Adaptive rule generation**: the grid search probes the rule volume at the
+  lowest support and automatically selects between a vectorised path (≤ 500
+  rules per support level) and a parallel `ThreadPoolExecutor` path (> 500
+  rules), so the overhead of thread scheduling is only incurred when the
+  work justifies it.
 
 ### Classifier
 
@@ -1048,10 +1105,13 @@ on 1M+ rows).
 | Per-state download | `ThreadPoolExecutor` | I/O-bound. |
 | Column categorisation | `ThreadPoolExecutor` | Independent per-column transforms; NumPy ops release GIL. |
 | CSV write (split) | 3 threads | Dataset, train and test written concurrently. |
-| Multi-year stage 1 | `ProcessPoolExecutor` | CPU-bound, bypasses GIL. |
-| BoCSoR boundary chunks | `ProcessPoolExecutor` (fork) | CPU-bound, inherits model/NN index via fork. |
+| Multi-year stage 1 | `ProcessPoolExecutor` (spawn) | CPU-bound, bypasses GIL.  Uses `spawn` start method for macOS fork safety. |
+| BoCSoR boundary chunks | `ThreadPoolExecutor` | CatBoost/MLP `.predict()` release the GIL (C++/Cython).  Avoids macOS fork deadlocks (Apple Accelerate mutex state). |
+| BoCSoR NN precomputation | Sequential (one batched query per chunk) | Computed once, reused across all k values.  SciPy cdist releases GIL internally. |
+| ARM per-k processing | `ThreadPoolExecutor` | Each k is independent (own CSV, own output dir).  Thread-safe heatmaps via `Figure()`. |
 | ARM grid search | `ThreadPoolExecutor` (adaptive) | Only activated when rule volume exceeds 500/support level. |
-| Micro ARM per-macro-rule | `ProcessPoolExecutor` (fork) | Each macro rule is independent; inherits exploded tokens via fork. Inner grid workers reduced to avoid oversubscription. |
+| Micro ARM per-k processing | `ThreadPoolExecutor` | Same as macroscopic per-k.  Inner workers reduced to avoid over-subscription. |
+| Micro ARM per-macro-rule | `ThreadPoolExecutor` | Each macro rule is independent; shares exploded tokens read-only. Inner grid workers reduced to avoid over-subscription. |
 
 ---
 

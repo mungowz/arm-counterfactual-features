@@ -836,7 +836,7 @@ def _resolve_states_label(raw_states_arg: list[str]) -> str | None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    multiprocessing.set_start_method("fork", force=True)
+    multiprocessing.set_start_method("spawn", force=True)
     parser = build_parser()
     args   = parser.parse_args()
 
