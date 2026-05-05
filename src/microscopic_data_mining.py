@@ -1,33 +1,33 @@
 """
 src/microscopic_data_mining.py
-───────────────────────────────
+-------------------------------
 Stage 4 of the ACS Income pipeline: Microscopic Association Rule Mining (ARM).
 
 Relation to stage 3 (macroscopic ARM)
-──────────────────────────────────────
+--------------------------------------
 Stage 3 discards feature values and works only with feature *labels*
 (e.g. the transaction {SCHL, WKHP}).  Stage 4 is the *microscopic* companion:
 it works with full "LABEL=value" tokens (e.g. {SCHL=Bachelors-Degree,
 WKHP=Full-Time}) so the rules carry specific value-level information.
 
 The microscopic analysis is anchored to the macroscopic rules: for each
-macroscopic rule (antecedent_labels → consequent_labels) we select only the
+macroscopic rule (antecedent_labels -> consequent_labels) we select only the
 itemset rows that contain **all** items belonging to that rule (i.e. at least
 one token per label in both the antecedent and the consequent).
 This keeps the microscopic analysis focused on the same feature relationships
 identified at the coarser level.
 
 Input
-─────
-  • Stage-2 itemset CSV  (feature_importance_itemsets_k<N>[suffix].csv  or
-    the combined file) — same file used by stage 3, but now the full
+-----
+  - Stage-2 itemset CSV  (feature_importance_itemsets_k<N>[suffix].csv  or
+    the combined file) -- same file used by stage 3, but now the full
     "LABEL=value" tokens are retained instead of being reduced to labels.
-  • Stage-3 macroscopic rules CSV  (association_rules/k<N>/arm[suffix]_rules.csv
-    or the all_k equivalent) — used to derive the anchor label sets.
+  - Stage-3 macroscopic rules CSV  (association_rules/k<N>/arm[suffix]_rules.csv
+    or the all_k equivalent) -- used to derive the anchor label sets.
 
 Processing flow (per macroscopic rule, per k)
-─────────────────────────────────────────────
-  1. Parse the macroscopic rule → extract the set of feature labels that appear
+---------------------------------------------
+  1. Parse the macroscopic rule -> extract the set of feature labels that appear
      in its antecedent and/or consequent.
   2. Filter the itemset CSV: keep only rows whose itemset contains at least one
      token with a matching label.
@@ -36,65 +36,65 @@ Processing flow (per macroscopic rule, per k)
   4. Run the same adaptive FP-Growth grid search used in stage 3 on these
      microscopic transactions.
   5. Annotate every surviving microscopic rule with:
-       • macro_antecedents  — the macroscopic antecedent it is anchored to
-       • macro_consequents  — the macroscopic consequent it is anchored to
-       • macro_rule_id      — index of the macroscopic rule (0-based)
+       - macro_antecedents  -- the macroscopic antecedent it is anchored to
+       - macro_consequents  -- the macroscopic consequent it is anchored to
+       - macro_rule_id      -- index of the macroscopic rule (0-based)
 
 Output directory structure
-──────────────────────────
+--------------------------
 All outputs land under the stage-3 association_rules directory:
 
   <output_dir>/association_rules/
-  ├── k<N>/
-  │   ├── micro/
-  │   │   ├── micro_rules[suffix].csv         ← all microscopic rules
-  │   │   ├── micro_grid_summary[suffix].csv
-  │   │   └── heatmaps/
-  │   │       ├── heatmap_support_confidence[suffix].png
-  │   │       ├── heatmap_support_lift[suffix].png
-  │   │       └── heatmap_confidence_lift[suffix].png
-  │   └── ...  (existing macroscopic outputs)
-  └── all_k/
-      ├── micro/
-      │   ├── micro_rules[suffix].csv
-      │   ├── micro_grid_summary[suffix].csv
-      │   └── heatmaps/
-      └── ...
+  +-- k<N>/
+  |   +-- micro/
+  |   |   +-- micro_rules[suffix].csv         <- all microscopic rules
+  |   |   +-- micro_grid_summary[suffix].csv
+  |   |   `-- heatmaps/
+  |   |       +-- heatmap_support_confidence[suffix].png
+  |   |       +-- heatmap_support_lift[suffix].png
+  |   |       `-- heatmap_confidence_lift[suffix].png
+  |   `-- ...  (existing macroscopic outputs)
+  `-- all_k/
+      +-- micro/
+      |   +-- micro_rules[suffix].csv
+      |   +-- micro_grid_summary[suffix].csv
+      |   `-- heatmaps/
+      `-- ...
 
 Column layout in micro_rules.csv
-─────────────────────────────────
-  macro_rule_id        — 0-based index of the macroscopic rule that anchored
+---------------------------------
+  macro_rule_id        -- 0-based index of the macroscopic rule that anchored
                          the transaction filter
-  macro_antecedents    — macroscopic antecedent label(s), e.g. "SCHL"
-  macro_consequents    — macroscopic consequent label(s), e.g. "WKHP"
-  k_value              — k value (per-k files only)
-  antecedents          — microscopic antecedent "LABEL=value" item(s)
-  consequents          — microscopic consequent "LABEL=value" item(s)
-  antecedent support   — P(antecedent)
-  consequent support   — P(consequent)
-  support              — P(antecedent ∪ consequent)
-  confidence           — P(consequent | antecedent)
-  lift                 — observed / expected co-occurrence
-  leverage             — P(A∪C) − P(A)·P(C)
-  conviction           — (1 − P(C)) / (1 − confidence)
-  lift_type            — "positive_correlation" or "negative_correlation"
-  grid_min_support     — min_support threshold that produced this rule
-  grid_min_confidence  — min_confidence threshold that produced this rule
-  filter_*             — active filter thresholds (self-documenting)
+  macro_antecedents    -- macroscopic antecedent label(s), e.g. "SCHL"
+  macro_consequents    -- macroscopic consequent label(s), e.g. "WKHP"
+  k_value              -- k value (per-k files only)
+  antecedents          -- microscopic antecedent "LABEL=value" item(s)
+  consequents          -- microscopic consequent "LABEL=value" item(s)
+  antecedent support   -- P(antecedent)
+  consequent support   -- P(consequent)
+  support              -- P(antecedent U consequent)
+  confidence           -- P(consequent | antecedent)
+  lift                 -- observed / expected co-occurrence
+  leverage             -- P(AUC) - P(A)*P(C)
+  conviction           -- (1 - P(C)) / (1 - confidence)
+  lift_type            -- "positive_correlation" or "negative_correlation"
+  grid_min_support     -- min_support threshold that produced this rule
+  grid_min_confidence  -- min_confidence threshold that produced this rule
+  filter_*             -- active filter thresholds (self-documenting)
 
 Skip-if-exists behaviour
-────────────────────────
+------------------------
 If micro_rules[suffix].csv already exists in a k-folder the entire microscopic
 run for that k is skipped.  Delete the file to force a re-run.
 
 Performance design
-──────────────────
+------------------
   1. Macroscopic rules CSV read once per k; label sets pre-computed into
      frozensets for O(1) membership tests.
   2. Itemset CSV parsed once per k with the same vectorised explode+groupby
      pipeline used in stage 3.
   3. Per-rule transaction filtering uses a vectorised pandas mask on the
-     exploded token frame — no Python loop over rows.
+     exploded token frame -- no Python loop over rows.
   4. Grid search reuses the adaptive strategy from stage 3 (vectorised path
      for few items, threaded path for many items), including the static mask
      cache optimisation.
@@ -107,7 +107,7 @@ Performance design
      before writing.
 
 Dependencies
-────────────
+------------
   pip install mlxtend pandas numpy matplotlib seaborn
 """
 
@@ -159,17 +159,17 @@ logging.getLogger("PIL").setLevel(logging.WARNING)
 # Sub-folder name for microscopic outputs inside each k-folder.
 _FOLDER_MICRO = "micro"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Default parameters — microscopic ARM uses lower thresholds than stage 3
+# -----------------------------------------------------------------------------
+# Default parameters -- microscopic ARM uses lower thresholds than stage 3
 # because filtered transaction sets are smaller (only transactions containing
 # ALL labels of the anchor macro rule) and require finer granularity.
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
-DEFAULT_MICRO_MIN_SUPPORT         = 0.01   # lower than macro (0.05) — smaller subsets
+DEFAULT_MICRO_MIN_SUPPORT         = 0.01   # lower than macro (0.05) -- smaller subsets
 DEFAULT_MICRO_MAX_SUPPORT         = DEFAULT_MAX_SUPPORT
 DEFAULT_MICRO_SUPPORT_STEP        = None   # data-driven
 
-DEFAULT_MICRO_MIN_CONFIDENCE      = 0.3    # lower than macro (0.5) — smaller subsets need looser threshold
+DEFAULT_MICRO_MIN_CONFIDENCE      = 0.3    # lower than macro (0.5) -- smaller subsets need looser threshold
 DEFAULT_MICRO_MAX_CONFIDENCE      = DEFAULT_MAX_CONFIDENCE
 DEFAULT_MICRO_CONFIDENCE_STEP     = None   # data-driven
 
@@ -177,9 +177,9 @@ DEFAULT_MICRO_LIFT_LOW  = DEFAULT_LIFT_INDEPENDENCE_LOW    # same as macro: 0.75
 DEFAULT_MICRO_LIFT_HIGH = DEFAULT_LIFT_INDEPENDENCE_HIGH   # same as macro: 1.25
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Directory helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _micro_dir(k_or_allk_dir: Path) -> Path:
     """Return <k_dir>/micro/ or <all_k_dir>/micro/, creating if absent."""
@@ -188,9 +188,9 @@ def _micro_dir(k_or_allk_dir: Path) -> Path:
     return p
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Macroscopic rules loading
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _load_macro_rules(macro_rules_path: Path) -> pd.DataFrame:
     """
@@ -257,16 +257,16 @@ def _macro_label_sets(macro_rules: pd.DataFrame) -> list[frozenset[str]]:
     return label_sets
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Microscopic transaction loading and filtering
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def load_micro_itemsets(csv_path: Path) -> pd.DataFrame:
     """
     Load the stage-2 itemset CSV and return a DataFrame with columns:
-      _txn_idx  — original row index (one per boundary instance)
-      token     — each "LABEL=value" token (one row per token per transaction)
-      label     — the LABEL part (before "=")
+      _txn_idx  -- original row index (one per boundary instance)
+      token     -- each "LABEL=value" token (one row per token per transaction)
+      label     -- the LABEL part (before "=")
 
     This is the exploded form used for vectorised per-rule filtering.
     The full "LABEL=value" tokens are retained (not reduced to labels).
@@ -310,14 +310,14 @@ def _filter_transactions_for_rule(
     **all** labels present in *label_set* (i.e. at least one token per label).
 
     A transaction qualifies only if every label in the macroscopic rule's
-    antecedent ∪ consequent is represented by at least one token.  Extra
-    tokens whose label is not in the label_set are retained — they provide
+    antecedent U consequent is represented by at least one token.  Extra
+    tokens whose label is not in the label_set are retained -- they provide
     additional microscopic context (e.g. a third feature co-occurring with
     the two rule labels).
 
     Example
     -------
-    Macro rule  WKHP → SCHL  →  label_set = {"WKHP", "SCHL"}
+    Macro rule  WKHP -> SCHL  ->  label_set = {"WKHP", "SCHL"}
     A transaction qualifies only if it contains both a WKHP=* token AND a
     SCHL=* token.  A transaction containing only SCHL=Bachelors-Degree is
     excluded; one containing WKHP=Full-Time and SCHL=Bachelors-Degree is
@@ -327,7 +327,7 @@ def _filter_transactions_for_rule(
     ----------
     exploded   : Output of load_micro_itemsets().
     label_set  : Frozenset of feature labels from the macroscopic rule's
-                 antecedent ∪ consequent.
+                 antecedent U consequent.
     """
     if exploded.empty or not label_set:
         return []
@@ -361,9 +361,9 @@ def _filter_transactions_for_rule(
     return [sorted(chunk.tolist()) for chunk in np.split(tok_s, split_pts)]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # CSV formatting
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _format_micro_rules_for_csv(
     rules_df: pd.DataFrame,
@@ -412,7 +412,7 @@ def _format_micro_rules_for_csv(
     _DROP = {"zhangs_metric", "jaccard", "certainty", "kulczynski", "representativity"}
     df = df.drop(columns=[c for c in _DROP if c in df.columns])
 
-    # Sanitise inf / -inf / NaN in numeric columns (e.g. conviction → inf
+    # Sanitise inf / -inf / NaN in numeric columns (e.g. conviction -> inf
     # when confidence = 1.0).  Replace infinities with NaN so to_csv()
     # writes an empty cell rather than the string "inf".
     _FLOAT_COLS = [
@@ -426,7 +426,7 @@ def _format_micro_rules_for_csv(
         df[col] = pd.to_numeric(df[col], errors="coerce")
         df[col] = df[col].replace([np.inf, -np.inf], np.nan)
 
-    # Canonical column order — macro provenance columns come first.
+    # Canonical column order -- macro provenance columns come first.
     _ORDERED = [
         "macro_rule_id", "macro_antecedents", "macro_consequents",
         "k_value",
@@ -443,8 +443,8 @@ def _format_micro_rules_for_csv(
     extra   = [c for c in df.columns if c not in present]
     df = df[present + extra]
 
-    # ── Sort rows alphabetically by macro rule then antecedents then consequents
-    # Makes symmetric rules (A→B and B→A) adjacent and easier to identify.
+    # -- Sort rows alphabetically by macro rule then antecedents then consequents
+    # Makes symmetric rules (A->B and B->A) adjacent and easier to identify.
     sort_cols = [c for c in (
         "macro_antecedents", "macro_consequents", "antecedents", "consequents"
     ) if c in df.columns]
@@ -481,7 +481,7 @@ def _save_micro_results(
         max_confidence=max_confidence,
     )
     rules_csv.to_csv(rules_path, index=False, float_format="%.6f")
-    logger.info("    Micro rules   → %s  (%d rows)", rules_path.name, len(rules_csv))
+    logger.info("    Micro rules   -> %s  (%d rows)", rules_path.name, len(rules_csv))
 
     gs = grid_summary.copy()
     if min_support    is not None: gs["filter_min_support"]    = min_support
@@ -492,12 +492,12 @@ def _save_micro_results(
     gs["filter_lift_kept_above"] = lift_independence_high
     gs["filter_lift_discarded"]  = f"[{lift_independence_low}, {lift_independence_high}]"
     gs.to_csv(summary_path, index=False, float_format="%.6f")
-    logger.info("    Micro summary → %s  (%d cells)", summary_path.name, len(grid_summary))
+    logger.info("    Micro summary -> %s  (%d cells)", summary_path.name, len(grid_summary))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Core: microscopic ARM for a single macroscopic rule
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _run_micro_for_macro_rule(
     macro_rule: pd.Series,
@@ -525,7 +525,7 @@ def _run_micro_for_macro_rule(
     macro_cons = str(macro_rule.get("macro_consequents", ""))
 
     logger.info(
-        "    macro rule %d: [%s] → [%s]  |  label filter: %s",
+        "    macro rule %d: [%s] -> [%s]  |  label filter: %s",
         macro_id, macro_ant, macro_cons, sorted(label_set),
     )
 
@@ -534,14 +534,14 @@ def _run_micro_for_macro_rule(
 
     if not transactions:
         logger.info(
-            "      No transactions contain ALL labels from this rule — skipping."
+            "      No transactions contain ALL labels from this rule -- skipping."
         )
         return pd.DataFrame(), pd.DataFrame()
 
     # Skip grid search if too few transactions to produce meaningful rules.
     if len(transactions) < 2:
         logger.info(
-            "      Only %d transaction — need ≥ 2 for association rules, skipping.",
+            "      Only %d transaction -- need >= 2 for association rules, skipping.",
             len(transactions),
         )
         return pd.DataFrame(), pd.DataFrame()
@@ -576,13 +576,13 @@ def _run_micro_for_macro_rule(
     grid_summary.insert(0, "macro_antecedents", macro_ant)
     grid_summary.insert(0, "macro_rule_id",     macro_id)
 
-    logger.info("      → %d microscopic rules found.", len(all_rules))
+    logger.info("      -> %d microscopic rules found.", len(all_rules))
     return all_rules, grid_summary
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Per-k runner
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _run_micro_for_k(
     k_val: int,
@@ -607,7 +607,7 @@ def _run_micro_for_k(
     for each, aggregates results, saves to association_rules/k<N>/micro/,
     and returns (all_micro_rules_df, all_grid_summary_df).
     """
-    logger.info("  ── micro k=%d ─────────────────────────────────────", k_val)
+    logger.info("  -- micro k=%d -------------------------------------", k_val)
 
     # Locate the itemset CSV (search output_dir and feature_importance/).
     search_dirs = [output_dir, output_dir / _FOLDER_FEATURE_IMP]
@@ -626,14 +626,14 @@ def _run_micro_for_k(
                 break
     if csv_path is None:
         logger.error(
-            "    No itemset CSV found for k=%d suffix='%s' — skipping.", k_val, suffix
+            "    No itemset CSV found for k=%d suffix='%s' -- skipping.", k_val, suffix
         )
         return pd.DataFrame(), pd.DataFrame()
 
     # Load the full exploded token frame once; reuse for all macro rules.
     exploded_tokens = load_micro_itemsets(csv_path)
     if exploded_tokens.empty:
-        logger.warning("    No usable tokens for k=%d — skipping.", k_val)
+        logger.warning("    No usable tokens for k=%d -- skipping.", k_val)
         return pd.DataFrame(), pd.DataFrame()
 
     # Pre-compute label sets for all macroscopic rules.
@@ -642,9 +642,9 @@ def _run_micro_for_k(
     all_rules_list:   list[pd.DataFrame] = []
     all_summary_list: list[pd.DataFrame] = []
 
-    # ── Parallel per-macro-rule processing ───────────────────────────────────
+    # -- Parallel per-macro-rule processing -----------------------------------
     # Each macro rule generates an independent filtered transaction set and
-    # grid search — no shared mutable state.  ThreadPoolExecutor is used
+    # grid search -- no shared mutable state.  ThreadPoolExecutor is used
     # instead of ProcessPoolExecutor(fork) because:
     #   - fork causes deadlocks on macOS when Apple Accelerate/BLAS mutex
     #     state is duplicated in an inconsistent state.
@@ -654,7 +654,7 @@ def _run_micro_for_k(
     #     zero serialisation overhead.
     #
     # Inner grid search worker count is reduced to avoid oversubscription:
-    # total threads ≈ n_parallel × inner_workers ≤ cpu_count.
+    # total threads ~ n_parallel * inner_workers <= cpu_count.
     n_rules = len(macro_rules)
     n_parallel = min(n_workers, n_rules)
     inner_workers = max(1, n_workers // max(n_parallel, 1))
@@ -663,7 +663,7 @@ def _run_micro_for_k(
 
     if n_parallel > 1 and n_rules > 1:
         logger.info(
-            "    Parallel micro ARM: %d macro rules × %d workers "
+            "    Parallel micro ARM: %d macro rules * %d workers "
             "(inner grid workers: %d).",
             n_rules, n_parallel, inner_workers,
         )
@@ -719,7 +719,7 @@ def _run_micro_for_k(
     # Aggregate.
     if all_rules_list:
         combined_rules = pd.concat(all_rules_list, ignore_index=True)
-        # Deduplicate on (macro_rule_id, antecedents, consequents) — the same
+        # Deduplicate on (macro_rule_id, antecedents, consequents) -- the same
         # micro rule may appear across different grid cells.
         key_cols = ["macro_rule_id", "antecedents", "consequents"]
         key_cols = [c for c in key_cols if c in combined_rules.columns]
@@ -730,7 +730,7 @@ def _run_micro_for_k(
                 combined_rules["macro_rule_id"].astype(str)
                 + "||"
                 + combined_rules["antecedents"].apply(_fs_str)
-                + "→"
+                + "->"
                 + combined_rules["consequents"].apply(_fs_str)
             )
             combined_rules = (
@@ -791,9 +791,9 @@ def _run_micro_for_k(
     return combined_rules, combined_summary
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Helpers to locate macroscopic rules files
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _find_macro_rules_path(output_dir: Path, k_val: int, suffix: str) -> Optional[Path]:
     """
@@ -833,9 +833,9 @@ def _discover_k_values_micro(output_dir: Path, suffix: str) -> list[int]:
     return sorted(found)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Main stage-4 runner
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def run_microscopic_mining(
     output_dir: Path,
@@ -856,8 +856,8 @@ def run_microscopic_mining(
 
     For each class in *original_class*:
       1. Discovers k values for which macroscopic rules exist.
-      2. For each k: loads macroscopic rules → filters itemset transactions
-         per rule → runs microscopic grid search → saves results.
+      2. For each k: loads macroscopic rules -> filters itemset transactions
+         per rule -> runs microscopic grid search -> saves results.
       3. Aggregates all per-k microscopic rules into association_rules/all_k/micro/.
 
     Skip-if-exists: if micro_rules[suffix].csv already exists in a k-folder
@@ -879,9 +879,9 @@ def run_microscopic_mining(
     lift_independence_high : Upper boundary of the lift independence interval.
     n_workers              : Thread-pool size (parallel path only).
     """
-    logger.info("═" * 62)
-    logger.info("  ACS INCOME PIPELINE  —  stage 4: microscopic ARM")
-    logger.info("═" * 62)
+    logger.info("=" * 62)
+    logger.info("  ACS INCOME PIPELINE  --  stage 4: microscopic ARM")
+    logger.info("=" * 62)
     logger.info("  Output dir             : %s", output_dir.resolve())
     logger.info("  k selector             : %s",
                 k_value if k_value else "auto (all k with macro rules)")
@@ -891,10 +891,10 @@ def run_microscopic_mining(
     logger.info("  Confidence grid        : [%.3f, %.3f]  step=%s",
                 min_confidence, max_confidence,
                 f"{confidence_step:.4f}" if confidence_step is not None else "auto")
-    logger.info("  Lift independence zone : [%.2f, %.2f]  → discarded",
+    logger.info("  Lift independence zone : [%.2f, %.2f]  -> discarded",
                 lift_independence_low, lift_independence_high)
     logger.info("  Workers                : %d", n_workers)
-    logger.info("═" * 62)
+    logger.info("=" * 62)
 
     orig_classes_requested = sorted(set(original_class))
     suffix_map = {
@@ -905,7 +905,7 @@ def run_microscopic_mining(
     for orig_cls in orig_classes_requested:
         suffix = suffix_map[orig_cls]
 
-        logger.info("── Class %d ──────────────────────────────────────────", orig_cls)
+        logger.info("-- Class %d ------------------------------------------", orig_cls)
 
         # Determine k values to process.
         if k_value is not None:
@@ -914,7 +914,7 @@ def run_microscopic_mining(
             k_values_to_run = _discover_k_values_micro(output_dir, suffix)
             if not k_values_to_run:
                 logger.warning(
-                    "No macroscopic rules found for suffix='%s' — "
+                    "No macroscopic rules found for suffix='%s' -- "
                     "run stage 3 first.", suffix
                 )
                 continue
@@ -924,7 +924,7 @@ def run_microscopic_mining(
         all_micro_rules_list:   list[pd.DataFrame] = []
         all_micro_summary_list: list[pd.DataFrame] = []
 
-        # ── Worker function: process one k value (thread-safe) ───────────────
+        # -- Worker function: process one k value (thread-safe) ---------------
         # Each k reads from its own per-k CSV, writes to its own directory,
         # and runs an independent grid search.  Heatmap rendering uses
         # Figure() directly (thread-safe, no pyplot global state).
@@ -961,7 +961,7 @@ def run_microscopic_mining(
             macro_path = _find_macro_rules_path(output_dir, k_val, suffix)
             if macro_path is None:
                 logger.warning(
-                    "  No macroscopic rules found for k=%d suffix='%s' — skipping.",
+                    "  No macroscopic rules found for k=%d suffix='%s' -- skipping.",
                     k_val, suffix,
                 )
                 return pd.DataFrame(), pd.DataFrame()
@@ -985,14 +985,14 @@ def run_microscopic_mining(
                 n_workers=inner_workers,
             )
 
-        # ── Dispatch: parallel if multiple k values, sequential otherwise ─────
+        # -- Dispatch: parallel if multiple k values, sequential otherwise -----
         n_k = len(k_values_to_run)
         if n_k > 1:
             from concurrent.futures import ThreadPoolExecutor, as_completed
             k_workers   = min(n_workers, n_k)
             inner_per_k = max(1, n_workers // k_workers)
             logger.info(
-                "  Parallel micro ARM: %d k values × %d workers "
+                "  Parallel micro ARM: %d k values * %d workers "
                 "(inner workers per k: %d).",
                 n_k, k_workers, inner_per_k,
             )
@@ -1015,8 +1015,8 @@ def run_microscopic_mining(
                 if not summary_k.empty:
                     all_micro_summary_list.append(summary_k)
 
-        # ── Aggregate all-k micro results ─────────────────────────────────────
-        logger.info("── Aggregating all-k micro results for class %d …", orig_cls)
+        # -- Aggregate all-k micro results -------------------------------------
+        logger.info("-- Aggregating all-k micro results for class %d ...", orig_cls)
         all_k_micro_out = _micro_dir(_all_k_dir(output_dir))
 
         if all_micro_rules_list:
@@ -1072,15 +1072,15 @@ def run_microscopic_mining(
             min_confidence=min_confidence, max_confidence=max_confidence,
         )
 
-    logger.info("═" * 62)
+    logger.info("=" * 62)
     logger.info("  Stage 4 (microscopic ARM) completed.")
     logger.info("  Outputs in: %s", (_arm_root(output_dir)).resolve())
-    logger.info("═" * 62)
+    logger.info("=" * 62)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # CLI argument definitions (consumed by main.py's build_parser)
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def add_micro_arguments(parser: argparse.ArgumentParser) -> None:
     """
@@ -1090,7 +1090,7 @@ def add_micro_arguments(parser: argparse.ArgumentParser) -> None:
     All arguments are optional with sensible defaults.
     """
     micro = parser.add_argument_group(
-        "Micro ARM hyperparameters  (stage 4 — microscopic association rule mining)"
+        "Micro ARM hyperparameters  (stage 4 -- microscopic association rule mining)"
     )
 
     micro.add_argument(
@@ -1151,28 +1151,28 @@ def add_micro_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Standalone entry-point guard
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import sys
     print(
         "microscopic_data_mining.py is stage 4 of the pipeline and cannot be\n"
-        "run independently — it depends on stage 3 macroscopic rules.\n\n"
+        "run independently -- it depends on stage 3 macroscopic rules.\n\n"
         "Run the full pipeline via:\n"
         "  python -m src.main [OPTIONS]\n\n"
         "Stage-4 specific options:\n"
-        "  --micro-min-support        (default: 0.05)\n"
+        "  --micro-min-support        (default: 0.01)\n"
         "  --micro-max-support        (default: 1.00)\n"
         "  --micro-support-step       (default: auto)\n"
-        "  --micro-min-confidence     (default: 0.50)\n"
+        "  --micro-min-confidence     (default: 0.30)\n"
         "  --micro-max-confidence     (default: 1.00)\n"
         "  --micro-confidence-step    (default: auto)\n"
         "  --micro-lift-low           (default: 0.75)\n"
         "  --micro-lift-high          (default: 1.25)\n"
         f"  --micro-workers            (default: {_DEFAULT_ARM_WORKERS}, auto-detected)\n"
-        "  --micro-k                  (default: None — all k with macro rules)\n",
+        "  --micro-k                  (default: None -- all k with macro rules)\n",
         file=sys.stderr,
     )
     sys.exit(1)

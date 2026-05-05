@@ -1,111 +1,79 @@
 """
 src/macroscopic_data_mining.py
-──────────────────────────────
+------------------------------
 Stage 3 of the ACS Income pipeline: Macroscopic Association Rule Mining (ARM).
-
-This module consumes the itemset CSV files produced by stage 2 (BoCSoR,
-feature_importance.py) and mines association rules using FP-Growth.
+This module consumes the itemset CSV files produced by stage 2 (BoCSoR, feature_importance.py) and mines association rules using FP-Growth.
 
 Macroscopic analysis
-────────────────────
-Each row of the stage-2 itemset file contains a space-separated string of
-tokens in the form "FEATURE=value" (e.g. "SCHL=Bachelors-Degree WKHP=Full-Time").
-For the *macroscopic* view only the **feature labels** are retained — the
-values are discarded.  This means each transaction becomes the set of feature
-*names* that were relevant for a given boundary instance (e.g. {"SCHL", "WKHP"}).
+--------------------
+Each row of the stage-2 itemset file contains a space-separated string of tokens in the form "FEATURE=value" (e.g. "SCHL=Bachelors-Degree WKHP=Full-Time"). For the *macroscopic* view only the **feature labels** are retained - the values are discarded. This means each transaction becomes the set of feature *names* that were relevant for a given boundary instance (e.g. {"SCHL", "WKHP"}).
 
 Association rule mining
-───────────────────────
+-----------------------
 Frequent itemsets are mined with the FP-Growth algorithm (mlxtend).
 Rules are evaluated with three metrics:
 
-  support    – fraction of transactions that contain both antecedent and
-               consequent.  Filters: [min_support, max_support].
+  support - fraction of transactions that contain both antecedent and consequent.  Filters: [min_support, max_support].
 
-  confidence – P(consequent | antecedent).
-               Filters: [min_confidence, max_confidence].
+  confidence - P(consequent | antecedent). Filters: [min_confidence, max_confidence].
 
-  lift       – ratio of observed co-occurrence to expected under independence.
-               lift = support(A ∪ C) / (support(A) × support(C))
-               Filter: lift < lift_independence_low  OR
-                       lift > lift_independence_high
-               This keeps:
-                 • positive correlations  (lift > 1.25)
-                 • negative correlations  (lift < 0.75)
-               and **discards** independence / near-independence rules.
-               The range [0.75, 1.25] is configurable via CLI.
+  lift - ratio of observed co-occurrence to expected under independence.
+  lift = support(A U C) / (support(A) * support(C)) Filter: lift < lift_independence_low  OR lift > lift_independence_high.
+  This keeps:
+    - positive correlations  (lift > 1.25)
+    - negative correlations  (lift < 0.75) and **discards** independence / near-independence rules.
+  The range [0.75, 1.25] is configurable via CLI.
 
 Output directory structure
-──────────────────────────
+--------------------------
 All outputs land under the stage-2 output directory in two sub-folders:
 
   <output_dir>/
-  ├── feature_importance/          ← stage-2 files are moved/referenced here
-  └── association_rules/
-      ├── k<N>/                    ← one sub-folder per k value
-      │   ├── arm_rules[suffix].csv
-      │   ├── arm_grid_summary[suffix].csv
-      │   └── heatmaps/
-      │       ├── heatmap_support_confidence[suffix].png
-      │       ├── heatmap_support_lift[suffix].png
-      │       └── heatmap_confidence_lift[suffix].png
-      └── all_k/                   ← combined across all k values
-          ├── arm_rules_all_k[suffix].csv
-          ├── arm_grid_summary_all_k[suffix].csv
-          └── heatmaps/
-              ├── heatmap_support_confidence[suffix].png
-              ├── heatmap_support_lift[suffix].png
-              └── heatmap_confidence_lift[suffix].png
+  +-- feature_importance/ <- stage-2 files are moved/referenced here
+  `-- association_rules/
+      +-- k<N>/ <- one sub-folder per k value
+      |   +-- arm_rules[suffix].csv
+      |   +-- arm_grid_summary[suffix].csv
+      |   `-- heatmaps/
+      |       +-- heatmap_support_confidence[suffix].png
+      |       +-- heatmap_support_lift[suffix].png
+      |       `-- heatmap_confidence_lift[suffix].png
+      `-- all_k/ <- combined across all k values
+          +-- arm_rules_all_k[suffix].csv
+          +-- arm_grid_summary_all_k[suffix].csv
+          `-- heatmaps/
+              +-- heatmap_support_confidence[suffix].png
+              +-- heatmap_support_lift[suffix].png
+              `-- heatmap_confidence_lift[suffix].png
 
 Heatmaps
-────────
+--------
 For each k value (and for the combined all-k run) three heatmaps are generated:
+  1. Support * Confidence - rows = support thresholds, cols = confidence thresholds.
+  2. Support * Lift - rows = support thresholds, cols = lift bins.
+  3. Confidence * Lift - rows = confidence thresholds, cols = lift bins.
 
-  1. Support × Confidence  — rows = support thresholds, cols = confidence thresholds.
-  2. Support × Lift         — rows = support thresholds, cols = lift bins.
-  3. Confidence × Lift      — rows = confidence thresholds, cols = lift bins.
-
-Cell colour encodes the number of rules found at that parameter combination.
-Darker cells = more rules.  The lift independence window (the discarded range)
-is visually annotated on the lift axis with a hatched band so it is immediately
-clear that no rules appear in that region.
+Cell colour encodes the number of rules found at that parameter combination. Darker cells = more rules.  The lift independence window (the discarded range) is visually annotated on the lift axis with a hatched band so it is immediately clear that no rules appear in that region.
 
 Grid search
-───────────
-A grid search over all (min_support, min_confidence) pairs is run per k value.
-FP-Growth is executed once per distinct support threshold and the result is
-cached.  ``association_rules()`` is then called once per support level at the
-global min_confidence floor, and per-cell confidence/lift filtering is applied
-as vectorised numpy operations — no thread pool needed.
+-----------
+A grid search over all (min_support, min_confidence) pairs is run per k value. FP-Growth is executed once per distinct support threshold and the result is cached.  ``association_rules()`` is then called once per support level at the global min_confidence floor, and per-cell confidence/lift filtering is applied as vectorised numpy operations -- no thread pool needed.
 
 Performance design
-──────────────────
+------------------
   1. Vectorised transaction parsing via pandas explode + groupby.
   2. Boolean matrix built once with numpy and reused across support thresholds.
   3. FP-Growth cached per distinct min_support value.
-  4. Adaptive rule generation strategy — chosen at runtime by probing the
-     actual rule volume at the lowest support threshold:
-       • Few rules (≤ 500 per support level, typical with ≤ ~7 items):
-         association_rules() called once per support level at the global
-         min_confidence floor; per-cell filtering is a vectorised numpy mask.
-         Thread scheduling overhead would dominate over useful work here.
-       • Many rules (> 500 per support level, typical with many columns):
-         ThreadPoolExecutor evaluates each (support, confidence) cell
-         concurrently; rule generation cost justifies parallelism.
-  5. Static mask cache: in the vectorised path, support-upper, confidence-upper,
-     and lift masks are pre-computed once per support level and reused across
-     all confidence cells via a single bitwise AND.
+  4. Adaptive rule generation strategy -- chosen at runtime by probing the actual rule volume at the lowest support threshold:
+    - Few rules (<= 500 per support level, typical with <= ~7 items): association_rules() called once per support level at the global min_confidence floor; per-cell filtering is a vectorised numpy mask. Thread scheduling overhead would dominate over useful work here.
+    - Many rules (> 500 per support level, typical with many columns): ThreadPoolExecutor evaluates each (support, confidence) cell concurrently; rule generation cost justifies parallelism.
+  5. Static mask cache: in the vectorised path, support-upper, confidence-upper, and lift masks are pre-computed once per support level and reused across all confidence cells via a single bitwise AND.
   6. Vectorised deduplication via serialised frozenset keys + drop_duplicates.
-  7. Parallel per-k processing: when multiple k values are present, each k is
-     dispatched to a ThreadPoolExecutor worker.  Each k loads its own CSV,
-     runs its own grid search, and writes to its own directory.  Inner grid
-     workers are reduced proportionally to avoid over-subscription.
-  8. Thread-safe heatmaps: _make_heatmap() uses matplotlib.figure.Figure()
-     with FigureCanvasAgg instead of plt.subplots(), enabling concurrent
-     heatmap generation across k values without pyplot state conflicts.
+  7. Parallel per-k processing: when multiple k values are present, each k is dispatched to a ThreadPoolExecutor worker.  Each k loads its own CSV, runs its own grid search, and writes to its own directory.  Inner grid workers are reduced proportionally to avoid over-subscription.
+  8. Thread-safe heatmaps: _make_heatmap() uses matplotlib.figure.Figure() with FigureCanvasAgg instead of plt.subplots(), enabling concurrent heatmaps generation across k values without pyplot state conflicts.
 
 Dependencies
-────────────
+------------
   pip install mlxtend pandas numpy matplotlib seaborn
 """
 
@@ -125,46 +93,39 @@ import pandas as pd
 
 logger = logging.getLogger("src.macroscopic_data_mining")
 
-# Silence matplotlib's verbose DEBUG output (font scoring, cache lookups, etc.)
-# which floods the log when the root logger is set to DEBUG.
+# Silence matplotlib's verbose DEBUG output (font scoring, cache lookups, etc.) which floods the log when the root logger is set to DEBUG.
 logging.getLogger("matplotlib").setLevel(logging.WARNING)
 logging.getLogger("PIL").setLevel(logging.WARNING)
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Default grid-search parameters
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
-DEFAULT_MIN_SUPPORT         = 0.05
-DEFAULT_MAX_SUPPORT         = 1.00
-DEFAULT_SUPPORT_STEP        = None   # None → computed from transactions (data-driven)
+DEFAULT_MIN_SUPPORT = 0.05
+DEFAULT_MAX_SUPPORT = 1.00
+DEFAULT_SUPPORT_STEP = None   # None -> computed from transactions (data-driven)
+DEFAULT_MIN_CONFIDENCE = 0.50
+DEFAULT_MAX_CONFIDENCE = 1.00
+DEFAULT_CONFIDENCE_STEP = None   # None -> computed from transactions (data-driven)
 
-DEFAULT_MIN_CONFIDENCE      = 0.50
-DEFAULT_MAX_CONFIDENCE      = 1.00
-DEFAULT_CONFIDENCE_STEP     = None   # None → computed from transactions (data-driven)
-
-# Target number of grid steps along each axis when using data-driven step.
-# Chosen to produce a grid dense enough to capture meaningful variation
-# without redundant cells (empirically: 30–50 levels per axis is ideal).
+# Target number of grid steps along each axis when using data-driven step. Chosen to produce a grid dense enough to capture meaningful variation without redundant cells (empirically: 30-50 levels per axis is ideal).
 _GRID_TARGET_STEPS = 40
-
 DEFAULT_LIFT_INDEPENDENCE_LOW  = 0.75
 DEFAULT_LIFT_INDEPENDENCE_HIGH = 1.25
-
-DEFAULT_K_VALUE: Optional[int] = None   # None → process ALL k values found
-
-_ARM_WORKER_CEILING  = 16
+DEFAULT_K_VALUE: Optional[int] = None   # None -> process ALL k values found
+_ARM_WORKER_CEILING = 16
 _DEFAULT_ARM_WORKERS = max(1, min(_ARM_WORKER_CEILING, (os.cpu_count() or 4) - 2))
 
 # Sub-folder names inside the stage-2 output directory.
-_FOLDER_FEATURE_IMP  = "feature_importance"
-_FOLDER_ARM          = "association_rules"
-_FOLDER_HEATMAPS     = "heatmaps"
-_FOLDER_ALL_K        = "all_k"
+_FOLDER_FEATURE_IMP = "feature_importance"
+_FOLDER_ARM = "association_rules"
+_FOLDER_HEATMAPS = "heatmaps"
+_FOLDER_ALL_K = "all_k"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Directory helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _arm_root(output_dir: Path) -> Path:
     """Return <output_dir>/association_rules/, creating it if absent."""
@@ -203,13 +164,12 @@ def _feature_imp_dir(output_dir: Path) -> Path:
 
 def _move_feature_importance_files(output_dir: Path) -> None:
     """
-    Move all stage-2 output files from *output_dir* into the
-    ``feature_importance/`` sub-folder so the directory tree is tidy.
+    Move all stage-2 output files from *output_dir* into the ``feature_importance/`` sub-folder so the directory tree is tidy.
 
     Files matched:
-      • feature_importance*.csv
-      • feature_importance*.md
-      • bocsor_summary*.md
+      - feature_importance*.csv
+      - feature_importance*.md
+      - bocsor_summary*.md
 
     Already-moved files (already inside feature_importance/) are left alone.
     """
@@ -233,25 +193,22 @@ def _move_feature_importance_files(output_dir: Path) -> None:
             moved += 1
     if moved:
         logger.info(
-            "Moved %d stage-2 file(s) → %s/", moved, fi_dir.name
+            "Moved %d stage-2 file(s) -> %s/", moved, fi_dir.name
         )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Discover available k values from stage-2 output
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _discover_k_values(output_dir: Path, suffix: str) -> list[int]:
     """
-    Scan *output_dir* and its ``feature_importance/`` sub-folder for per-k
-    itemset files and return sorted k values.
+    Scan *output_dir* and its ``feature_importance/`` sub-folder for per-k itemset files and return sorted k values.
 
     Looks for files matching:
         feature_importance_itemsets_k<N><suffix>.csv
 
-    Searches both the root output directory and the feature_importance/
-    sub-folder so that discovery works regardless of whether the move has
-    already been performed.
+    Searches both the root output directory and the feature_importance/ sub-folder so that discovery works regardless of whether the move has already been performed.
 
     Returns an empty list if no per-k files are found.
     """
@@ -280,13 +237,11 @@ def _build_input_path(
     """
     Resolve the stage-2 itemset CSV for a given k value (or the combined file).
 
-    Searches both *output_dir* and its ``feature_importance/`` sub-folder so
-    that file resolution works regardless of whether the post-processing move
-    has already been performed (files may be in either location).
+    Searches both *output_dir* and its ``feature_importance/`` sub-folder so that file resolution works regardless of whether the post-processing move has already been performed (files may be in either location).
 
     Resolution order for each location:
-      1. Per-k file  feature_importance_itemsets_k<N><suffix>.csv
-      2. Combined    feature_importance_itemsets<suffix>.csv
+      1. Per-k file feature_importance_itemsets_k<N><suffix>.csv
+      2. Combined feature_importance_itemsets<suffix>.csv
 
     Raises FileNotFoundError if neither is found in either location.
     """
@@ -316,24 +271,22 @@ def _build_input_path(
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Transaction loading
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def load_itemsets(csv_path: Path, k_value: Optional[int] = None) -> list[list[str]]:
     """
     Load a stage-2 itemset CSV and return macroscopic transactions.
 
-    Each transaction is a **sorted list of unique feature labels** extracted
-    from the ``itemset`` column (tokens before the ``=`` separator).
+    Each transaction is a **sorted list of unique feature labels** extracted from the ``itemset`` column (tokens before the ``=`` separator).
 
-    Parsing is fully vectorised: pandas explode for tokenisation, then
-    numpy lexsort + np.split for grouping — no Python loop over rows.
+    Parsing is fully vectorised: pandas explode for tokenisation, then numpy lexsort + np.split for grouping -- no Python loop over rows.
 
     Parameters
     ----------
-    csv_path : Path to a ``feature_importance_itemsets*.csv`` file.
-    k_value  : If given, only rows with this ``k_value`` are used.
+    csv_path: Path to a ``feature_importance_itemsets*.csv`` file.
+    k_value: If given, only rows with this ``k_value`` are used.
 
     Returns
     -------
@@ -343,7 +296,7 @@ def load_itemsets(csv_path: Path, k_value: Optional[int] = None) -> list[list[st
         df = pd.read_csv(csv_path)
     except pd.errors.EmptyDataError:
         logger.warning(
-            "File %s is empty (0 rows) — no transactions available.", csv_path.name
+            "File %s is empty (0 rows) -- no transactions available.", csv_path.name
         )
         return []
 
@@ -363,7 +316,7 @@ def load_itemsets(csv_path: Path, k_value: Optional[int] = None) -> list[list[st
     if k_value is not None:
         if "k_value" not in df.columns:
             raise ValueError(
-                f"Column 'k_value' not found in {csv_path} — "
+                f"Column 'k_value' not found in {csv_path} -- "
                 "cannot filter by k_value."
             )
         df = df[df["k_value"] == k_value]
@@ -383,13 +336,12 @@ def load_itemsets(csv_path: Path, k_value: Optional[int] = None) -> list[list[st
     if exploded.empty:
         return []
 
-    # Build transactions as sorted label lists using numpy lexsort + np.split.
-    # Faster than groupby+apply(lambda) for large transaction sets (~2× speedup).
+    # Build transactions as sorted label lists using numpy lexsort + np.split. Faster than groupby+apply(lambda) for large transaction sets (~2* speedup).
     idx_arr = exploded["_txn_idx"].values
     lbl_arr = exploded["label"].values
-    order     = np.lexsort((lbl_arr, idx_arr))
-    idx_s     = idx_arr[order]
-    lbl_s     = lbl_arr[order]
+    order = np.lexsort((lbl_arr, idx_arr))
+    idx_s = idx_arr[order]
+    lbl_s = lbl_arr[order]
     split_pts = np.where(np.diff(idx_s))[0] + 1
     transactions: list[list[str]] = [chunk.tolist() for chunk in np.split(lbl_s, split_pts)]
 
@@ -402,9 +354,9 @@ def load_itemsets(csv_path: Path, k_value: Optional[int] = None) -> list[list[st
     return transactions
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Boolean matrix
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _build_boolean_matrix(
     transactions: list[list[str]],
@@ -412,8 +364,7 @@ def _build_boolean_matrix(
     """
     Build the one-hot boolean matrix for FP-Growth.
 
-    Uses numpy advanced indexing with pre-computed row/column index arrays —
-    no Python loop over transactions.
+    Uses numpy advanced indexing with pre-computed row/column index arrays - no Python loop over transactions.
 
     Returns (bool_df, sorted_item_names).
     """
@@ -439,9 +390,9 @@ def _build_boolean_matrix(
     return pd.DataFrame(arr, columns=all_items), all_items
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # FP-Growth + rule generation
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _mine_frequent_itemsets(bool_df: pd.DataFrame, min_support: float) -> pd.DataFrame:
     """Run FP-Growth on the pre-built boolean matrix."""
@@ -458,9 +409,9 @@ def _mine_frequent_itemsets(bool_df: pd.DataFrame, min_support: float) -> pd.Dat
         return fpgrowth(bool_df, min_support=min_support, use_colnames=True)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Grid search
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _linspace(start: float, stop: float, step: float) -> list[float]:
     values: list[float] = []
@@ -482,34 +433,26 @@ def _compute_data_driven_steps(
     Derive grid step sizes from the natural granularity of the transaction data.
 
     Strategy
-    ────────
+    --------
     The minimum meaningful step on the support axis is ``1 / n_transactions``
-    (one transaction changes the support by exactly this amount).  However, with
-    few distinct items the number of *distinct* support values after FP-Growth is
-    much smaller than n_transactions — typically of order (n_items choose k).
-    Rather than targeting the finest possible resolution we aim for
-    ``_GRID_TARGET_STEPS`` evenly-spaced levels across each axis range, rounded
-    to the nearest "human-readable" value from a fixed candidate set.
+    (one transaction changes the support by exactly this amount). However, with few distinct items the number of *distinct* support values after FP-Growth is much smaller than n_transactions - typically of order (n_items choose k). Rather than targeting the finest possible resolution we aim for ``_GRID_TARGET_STEPS`` evenly-spaced levels across each axis range, rounded to the nearest "human-readable" value from a fixed candidate set.
 
     Candidate steps (human-readable fractions):
         0.005, 0.01, 0.02, 0.025, 0.04, 0.05, 0.1
 
-    The smallest candidate that still produces ≥ _GRID_TARGET_STEPS levels
-    across the range is chosen.  If n_transactions is very small the step floor
-    is raised to ``1 / n_transactions`` so we never request more levels than
-    the data can provide.
+    The smallest candidate that still produces >= _GRID_TARGET_STEPS levels across the range is chosen.  If n_transactions is very small the step floor is raised to ``1 / n_transactions`` so we never request more levels than the data can provide.
 
     Parameters
     ----------
-    transactions   : Loaded macroscopic transactions.
-    min_support    : Lower bound of the support range.
-    max_support    : Upper bound of the support range.
-    min_confidence : Lower bound of the confidence range.
-    max_confidence : Upper bound of the confidence range.
+    transactions: Loaded macroscopic transactions.
+    min_support: Lower bound of the support range.
+    max_support: Upper bound of the support range.
+    min_confidence: Lower bound of the confidence range.
+    max_confidence: Upper bound of the confidence range.
 
     Returns
     -------
-    (support_step, confidence_step) — both rounded to 6 decimal places.
+    (support_step, confidence_step) -- both rounded to 6 decimal places.
     """
     n = max(1, len(transactions))
 
@@ -521,13 +464,13 @@ def _compute_data_driven_steps(
 
     def _pick(range_width: float) -> float:
         ideal = range_width / _GRID_TARGET_STEPS
-        # Use the finest candidate that is ≥ both the data floor and the ideal.
+        # Use the finest candidate that is >= both the data floor and the ideal.
         for c in candidates:
             if c >= data_floor and c >= ideal:
                 return c
         return candidates[-1]   # fallback: coarsest candidate
 
-    sup_step  = _pick(max_support    - min_support)
+    sup_step  = _pick(max_support - min_support)
     conf_step = _pick(max_confidence - min_confidence)
 
     logger.info(
@@ -543,61 +486,48 @@ def _build_grid(
     min_confidence: float, max_confidence: float, confidence_step: float,
 ) -> list[tuple[float, float]]:
     return list(itertools.product(
-        _linspace(min_support,    max_support,    support_step),
+        _linspace(min_support, max_support, support_step),
         _linspace(min_confidence, max_confidence, confidence_step),
     ))
 
 
 def run_grid_search(
     transactions: list[list[str]],
-    min_support:            float         = DEFAULT_MIN_SUPPORT,
-    max_support:            float         = DEFAULT_MAX_SUPPORT,
-    support_step:           Optional[float] = DEFAULT_SUPPORT_STEP,
-    min_confidence:         float         = DEFAULT_MIN_CONFIDENCE,
-    max_confidence:         float         = DEFAULT_MAX_CONFIDENCE,
-    confidence_step:        Optional[float] = DEFAULT_CONFIDENCE_STEP,
-    lift_independence_low:  float         = DEFAULT_LIFT_INDEPENDENCE_LOW,
-    lift_independence_high: float         = DEFAULT_LIFT_INDEPENDENCE_HIGH,
-    n_workers:              int           = _DEFAULT_ARM_WORKERS,
+    min_support: float = DEFAULT_MIN_SUPPORT,
+    max_support: float = DEFAULT_MAX_SUPPORT,
+    support_step: Optional[float] = DEFAULT_SUPPORT_STEP,
+    min_confidence: float = DEFAULT_MIN_CONFIDENCE,
+    max_confidence: float = DEFAULT_MAX_CONFIDENCE,
+    confidence_step: Optional[float] = DEFAULT_CONFIDENCE_STEP,
+    lift_independence_low: float = DEFAULT_LIFT_INDEPENDENCE_LOW,
+    lift_independence_high: float = DEFAULT_LIFT_INDEPENDENCE_HIGH,
+    n_workers: int = _DEFAULT_ARM_WORKERS,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Full grid search over (support, confidence) parameter space.
 
     Adaptive strategy
-    ─────────────────
-    The optimal implementation depends on how many rules FP-Growth produces,
-    which in turn depends on the number of distinct feature labels (= n_items)
-    in the transaction set.  This varies with ``--columns``:
+    -----------------
+    The optimal implementation depends on how many rules FP-Growth produces, which in turn depends on the number of distinct feature labels (= n_items) in the transaction set.  This varies with ``--columns``:
 
-    • Few items  (e.g. 3 columns → ≤ 12 rules/level):
-      ``association_rules()`` is called once per support level at the global
-      min_confidence floor.  Per-cell filtering is a vectorised numpy mask.
-      Thread scheduling overhead would exceed useful work here.
+    - Few items  (e.g. 3 columns -> <= 12 rules/level): ``association_rules()`` is called once per support level at the global min_confidence floor.  Per-cell filtering is a vectorised numpy mask. Thread scheduling overhead would exceed useful work here.
 
-    • Many items (e.g. 10 columns → up to thousands of rules/level):
-      A ``ThreadPoolExecutor`` calls ``association_rules()`` concurrently for
-      each (support, confidence) grid cell.  Rule generation cost is large
-      enough that parallelism pays off.
+    - Many items (e.g. 10 columns -> up to thousands of rules/level): A ``ThreadPoolExecutor`` calls ``association_rules()`` concurrently for each (support, confidence) grid cell.  Rule generation cost is large enough that parallelism pays off.
 
-    The threshold (``_VECTOR_RULE_THRESHOLD = 500``) is measured by probing
-    the actual rule count at the lowest support value before starting the grid,
-    so the decision is purely data-driven.
+    The threshold (``_VECTOR_RULE_THRESHOLD = 500``) is measured by probing the actual rule count at the lowest support value before starting the grid, so the decision is purely data-driven.
 
     Step resolution
-    ───────────────
-    When support_step or confidence_step is None (the default), the step is
-    computed automatically via ``_compute_data_driven_steps()``.
+    ---------------
+    When support_step or confidence_step is None (the default), the step is computed automatically via ``_compute_data_driven_steps()``.
 
     Parameters
     ----------
-    n_workers : Thread-pool size used in the parallel path only.
-                Ignored when the vectorised path is selected.
+    n_workers: Thread-pool size used in the parallel path only. Ignored when the vectorised path is selected.
 
     Returns (all_rules_df, grid_summary_df, freq_itemsets_at_min_support).
-    freq_itemsets_at_min_support is the FP-Growth result at the lowest support
-    threshold — used by callers to save the frequent itemsets CSV.
+    freq_itemsets_at_min_support is the FP-Growth result at the lowest support threshold - used by callers to save the frequent itemsets CSV.
     """
-    # ── Resolve data-driven steps if not explicitly provided ──────────────────
+    # -- Resolve data-driven steps if not explicitly provided ------------------
     if support_step is None or confidence_step is None:
         auto_sup, auto_conf = _compute_data_driven_steps(
             transactions, min_support, max_support, min_confidence, max_confidence,
@@ -611,10 +541,10 @@ def run_grid_search(
         min_support, max_support, support_step,
         min_confidence, max_confidence, confidence_step,
     )
-    unique_supports    = sorted({s for s, _ in grid})
+    unique_supports = sorted({s for s, _ in grid})
     unique_confidences = sorted({c for _, c in grid})
     logger.info(
-        "  Grid: %d cells (%d sup × %d conf), workers=%d.",
+        "  Grid: %d cells (%d sup * %d conf), workers=%d.",
         len(grid), len(unique_supports), len(unique_confidences), n_workers,
     )
 
@@ -623,34 +553,32 @@ def run_grid_search(
     freq_cache: dict[float, pd.DataFrame] = {}
     for sup in unique_supports:
         freq_cache[sup] = _mine_frequent_itemsets(bool_df, min_support=sup)
-        # Monotonicity: if support S yields 0 frequent itemsets, all S' > S
-        # will too.  Short-circuit the remaining (higher) support levels.
+        # Monotonicity: if support S yields 0 frequent itemsets, all S' > S will too. Short-circuit the remaining (higher) support levels.
         if freq_cache[sup].empty:
             for sup2 in unique_supports:
                 if sup2 > sup and sup2 not in freq_cache:
                     freq_cache[sup2] = pd.DataFrame(columns=["support", "itemsets"])
             break
 
-    # Lazy import — kept here to avoid catboost/sklearn overhead on stage-1 runs.
+    # Lazy import -- kept here to avoid catboost/sklearn overhead on stage-1 runs.
     try:
         from mlxtend.frequent_patterns import association_rules as _ar
     except ImportError as exc:
         raise ImportError("pip install mlxtend") from exc
 
-    # ── Step 3: adaptive rule generation + per-cell filtering ────────────────
+    # -- Step 3: adaptive rule generation + per-cell filtering ----------------
     #
-    # The optimal strategy depends on n_items (= number of distinct feature
-    # labels in the transaction set), which is not known at import time and
+    # The optimal strategy depends on n_items (= number of distinct featurelabels in the transaction set), which is not known at import time and
     # varies with --columns:
     #
-    #   Few items  (≤ _VECTOR_RULE_THRESHOLD total rules at min support)
-    #     → Call association_rules() ONCE per support level at the global
+    #   Few items  (<= _VECTOR_RULE_THRESHOLD total rules at min support)
+    #     -> Call association_rules() ONCE per support level at the global
     #       min_confidence floor, cache the full rules DataFrame, then apply
     #       all per-cell filters as vectorised numpy masks.  Thread scheduling
     #       overhead would exceed useful work here.
     #
     #   Many items (> _VECTOR_RULE_THRESHOLD total rules at min support)
-    #     → Use a ThreadPoolExecutor to call association_rules() concurrently
+    #     -> Use a ThreadPoolExecutor to call association_rules() concurrently
     #       for each (support, confidence) grid cell.  Each call is expensive
     #       enough that parallelism pays off.
     #
@@ -668,8 +596,7 @@ def run_grid_search(
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             try:
-                _probe = _ar(probe_freq, metric="confidence",
-                             min_threshold=min_confidence)
+                _probe = _ar(probe_freq, metric="confidence", min_threshold=min_confidence)
                 probe_rules_count = len(_probe)
             except Exception:
                 probe_rules_count = 0
@@ -682,8 +609,7 @@ def run_grid_search(
         unique_supports[0], probe_rules_count, _VECTOR_RULE_THRESHOLD,
     )
 
-    # DEBUG: show lift values of probe rules so it is visible why rules may be
-    # discarded by the independence filter even when probe_rules_count > 0.
+    # DEBUG: show lift values of probe rules so it is visible why rules may be discarded by the independence filter even when probe_rules_count > 0.
     if probe_rules_count > 0 and logger.isEnabledFor(logging.DEBUG):
         _lift_vals = _probe["lift"].round(4).tolist()
         _surviving = sum(
@@ -691,7 +617,7 @@ def run_grid_search(
             if l < lift_independence_low or l > lift_independence_high
         )
         logger.debug(
-            "  Probe rule lifts: %s  →  %d/%d survive lift filter [%.2f, %.2f]",
+            "  Probe rule lifts: %s  ->  %d/%d survive lift filter [%.2f, %.2f]",
             _lift_vals, _surviving, probe_rules_count,
             lift_independence_low, lift_independence_high,
         )
@@ -699,14 +625,14 @@ def run_grid_search(
     cell_results: dict[tuple[float, float], pd.DataFrame] = {}
 
     if use_vectorised:
-        # ── Vectorised path ───────────────────────────────────────────────────
+        # -- Vectorised path ---------------------------------------------------
         # Call association_rules() once per support level at global min_confidence,
-        # then filter each cell with numpy boolean masks — no thread overhead.
+        # then filter each cell with numpy boolean masks - no thread overhead.
         #
         # Optimisation: the support-upper, confidence-upper, and lift masks are
-        # constant across all confidence levels for a given support.  They are
+        # constant across all confidence levels for a given support. They are
         # pre-computed once and combined with the per-cell confidence-lower mask
-        # via a cheap bitwise AND — avoiding len(unique_confidences)-1 redundant
+        # via a cheap bitwise AND -- avoiding len(unique_confidences)-1 redundant
         # mask re-evaluations per support level.
         rules_cache: dict[float, pd.DataFrame] = {}
         static_mask_cache: dict[float, np.ndarray] = {}
@@ -720,20 +646,14 @@ def run_grid_search(
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 try:
-                    r = _ar(fi, metric="confidence",
-                            min_threshold=min_confidence)
+                    r = _ar(fi, metric="confidence", min_threshold=min_confidence)
                 except Exception:
                     r = pd.DataFrame()
             rules_cache[sup] = r
             if not r.empty:
                 # Pre-compute the static mask (constant across confidence levels).
                 static_mask_cache[sup] = (
-                    (r["support"].values    <= max_support)
-                    & (r["confidence"].values <= max_confidence)
-                    & (
-                        (r["lift"].values < lift_independence_low)
-                        | (r["lift"].values > lift_independence_high)
-                    )
+                    (r["support"].values <= max_support) & (r["confidence"].values <= max_confidence) & ((r["lift"].values < lift_independence_low) | (r["lift"].values > lift_independence_high))
                 )
                 conf_vals_cache[sup] = r["confidence"].values
 
@@ -751,7 +671,7 @@ def run_grid_search(
             cell_results[(sup, conf)] = filtered
 
     else:
-        # ── Parallel path ─────────────────────────────────────────────────────
+        # -- Parallel path -----------------------------------------------------
         # Each (support, confidence) cell calls association_rules() independently.
         # Rule generation is expensive enough that parallelism pays off.
         from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -764,24 +684,18 @@ def run_grid_search(
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 try:
-                    rules = _ar(freq_itemsets, metric="confidence",
-                                min_threshold=conf)
+                    rules = _ar(freq_itemsets, metric="confidence", min_threshold=conf)
                 except Exception:
                     return sup, conf, pd.DataFrame()
             if rules.empty:
                 return sup, conf, pd.DataFrame()
             mask = (
-                (rules["support"]    <= max_support)
-                & (rules["confidence"] <= max_confidence)
-                & (
-                    (rules["lift"] < lift_independence_low)
-                    | (rules["lift"] > lift_independence_high)
-                )
+                (rules["support"] <= max_support) & (rules["confidence"] <= max_confidence) & ((rules["lift"] < lift_independence_low) | (rules["lift"] > lift_independence_high))
             )
             filtered = rules.loc[mask]
             if not filtered.empty:
                 filtered = filtered.copy()
-                filtered["grid_support"]    = sup
+                filtered["grid_support"] = sup
                 filtered["grid_confidence"] = conf
             return sup, conf, filtered
 
@@ -816,7 +730,7 @@ def run_grid_search(
             combined["antecedents"].apply(
                 lambda fs: "|".join(sorted(fs)) if isinstance(fs, frozenset) else str(fs)
             )
-            + "→"
+            + "->"
             + combined["consequents"].apply(
                 lambda fs: "|".join(sorted(fs)) if isinstance(fs, frozenset) else str(fs)
             )
@@ -828,13 +742,13 @@ def run_grid_search(
             .reset_index(drop=True)
         )
 
-    logger.info("  → %d unique rules found.", len(all_rules_df))
+    logger.info("  -> %d unique rules found.", len(all_rules_df))
     return all_rules_df, grid_summary, freq_cache[unique_supports[0]]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Heatmap generation
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 # Number of bins for the lift axis in heatmaps.
 _LIFT_N_BINS = 20
@@ -846,11 +760,9 @@ def _lift_bins(
     lift_independence_high: float,
 ) -> tuple[np.ndarray, list[str]]:
     """
-    Build lift bin edges that always include the independence window boundaries
-    as explicit edges, so the filtered band is clearly visible in the heatmap.
+    Build lift bin edges that always include the independence window boundaries as explicit edges, so the filtered band is clearly visible in the heatmap.
 
-    Handles degenerate cases where all rules have similar lift values by
-    reducing bin count and increasing label precision until all labels are unique.
+    Handles degenerate cases where all rules have similar lift values by reducing bin count and increasing label precision until all labels are unique.
 
     Returns (edges, tick_labels).
     """
@@ -864,11 +776,10 @@ def _lift_bins(
         extra = [lift_independence_low, lift_independence_high]
         edges = np.unique(np.sort(np.concatenate([raw_edges, extra])))
 
-    # Try increasing label precision (2 → 3 → 4 decimals) until all labels
-    # are unique.  If still not unique, reduce bin count until they are.
+    # Try increasing label precision (2 -> 3 -> 4 decimals) until all labels are unique.  If still not unique, reduce bin count until they are.
     for precision in (2, 3, 4):
         labels = [
-            f"{edges[i]:.{precision}f}–{edges[i+1]:.{precision}f}"
+            f"{edges[i]:.{precision}f}-{edges[i+1]:.{precision}f}"
             for i in range(len(edges) - 1)
         ]
         if len(labels) == len(set(labels)):
@@ -883,7 +794,7 @@ def _lift_bins(
             np.linspace(lift_min, lift_max, n + 1),
             [lift_independence_low, lift_independence_high],
         ])))
-        labels = [f"{candidate[i]:.4f}–{candidate[i+1]:.4f}"
+        labels = [f"{candidate[i]:.4f}-{candidate[i+1]:.4f}"
                   for i in range(len(candidate) - 1)]
         if len(labels) == len(set(labels)):
             return candidate, labels
@@ -891,7 +802,7 @@ def _lift_bins(
 
     # Absolute fallback: single bin covering the full range.
     edges = np.array([lift_min, lift_max])
-    return edges, [f"{lift_min:.4f}–{lift_max:.4f}"]
+    return edges, [f"{lift_min:.4f}-{lift_max:.4f}"]
 
 
 def _make_heatmap(
@@ -910,14 +821,14 @@ def _make_heatmap(
 
     Parameters
     ----------
-    pivot                  : Pivot table with n_rules as values.
-    title                  : Plot title (bold, large).
-    subtitle               : Secondary line below the title showing active filters.
-    xlabel / ylabel        : Axis labels.
-    save_path              : Output PNG path.
-    lift_independence_low  : If given, draw a hatched band on the lift axis.
+    pivot: Pivot table with n_rules as values.
+    title: Plot title (bold, large).
+    subtitle: Secondary line below the title showing active filters.
+    xlabel / ylabel: Axis labels.
+    save_path: Output PNG path.
+    lift_independence_low: If given, draw a hatched band on the lift axis.
     lift_independence_high : Upper bound of that band.
-    lift_axis              : 'x' or 'y' — which axis carries the lift values.
+    lift_axis: 'x' or 'y' -- which axis carries the lift values.
     """
     try:
         import matplotlib
@@ -932,13 +843,11 @@ def _make_heatmap(
             "  pip install matplotlib seaborn"
         ) from exc
 
-    # Use Figure() directly instead of plt.subplots() to avoid the pyplot
-    # global state machine — this makes heatmap rendering thread-safe and
-    # enables concurrent generation across k values.
+    # Use Figure() directly instead of plt.subplots() to avoid the pyplot global state machine - this makes heatmap rendering thread-safe and enables concurrent generation across k values.
     fig = Figure(
         figsize=(max(10, pivot.shape[1] * 0.35), max(8, pivot.shape[0] * 0.28))
     )
-    FigureCanvasAgg(fig)    # attach Agg renderer so fig.savefig() works
+    FigureCanvasAgg(fig) # attach Agg renderer so fig.savefig() works
     ax = fig.add_subplot(111)
 
     # Disable per-cell annotation when the grid is too dense to be readable.
@@ -947,7 +856,7 @@ def _make_heatmap(
     sns.heatmap(
         pivot,
         ax=ax,
-        cmap="Blues",          # Darker = more rules.
+        cmap="Blues", # Darker = more rules.
         linewidths=0.15 if annotate else 0.0,
         linecolor="white",
         annot=annotate,
@@ -976,7 +885,7 @@ def _make_heatmap(
     ):
         if n_labels > _MAX_TICKS:
             step = max(1, n_labels // _MAX_TICKS)
-            ticks     = axis_obj.get_major_ticks()
+            ticks = axis_obj.get_major_ticks()
             ticklabels = [t.label1 for t in ticks]
             for i, tick in enumerate(ticks):
                 tick.set_visible(i % step == 0)
@@ -984,7 +893,7 @@ def _make_heatmap(
     ax.tick_params(axis="x", rotation=45, labelsize=7)
     ax.tick_params(axis="y", rotation=0,  labelsize=7)
 
-    # ── Annotate the lift independence window on the correct axis ─────────────
+    # -- Annotate the lift independence window on the correct axis -------------
     if (
         lift_independence_low is not None
         and lift_independence_high is not None
@@ -997,8 +906,8 @@ def _make_heatmap(
         def _label_in_window(lbl: str) -> bool:
             """True if the bin label's lower edge is inside the independence window."""
             try:
-                lo = float(str(lbl).split("–")[0])
-                hi = float(str(lbl).split("–")[1])
+                lo = float(str(lbl).split("-")[0])
+                hi = float(str(lbl).split("-")[1])
                 # The bin overlaps the independence window.
                 return lo < lift_independence_high and hi > lift_independence_low
             except Exception:
@@ -1026,7 +935,7 @@ def _make_heatmap(
             legend_patch = mpatches.Patch(
                 facecolor="red", alpha=0.25, hatch="///", edgecolor="red",
                 label=f"Lift independence window [{lift_independence_low:.2f}, "
-                      f"{lift_independence_high:.2f}] — discarded",
+                      f"{lift_independence_high:.2f}] -- discarded",
             )
             ax.legend(
                 handles=[legend_patch],
@@ -1037,9 +946,9 @@ def _make_heatmap(
 
     fig.tight_layout()
     fig.savefig(save_path, dpi=150, bbox_inches="tight")
-    # No plt.close() needed — Figure is not registered in the pyplot state
+    # No plt.close() needed -- Figure is not registered in the pyplot state
     # machine, so it will be garbage-collected normally.
-    logger.info("    Heatmap saved → %s", save_path.name)
+    logger.info("    Heatmap saved -> %s", save_path.name)
 
 
 def generate_heatmaps(
@@ -1050,58 +959,53 @@ def generate_heatmaps(
     lift_independence_low: float,
     lift_independence_high: float,
     k_label: str,
-    min_support: Optional[float]    = None,
-    max_support: Optional[float]    = None,
+    min_support: Optional[float] = None,
+    max_support: Optional[float] = None,
     min_confidence: Optional[float] = None,
     max_confidence: Optional[float] = None,
 ) -> None:
     """
     Generate the three heatmaps for a given k (or all-k) run.
 
-    Each heatmap shows how many rules were found at each parameter combination.
-    A subtitle records the active filter thresholds so every PNG is self-
-    documenting.
+    Each heatmap shows how many rules were found at each parameter combination. A subtitle records the active filter thresholds so every PNG is self-documenting.
 
-    Heatmap 1 — Support × Confidence  (grid-threshold view)
-    ─────────────────────────────────────────────────────────
-    rows  = min_support thresholds used in the grid
-    cols  = min_confidence thresholds used in the grid
-    cell  = n_rules found at that (min_support, min_confidence) pair
-            (sourced from grid_summary, which already has the exact counts)
+    Heatmap 1 - Support * Confidence (grid-threshold view)
+    ---------------------------------------------------------
+    rows = min_support thresholds used in the grid
+    cols = min_confidence thresholds used in the grid
+    cell = n_rules found at that (min_support, min_confidence) pair (sourced from grid_summary, which already has the exact counts)
 
-    Heatmap 2 — Support × Lift  (actual-metric view)
-    ──────────────────────────────────────────────────
+    Heatmap 2 - Support * Lift  (actual-metric view)
+    --------------------------------------------------
     rows  = actual rule support values (binned)
     cols  = actual rule lift values (binned, with independence window hatched)
     cell  = number of surviving rules in that (support_bin, lift_bin) cell
 
-    Heatmap 3 — Confidence × Lift  (actual-metric view)
-    ─────────────────────────────────────────────────────
+    Heatmap 3 -- Confidence * Lift  (actual-metric view)
+    -----------------------------------------------------
     rows  = actual rule confidence values (binned)
     cols  = actual rule lift values (binned, with independence window hatched)
     cell  = number of surviving rules in that (confidence_bin, lift_bin) cell
     """
     heatmap_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Subtitle: active filter thresholds ────────────────────────────────────
+    # -- Subtitle: active filter thresholds ------------------------------------
     parts: list[str] = []
     if min_support is not None and max_support is not None:
-        parts.append(f"support ∈ [{min_support:.3f}, {max_support:.3f}]")
+        parts.append(f"support  in  [{min_support:.3f}, {max_support:.3f}]")
     if min_confidence is not None and max_confidence is not None:
-        parts.append(f"confidence ∈ [{min_confidence:.3f}, {max_confidence:.3f}]")
+        parts.append(f"confidence  in  [{min_confidence:.3f}, {max_confidence:.3f}]")
     parts.append(
         f"lift kept: <{lift_independence_low:.2f} (neg.) "
         f"or >{lift_independence_high:.2f} (pos.) | "
         f"discarded: [{lift_independence_low:.2f}, {lift_independence_high:.2f}]"
     )
-    subtitle = "   ·   ".join(parts)
+    subtitle = "   *   ".join(parts)
 
-    # ── Heatmap 1: Support × Confidence (grid thresholds, from grid_summary) ──
+    # -- Heatmap 1: Support * Confidence (grid thresholds, from grid_summary) --
     if not grid_summary.empty:
-        # Use the actual column names regardless of whether they come from
-        # grid_summary (min_support/min_confidence) or from a rules CSV that
-        # was already renamed (grid_min_support/grid_min_confidence).
-        sup_col  = "min_support"    if "min_support"    in grid_summary.columns else "grid_min_support"
+        # Use the actual column names regardless of whether they come from grid_summary (min_support/min_confidence) or from a rules CSV that was already renamed (grid_min_support/grid_min_confidence).
+        sup_col = "min_support" if "min_support" in grid_summary.columns else "grid_min_support"
         conf_col = "min_confidence" if "min_confidence" in grid_summary.columns else "grid_min_confidence"
 
         pivot_sc = grid_summary.pivot_table(
@@ -1111,9 +1015,9 @@ def generate_heatmaps(
             aggfunc="sum",
             fill_value=0,
         )
-        pivot_sc.index   = [f"{v:.3f}" for v in pivot_sc.index]
+        pivot_sc.index = [f"{v:.3f}" for v in pivot_sc.index]
         pivot_sc.columns = [f"{v:.3f}" for v in pivot_sc.columns]
-        pivot_sc.index.name   = "min_support (threshold)"
+        pivot_sc.index.name = "min_support (threshold)"
         pivot_sc.columns.name = "min_confidence (threshold)"
 
         _make_heatmap(
@@ -1125,16 +1029,16 @@ def generate_heatmaps(
             save_path=heatmap_dir / f"heatmap_support_confidence{suffix}.png",
         )
 
-    # ── Heatmaps 2 & 3 use actual rule metric values ──────────────────────────
+    # -- Heatmaps 2 & 3 use actual rule metric values --------------------------
     if all_rules.empty or "lift" not in all_rules.columns:
-        logger.info("    No rules with lift values — skipping lift heatmaps.")
+        logger.info("    No rules with lift values -- skipping lift heatmaps.")
         return
 
     # Detect renamed columns (rules may come from a post-format DataFrame).
-    sup_col_r  = "support"
+    sup_col_r = "support"
     conf_col_r = "confidence"
     if sup_col_r not in all_rules.columns or conf_col_r not in all_rules.columns:
-        logger.info("    Missing support/confidence columns — skipping lift heatmaps.")
+        logger.info("    Missing support/confidence columns -- skipping lift heatmaps.")
         return
 
     lift_edges, lift_labels = _lift_bins(
@@ -1145,9 +1049,7 @@ def generate_heatmaps(
         """
         Bin a continuous series into equal-width bins with guaranteed unique labels.
 
-        Uses the same adaptive strategy as _lift_bins: try increasing label
-        precision (3 → 4 → 6 decimals) then reduce bin count until labels
-        are unique.  Falls back to a single bin if the series is constant.
+        Uses the same adaptive strategy as _lift_bins: try increasing label precision (3 -> 4 -> 6 decimals) then reduce bin count until labels are unique.  Falls back to a single bin if the series is constant.
         """
         lo, hi = float(series.min()), float(series.max())
         if lo == hi:
@@ -1157,30 +1059,25 @@ def generate_heatmaps(
         edges = np.unique(np.round(edges, 6))
 
         for precision in (3, 4, 6):
-            labels = [f"{edges[i]:.{precision}f}–{edges[i+1]:.{precision}f}"
-                      for i in range(len(edges) - 1)]
+            labels = [f"{edges[i]:.{precision}f}-{edges[i+1]:.{precision}f}" for i in range(len(edges) - 1)]
             if len(labels) == len(set(labels)):
-                binned = pd.cut(series, bins=edges, labels=labels,
-                                include_lowest=True).astype(str)
+                binned = pd.cut(series, bins=edges, labels=labels, include_lowest=True).astype(str)
                 return labels, binned
 
         # Reduce bin count progressively.
         n = n_bins
         while n >= 2:
             candidate = np.unique(np.linspace(lo, hi, n + 1))
-            labels = [f"{candidate[i]:.6f}–{candidate[i+1]:.6f}"
-                      for i in range(len(candidate) - 1)]
+            labels = [f"{candidate[i]:.6f}-{candidate[i+1]:.6f}" for i in range(len(candidate) - 1)]
             if len(labels) == len(set(labels)):
-                binned = pd.cut(series, bins=candidate, labels=labels,
-                                include_lowest=True).astype(str)
+                binned = pd.cut(series, bins=candidate, labels=labels, include_lowest=True).astype(str)
                 return labels, binned
             n //= 2
 
         # Absolute fallback: single bin.
         edges = np.array([lo - 0.01, hi + 0.01])
-        labels = [f"{lo:.6f}–{hi:.6f}"]
-        binned = pd.cut(series, bins=edges, labels=labels,
-                        include_lowest=True).astype(str)
+        labels = [f"{lo:.6f}-{hi:.6f}"]
+        binned = pd.cut(series, bins=edges, labels=labels, include_lowest=True).astype(str)
         return labels, binned
 
     rules_work = all_rules.copy()
@@ -1193,22 +1090,22 @@ def generate_heatmaps(
         include_lowest=True,
     ).astype(str)
 
-    # ── Heatmap 2: Support × Lift (actual values) ─────────────────────────────
+    # -- Heatmap 2: Support * Lift (actual values) -----------------------------
     sup_labels, rules_work["sup_bin"] = _bin_axis(rules_work[sup_col_r])
 
     pivot_sl = (
         rules_work.groupby(["sup_bin", "lift_bin"], observed=True)
         .size()
         .unstack(fill_value=0)
-        .reindex(index=sup_labels,  fill_value=0)
+        .reindex(index=sup_labels, fill_value=0)
         .reindex(columns=lift_labels, fill_value=0)
     )
-    pivot_sl.index.name   = "support (actual)"
+    pivot_sl.index.name = "support (actual)"
     pivot_sl.columns.name = "lift (actual)"
 
     _make_heatmap(
         pivot=pivot_sl,
-        title=f"Rules by actual Support × Lift  [{k_label}]",
+        title=f"Rules by actual Support * Lift  [{k_label}]",
         subtitle=subtitle,
         xlabel="lift (actual value, binned)",
         ylabel="support (actual value, binned)",
@@ -1218,22 +1115,22 @@ def generate_heatmaps(
         lift_axis="x",
     )
 
-    # ── Heatmap 3: Confidence × Lift (actual values) ──────────────────────────
+    # -- Heatmap 3: Confidence * Lift (actual values) --------------------------
     conf_labels, rules_work["conf_bin"] = _bin_axis(rules_work[conf_col_r])
 
     pivot_cl = (
         rules_work.groupby(["conf_bin", "lift_bin"], observed=True)
         .size()
         .unstack(fill_value=0)
-        .reindex(index=conf_labels,  fill_value=0)
+        .reindex(index=conf_labels, fill_value=0)
         .reindex(columns=lift_labels, fill_value=0)
     )
-    pivot_cl.index.name   = "confidence (actual)"
+    pivot_cl.index.name = "confidence (actual)"
     pivot_cl.columns.name = "lift (actual)"
 
     _make_heatmap(
         pivot=pivot_cl,
-        title=f"Rules by actual Confidence × Lift  [{k_label}]",
+        title=f"Rules by actual Confidence * Lift  [{k_label}]",
         subtitle=subtitle,
         xlabel="lift (actual value, binned)",
         ylabel="confidence (actual value, binned)",
@@ -1244,9 +1141,9 @@ def generate_heatmaps(
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # CSV helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _annotate_lift_type(
     rules_df: pd.DataFrame,
@@ -1256,10 +1153,9 @@ def _annotate_lift_type(
     """
     Add a ``lift_type`` column that makes the filter decision self-documenting:
 
-      "positive_correlation"  — lift > lift_independence_high  (kept)
-      "negative_correlation"  — lift < lift_independence_low   (kept)
-      "independent"           — lift in [low, high]            (discarded; should
-                                never appear in filtered output)
+      "positive_correlation" - lift > lift_independence_high (kept)
+      "negative_correlation" - lift < lift_independence_low (kept)
+      "independent" - lift in [low, high] (discarded; should never appear in filtered output)
     """
     df = rules_df.copy()
     if "lift" not in df.columns:
@@ -1277,8 +1173,8 @@ def _format_rules_for_csv(
     rules_df: pd.DataFrame,
     lift_independence_low: float  = DEFAULT_LIFT_INDEPENDENCE_LOW,
     lift_independence_high: float = DEFAULT_LIFT_INDEPENDENCE_HIGH,
-    min_support: Optional[float]    = None,
-    max_support: Optional[float]    = None,
+    min_support: Optional[float] = None,
+    max_support: Optional[float] = None,
     min_confidence: Optional[float] = None,
     max_confidence: Optional[float] = None,
 ) -> pd.DataFrame:
@@ -1286,70 +1182,68 @@ def _format_rules_for_csv(
     Prepare the rules DataFrame for CSV output.
 
     Column layout (in order)
-    ────────────────────────
-    antecedents          — feature label(s) in the antecedent (human-readable)
-    consequents          — feature label(s) in the consequent
-    antecedent support   — P(antecedent)
-    consequent support   — P(consequent)
-    support              — P(antecedent ∪ consequent)  [actual rule metric]
-    confidence           — P(consequent | antecedent)  [actual rule metric]
-    lift                 — observed / expected co-occurrence [actual rule metric]
-    leverage             — P(A∪C) - P(A)·P(C)
-    conviction           — (1 - P(C)) / (1 - confidence)
-    lift_type            — "positive_correlation" or "negative_correlation"
-    grid_min_support     — min_support threshold at which this rule was found
-    grid_min_confidence  — min_confidence threshold at which this rule was found
-    filter_min_support   — global lower bound of the support grid
-    filter_max_support   — global upper bound of the support grid
-    filter_min_confidence — global lower bound of the confidence grid
-    filter_max_confidence — global upper bound of the confidence grid
-    filter_lift_kept_below   — lift < this → kept (negative correlation)
-    filter_lift_kept_above   — lift > this → kept (positive correlation)
-    filter_lift_discarded    — interval [low, high] that was discarded
-    k_value              — k value (present only in per-k files)
+    ------------------------
+    antecedents - feature label(s) in the antecedent (human-readable)
+    consequents - feature label(s) in the consequent
+    antecedent support - P(antecedent)
+    consequent support - P(consequent)
+    support - P(antecedent U consequent) [actual rule metric]
+    confidence - P(consequent | antecedent)  [actual rule metric]
+    lift - observed / expected co-occurrence [actual rule metric]
+    leverage - P(AUC) - P(A)*P(C)
+    conviction - (1 - P(C)) / (1 - confidence)
+    lift_type - "positive_correlation" or "negative_correlation"
+    grid_min_support - min_support threshold at which this rule was found
+    grid_min_confidence  - min_confidence threshold at which this rule was found
+    filter_min_support - global lower bound of the support grid
+    filter_max_support - global upper bound of the support grid
+    filter_min_confidence - global lower bound of the confidence grid
+    filter_max_confidence - global upper bound of the confidence grid
+    filter_lift_kept_below - lift < this -> kept (negative correlation)
+    filter_lift_kept_above - lift > this -> kept (positive correlation)
+    filter_lift_discarded - interval [low, high] that was discarded
+    k_value - k value (present only in per-k files)
 
     Columns dropped (not requested)
-    ────────────────────────────────
+    --------------------------------
     zhangs_metric, jaccard, certainty, kulczynski, representativity
     """
     df = rules_df.copy()
 
-    # ── Convert frozenset columns to readable strings ─────────────────────────
+    # -- Convert frozenset columns to readable strings -------------------------
     for col in ("antecedents", "consequents"):
         if col in df.columns:
             df[col] = df[col].apply(
                 lambda x: " & ".join(sorted(x)) if isinstance(x, frozenset) else str(x)
             )
 
-    # ── Add lift_type ─────────────────────────────────────────────────────────
+    # -- Add lift_type ---------------------------------------------------------
     df = _annotate_lift_type(df, lift_independence_low, lift_independence_high)
 
-    # ── Rename grid annotation columns to be self-explanatory ────────────────
+    # -- Rename grid annotation columns to be self-explanatory ----------------
     df = df.rename(columns={
         "grid_support":    "grid_min_support",
         "grid_confidence": "grid_min_confidence",
     })
 
-    # ── Add global filter thresholds as per-row columns ──────────────────────
-    if min_support    is not None: df["filter_min_support"]    = min_support
-    if max_support    is not None: df["filter_max_support"]    = max_support
+    # -- Add global filter thresholds as per-row columns ----------------------
+    if min_support is not None: df["filter_min_support"] = min_support
+    if max_support is not None: df["filter_max_support"] = max_support
     if min_confidence is not None: df["filter_min_confidence"] = min_confidence
     if max_confidence is not None: df["filter_max_confidence"] = max_confidence
-    df["filter_lift_kept_below"]  = lift_independence_low
-    df["filter_lift_kept_above"]  = lift_independence_high
-    df["filter_lift_discarded"]   = f"[{lift_independence_low}, {lift_independence_high}]"
+    df["filter_lift_kept_below"] = lift_independence_low
+    df["filter_lift_kept_above"] = lift_independence_high
+    df["filter_lift_discarded"] = f"[{lift_independence_low}, {lift_independence_high}]"
 
-    # ── Drop columns that are not needed ─────────────────────────────────────
+    # -- Drop columns that are not needed -------------------------------------
     _DROP = {
         "zhangs_metric",
         "jaccard", "certainty", "kulczynski", "representativity",
     }
     df = df.drop(columns=[c for c in _DROP if c in df.columns])
 
-    # ── Sanitise inf / -inf / NaN in numeric columns ──────────────────────────
-    # conviction = (1-P(C))/(1-conf) → inf when confidence=1.0 (mathematically
-    # correct but unreadable in CSV).  Replace with a large finite sentinel and
-    # replace NaN with empty string equivalent for float columns.
+    # -- Sanitise inf / -inf / NaN in numeric columns --------------------------
+    # conviction = (1-P(C))/(1-conf) -> inf when confidence=1.0 (mathematically correct but unreadable in CSV).  Replace with a large finite sentinel and replace NaN with empty string equivalent for float columns.
     _FLOAT_COLS = [
         "antecedent support", "consequent support",
         "support", "confidence", "lift", "leverage", "conviction",
@@ -1361,7 +1255,7 @@ def _format_rules_for_csv(
         df[col] = pd.to_numeric(df[col], errors="coerce")
         df[col] = df[col].replace([np.inf, -np.inf], np.nan)
 
-    # ── Enforce canonical column order ────────────────────────────────────────
+    # -- Enforce canonical column order ----------------------------------------
     _ORDERED = [
         "k_value",
         "antecedents", "consequents",
@@ -1374,11 +1268,11 @@ def _format_rules_for_csv(
         "filter_lift_discarded",
     ]
     present = [c for c in _ORDERED if c in df.columns]
-    extra   = [c for c in df.columns if c not in present]
+    extra = [c for c in df.columns if c not in present]
     df = df[present + extra]
 
-    # ── Sort rows alphabetically by antecedents then consequents ─────────────
-    # Makes symmetric rules (A→B and B→A) adjacent and the CSV easier to scan.
+    # -- Sort rows alphabetically by antecedents then consequents -------------
+    # Makes symmetric rules (A->B and B->A) adjacent and the CSV easier to scan.
     sort_cols = [c for c in ("antecedents", "consequents") if c in df.columns]
     if sort_cols:
         df = df.sort_values(sort_cols).reset_index(drop=True)
@@ -1391,10 +1285,10 @@ def _save_rules(
     grid_summary: pd.DataFrame,
     dest_dir: Path,
     filename_stem: str,
-    lift_independence_low: float    = DEFAULT_LIFT_INDEPENDENCE_LOW,
-    lift_independence_high: float   = DEFAULT_LIFT_INDEPENDENCE_HIGH,
-    min_support: Optional[float]    = None,
-    max_support: Optional[float]    = None,
+    lift_independence_low: float = DEFAULT_LIFT_INDEPENDENCE_LOW,
+    lift_independence_high: float = DEFAULT_LIFT_INDEPENDENCE_HIGH,
+    min_support: Optional[float] = None,
+    max_support: Optional[float] = None,
     min_confidence: Optional[float] = None,
     max_confidence: Optional[float] = None,
 ) -> None:
@@ -1402,18 +1296,12 @@ def _save_rules(
     Write arm_rules and arm_grid_summary CSVs to dest_dir.
 
     Rules CSV
-    ─────────
-    Each row contains the actual rule metrics (support, confidence, lift),
-    antecedent/consequent supports, lift_type, the grid thresholds at which
-    the rule was found (grid_min_support, grid_min_confidence), and the global
-    filter bounds — making every row fully self-describing.
-    Columns not requested (zhangs_metric, jaccard, certainty,
-    kulczynski, representativity) are dropped.
+    ---------
+    Each row contains the actual rule metrics (support, confidence, lift), antecedent/consequent supports, lift_type, the grid thresholds at which the rule was found (grid_min_support, grid_min_confidence), and the global filter bounds - making every row fully self-describing.Columns not requested (zhangs_metric, jaccard, certainty, kulczynski, representativity) are dropped.
 
     Grid summary CSV
-    ────────────────
-    One row per (min_support, min_confidence) grid cell with n_rules count
-    plus the global filter parameters as extra columns.
+    ----------------
+    One row per (min_support, min_confidence) grid cell with n_rules count plus the global filter parameters as extra columns.
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
     rules_path   = dest_dir / f"{filename_stem}_rules.csv"
@@ -1429,23 +1317,23 @@ def _save_rules(
         max_confidence=max_confidence,
     )
     rules_csv.to_csv(rules_path, index=False, float_format="%.6f")
-    logger.info("    Rules   → %s  (%d rows)", rules_path.name, len(rules_csv))
+    logger.info("    Rules   -> %s  (%d rows)", rules_path.name, len(rules_csv))
 
     gs = grid_summary.copy()
-    if min_support    is not None: gs["filter_min_support"]    = min_support
-    if max_support    is not None: gs["filter_max_support"]    = max_support
+    if min_support is not None: gs["filter_min_support"] = min_support
+    if max_support is not None: gs["filter_max_support"] = max_support
     if min_confidence is not None: gs["filter_min_confidence"] = min_confidence
     if max_confidence is not None: gs["filter_max_confidence"] = max_confidence
-    gs["filter_lift_kept_below"]  = lift_independence_low
-    gs["filter_lift_kept_above"]  = lift_independence_high
-    gs["filter_lift_discarded"]   = f"[{lift_independence_low}, {lift_independence_high}]"
+    gs["filter_lift_kept_below"] = lift_independence_low
+    gs["filter_lift_kept_above"] = lift_independence_high
+    gs["filter_lift_discarded"] = f"[{lift_independence_low}, {lift_independence_high}]"
     gs.to_csv(summary_path, index=False, float_format="%.6f")
-    logger.info("    Summary → %s  (%d cells)", summary_path.name, len(grid_summary))
+    logger.info("    Summary -> %s  (%d cells)", summary_path.name, len(grid_summary))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Per-k runner
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _save_frequent_itemsets(
     freq_itemsets: pd.DataFrame,
@@ -1455,14 +1343,13 @@ def _save_frequent_itemsets(
     min_support: float,
 ) -> None:
     """
-    Save the frequent itemsets DataFrame (output of FP-Growth at min_support)
-    to a CSV file.
+    Save the frequent itemsets DataFrame (output of FP-Growth at min_support) to a CSV file.
 
     Columns written
-    ───────────────
-    k_value   — k value for this run
-    itemset   — frozenset serialised as " & "-joined sorted tokens
-    support   — itemset support (fraction of transactions)
+    ---------------
+    k_value - k value for this run
+    itemset - frozenset serialised as " & "-joined sorted tokens
+    support - itemset support (fraction of transactions)
 
     Sorted descending by support so the most frequent itemsets appear first.
     """
@@ -1482,7 +1369,7 @@ def _save_frequent_itemsets(
     df = df.sort_values("support", ascending=False).reset_index(drop=True)
     df.to_csv(path, index=False, float_format="%.6f")
     logger.info(
-        "    Frequent itemsets → %s  (%d itemsets at min_support=%.4f)",
+        "    Frequent itemsets -> %s  (%d itemsets at min_support=%.4f)",
         path.name, len(df), min_support,
     )
 
@@ -1499,11 +1386,9 @@ def _run_for_k(
     """
     Run the full grid search for a single k value.
 
-    Loads transactions from the per-k itemset file, runs the grid search,
-    saves results + heatmaps + frequent itemsets CSV into association_rules/k<N>/,
-    and returns (all_rules_df, grid_summary_df) for later aggregation.
+    Loads transactions from the per-k itemset file, runs the grid search, saves results + heatmaps + frequent itemsets CSV into association_rules/k<N>/, and returns (all_rules_df, grid_summary_df) for later aggregation.
     """
-    logger.info("  ── k=%d ──────────────────────────────────────────", k_val)
+    logger.info("  -- k=%d ------------------------------------------", k_val)
 
     csv_path = _build_input_path(output_dir, suffix, k_val)
     transactions = load_itemsets(csv_path, k_value=None)  # file already filtered to this k
@@ -1559,72 +1444,59 @@ def _run_for_k(
     return all_rules, grid_summary
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Main stage-3 runner (called from main.py)
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def run_macroscopic_mining(
     output_dir: Path,
     original_class: list[int],
-    k_value: Optional[int]              = DEFAULT_K_VALUE,
-    min_support: float                  = DEFAULT_MIN_SUPPORT,
-    max_support: float                  = DEFAULT_MAX_SUPPORT,
-    support_step: Optional[float]       = DEFAULT_SUPPORT_STEP,
-    min_confidence: float               = DEFAULT_MIN_CONFIDENCE,
-    max_confidence: float               = DEFAULT_MAX_CONFIDENCE,
-    confidence_step: Optional[float]    = DEFAULT_CONFIDENCE_STEP,
-    lift_independence_low: float        = DEFAULT_LIFT_INDEPENDENCE_LOW,
-    lift_independence_high: float       = DEFAULT_LIFT_INDEPENDENCE_HIGH,
-    n_workers: int                      = _DEFAULT_ARM_WORKERS,
+    k_value: Optional[int] = DEFAULT_K_VALUE,
+    min_support: float = DEFAULT_MIN_SUPPORT,
+    max_support: float = DEFAULT_MAX_SUPPORT,
+    support_step: Optional[float] = DEFAULT_SUPPORT_STEP,
+    min_confidence: float = DEFAULT_MIN_CONFIDENCE,
+    max_confidence: float = DEFAULT_MAX_CONFIDENCE,
+    confidence_step: Optional[float] = DEFAULT_CONFIDENCE_STEP,
+    lift_independence_low: float = DEFAULT_LIFT_INDEPENDENCE_LOW,
+    lift_independence_high: float = DEFAULT_LIFT_INDEPENDENCE_HIGH,
+    n_workers: int = _DEFAULT_ARM_WORKERS,
 ) -> None:
     """
     Entry point for stage 3, called by main.py after stage 2 completes.
 
     For each class in *original_class* the function:
-      1. Discovers all available per-k itemset files (or uses a single k if
-         --arm-k is specified).
-      2. Runs the grid search for each k separately → saves rules + heatmaps
-         under association_rules/k<N>/.
-      3. Aggregates all per-k rules into a combined dataset → saves under
-         association_rules/all_k/.
+      1. Discovers all available per-k itemset files (or uses a single k if --arm-k is specified).
+      2. Runs the grid search for each k separately -> saves rules + heatmaps under association_rules/k<N>/.
+      3. Aggregates all per-k rules into a combined dataset -> saves under association_rules/all_k/.
 
-    Skip-if-exists: if association_rules/all_k/arm[suffix]_all_k_rules.csv already
-    exists the entire class is skipped.  Individual per-k runs are skipped if
-    their arm[suffix]_rules.csv already exists, or if a sentinel file
-    .arm[suffix]_done marks them as previously processed with zero results.
+    Skip-if-exists: if association_rules/all_k/arm[suffix]_all_k_rules.csv already exists the entire class is skipped.  Individual per-k runs are skipped if their arm[suffix]_rules.csv already exists, or if a sentinel file .arm[suffix]_done marks them as previously processed with zero results.
 
     Parameters
     ----------
-    output_dir             : Stage-2 output directory (contains itemset CSVs).
-    original_class         : List of class indices to process ([0], [1], [0,1]).
-    k_value                : If set, process only that k value; otherwise all
-                             k values found in output_dir are processed.
-    min_support            : Lower bound of the support grid.
-    max_support            : Upper bound filter for support.
-    support_step           : Step size for the support grid.
-    min_confidence         : Lower bound of the confidence grid.
-    max_confidence         : Upper bound filter for confidence.
-    confidence_step        : Step size for the confidence grid.
-    lift_independence_low  : Lower boundary of the independence lift interval.
-    lift_independence_high : Upper boundary of the independence lift interval.
-    n_workers              : Thread-pool size for the parallel confidence sweep.
+    output_dir: Stage-2 output directory (contains itemset CSVs).
+    original_class: List of class indices to process ([0], [1], [0,1]).
+    k_value: If set, process only that k value; otherwise all k values found in output_dir are processed.
+    min_support: Lower bound of the support grid.
+    max_support: Upper bound filter for support.
+    support_step: Step size for the support grid.
+    min_confidence: Lower bound of the confidence grid.
+    max_confidence: Upper bound filter for confidence.
+    confidence_step: Step size for the confidence grid.
+    lift_independence_low: Lower boundary of the independence lift interval.
+    lift_independence_high: Upper boundary of the independence lift interval.
+    n_workers: Thread-pool size for the parallel confidence sweep.
     """
-    logger.info("═" * 62)
-    logger.info("  ACS INCOME PIPELINE  —  stage 3: macroscopic ARM")
-    logger.info("═" * 62)
-    logger.info("  Output dir             : %s", output_dir.resolve())
-    logger.info("  k selector             : %s",
-                k_value if k_value else "auto (all k files found)")
-    logger.info("  Support  grid          : [%.3f, %.3f]  step=%s",
-                min_support, max_support,
-                f"{support_step:.4f}" if support_step is not None else "auto")
-    logger.info("  Confidence grid        : [%.3f, %.3f]  step=%s",
-                min_confidence, max_confidence,
-                f"{confidence_step:.4f}" if confidence_step is not None else "auto")
-    logger.info("  Lift independence zone : [%.2f, %.2f]  → discarded",
-                lift_independence_low, lift_independence_high)
-    logger.info("  Workers                : %d", n_workers)
-    logger.info("═" * 62)
+    logger.info("=" * 62)
+    logger.info("  ACS INCOME PIPELINE - stage 3: macroscopic ARM")
+    logger.info("=" * 62)
+    logger.info("  Output dir: %s", output_dir.resolve())
+    logger.info("  k selector: %s", k_value if k_value else "auto (all k files found)")
+    logger.info("  Support grid: [%.3f, %.3f] step=%s", min_support, max_support, f"{support_step:.4f}" if support_step is not None else "auto")
+    logger.info("  Confidence grid: [%.3f, %.3f] step=%s", min_confidence, max_confidence, f"{confidence_step:.4f}" if confidence_step is not None else "auto")
+    logger.info("  Lift independence zone: [%.2f, %.2f] -> discarded", lift_independence_low, lift_independence_high)
+    logger.info("  Workers: %d", n_workers)
+    logger.info("=" * 62)
 
     # Ensure the feature_importance sub-folder exists.
     _feature_imp_dir(output_dir)
@@ -1647,7 +1519,7 @@ def run_macroscopic_mining(
             )
             continue
 
-        logger.info("── Class %d ──────────────────────────────────────────", orig_cls)
+        logger.info("-- Class %d ------------------------------------------", orig_cls)
 
         # Determine which k values to process.
         if k_value is not None:
@@ -1665,13 +1537,11 @@ def run_macroscopic_mining(
 
         logger.info("  k values to process: %s", k_values_to_run)
 
-        all_rules_list:   list[pd.DataFrame] = []
+        all_rules_list: list[pd.DataFrame] = []
         all_summary_list: list[pd.DataFrame] = []
 
-        # ── Worker function: process a single k value (thread-safe) ──────────
-        # Each k writes to its own directory and loads its own CSV, so there
-        # is no shared mutable state.  _make_heatmap uses Figure() directly
-        # (not plt.subplots()) to avoid the pyplot global state machine.
+        # -- Worker function: process a single k value (thread-safe) ----------
+        # Each k writes to its own directory and loads its own CSV, so there is no shared mutable state.  _make_heatmap uses Figure() directly (not plt.subplots()) to avoid the pyplot global state machine.
         def _process_one_k(
             k_val: int, inner_workers: int,
         ) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -1680,9 +1550,9 @@ def run_macroscopic_mining(
 
             if effective_k is not None:
                 k_out = _k_dir(output_dir, k_val)
-                k_rules_path   = k_out / f"arm{suffix}_rules.csv"
+                k_rules_path = k_out / f"arm{suffix}_rules.csv"
                 k_summary_path = k_out / f"arm{suffix}_grid_summary.csv"
-                k_sentinel     = k_out / f".arm{suffix}_done"
+                k_sentinel = k_out / f".arm{suffix}_done"
 
                 if k_rules_path.exists():
                     try:
@@ -1698,7 +1568,7 @@ def run_macroscopic_mining(
 
                     if existing.empty:
                         logger.info(
-                            "  k=%d: existing rules file is empty — reprocessing.",
+                            "  k=%d: existing rules file is empty - reprocessing.",
                             k_val,
                         )
                     else:
@@ -1726,7 +1596,7 @@ def run_macroscopic_mining(
                     if rules_k.empty:
                         k_sentinel.touch()
                 else:
-                    logger.info("  ── combined (all k) ──────────────────────────────")
+                    logger.info("  -- combined (all k) ------------------------------")
                     csv_path = _build_input_path(output_dir, suffix, None)
                     transactions = load_itemsets(csv_path)
                     if not transactions:
@@ -1748,21 +1618,20 @@ def run_macroscopic_mining(
                 return pd.DataFrame(), pd.DataFrame()
             except Exception as exc:
                 logger.error(
-                    "  Unexpected error processing k=%d: %s — skipping.", k_val, exc,
-                    exc_info=True,
-                )
+                    "  Unexpected error processing k=%d: %s - skipping.", k_val, exc, exc_info=True,
+        )
                 return pd.DataFrame(), pd.DataFrame()
 
             return rules_k, summary_k
 
-        # ── Dispatch: parallel if multiple k values, sequential otherwise ─────
+        # -- Dispatch: parallel if multiple k values, sequential otherwise -----
         n_k = len(k_values_to_run)
         if n_k > 1:
             from concurrent.futures import ThreadPoolExecutor, as_completed
-            k_workers    = min(n_workers, n_k)
-            inner_per_k  = max(1, n_workers // k_workers)
+            k_workers = min(n_workers, n_k)
+            inner_per_k = max(1, n_workers // k_workers)
             logger.info(
-                "  Parallel macro ARM: %d k values × %d workers "
+                "  Parallel macro ARM: %d k values * %d workers "
                 "(inner grid workers per k: %d).",
                 n_k, k_workers, inner_per_k,
             )
@@ -1785,8 +1654,8 @@ def run_macroscopic_mining(
                 if not summary_k.empty:
                     all_summary_list.append(summary_k)
 
-        # ── Aggregate and save combined all-k results ─────────────────────────
-        logger.info("── Aggregating all-k results for class %d …", orig_cls)
+        # -- Aggregate and save combined all-k results -------------------------
+        logger.info("-- Aggregating all-k results for class %d ...", orig_cls)
         all_k_out = _all_k_dir(output_dir)
 
         if all_rules_list:
@@ -1800,7 +1669,7 @@ def run_macroscopic_mining(
                     return str(x)
                 combined_rules["_rule_key"] = (
                     combined_rules[key_cols[0]].apply(_fs_key)
-                    + "→"
+                    + "->"
                     + combined_rules[key_cols[1]].apply(_fs_key)
                 )
                 combined_rules = (
@@ -1843,37 +1712,34 @@ def run_macroscopic_mining(
             min_confidence=min_confidence, max_confidence=max_confidence,
         )
 
-    # ── Move stage-2 files into feature_importance/ now that all reads are done ─
+    # -- Move stage-2 files into feature_importance/ now that all reads are done -
     _move_feature_importance_files(output_dir)
 
-    logger.info("═" * 62)
+    logger.info("=" * 62)
     logger.info("  Stage 3 (ARM) completed.")
     logger.info("  Outputs in: %s", (_arm_root(output_dir)).resolve())
-    logger.info("═" * 62)
+    logger.info("=" * 62)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # CLI argument definitions (consumed by main.py's build_parser)
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def add_arm_arguments(parser: argparse.ArgumentParser) -> None:
     """
     Add stage-3 (ARM) arguments to an existing ArgumentParser.
 
-    Called by main.py's build_parser() to keep all CLI logic in one place.
-    All arguments are optional with sensible defaults.
+    Called by main.py's build_parser() to keep all CLI logic in one place. All arguments are optional with sensible defaults.
     """
     arm = parser.add_argument_group(
-        "ARM hyperparameters  (stage 3 — macroscopic association rule mining)"
+        "ARM hyperparameters (stage 3 - macroscopic association rule mining)"
     )
 
     arm.add_argument(
-        "--arm-min-support", type=float, default=DEFAULT_MIN_SUPPORT, metavar="S",
-        help=f"Minimum support for FP-Growth grid search.  Default: {DEFAULT_MIN_SUPPORT}.",
+        "--arm-min-support", type=float, default=DEFAULT_MIN_SUPPORT, metavar="S", help=f"Minimum support for FP-Growth grid search.  Default: {DEFAULT_MIN_SUPPORT}.",
     )
     arm.add_argument(
-        "--arm-max-support", type=float, default=DEFAULT_MAX_SUPPORT, metavar="S",
-        help=f"Maximum support upper-bound filter.  Default: {DEFAULT_MAX_SUPPORT}.",
+        "--arm-max-support", type=float, default=DEFAULT_MAX_SUPPORT, metavar="S", help=f"Maximum support upper-bound filter.  Default: {DEFAULT_MAX_SUPPORT}.",
     )
     arm.add_argument(
         "--arm-support-step", type=float, default=None, metavar="S",
@@ -1931,30 +1797,30 @@ def add_arm_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Standalone entry-point guard
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import sys
 
     print(
         "macroscopic_data_mining.py is stage 3 of the pipeline and cannot be\n"
-        "run independently — the input file path depends on the full set of\n"
-        "pipeline parameters (states, years, columns, percentile, …).\n\n"
+        "run independently -- the input file path depends on the full set of\n"
+        "pipeline parameters (states, years, columns, percentile, ...).\n\n"
         "Run the full pipeline via:\n"
         "  python -m src.main [OPTIONS]\n\n"
         "Stage-3 specific options:\n"
-        "  --arm-min-support        (default: 0.05)\n"
-        "  --arm-max-support        (default: 1.00)\n"
-        "  --arm-support-step       (default: 0.05)\n"
-        "  --arm-min-confidence     (default: 0.50)\n"
-        "  --arm-max-confidence     (default: 1.00)\n"
-        "  --arm-confidence-step    (default: 0.10)\n"
-        "  --arm-lift-low           (default: 0.75)\n"
-        "  --arm-lift-high          (default: 1.25)\n"
-        f"  --arm-workers            (default: {_DEFAULT_ARM_WORKERS}, auto-detected)\n"
-        "  --arm-k                  (default: None — process all k values found)\n",
+        "  --arm-min-support (default: 0.05)\n"
+        "  --arm-max-support (default: 1.00)\n"
+        "  --arm-support-step (default: auto)\n"
+        "  --arm-min-confidence (default: 0.50)\n"
+        "  --arm-max-confidence (default: 1.00)\n"
+        "  --arm-confidence-step (default: auto)\n"
+        "  --arm-lift-low (default: 0.75)\n"
+        "  --arm-lift-high (default: 1.25)\n"
+        f"  --arm-workers (default: {_DEFAULT_ARM_WORKERS}, auto-detected)\n"
+        "  --arm-k (default: None -- process all k values found)\n",
         file=sys.stderr,
     )
     sys.exit(1)

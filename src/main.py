@@ -1,43 +1,34 @@
 """
 src/main.py
-───────────
+-----------
 Command-line entry point for the ACS Income pipeline.
 
 This file orchestrates all four pipeline stages:
 
-  Stage 1 — dataset creation  (src/create_dataset.py)
-    Downloads ACS PUMS data via folktables, decodes categorical features,
-    discretises continuous variables, and writes train/test CSV files.
-    When --states is a group name (e.g. northeast) the group name is used
-    in the output filename instead of the individual state codes.
+  Stage 1 - dataset creation  (src/create_dataset.py)
+    Downloads ACS PUMS data via folktables, decodes categorical features, discretises continuous variables, and writes train/test CSV files When --states is a group name (e.g. northeast) the group name is used in the output filename instead of the individual state codes.
 
-  Stage 2 — feature importance  (src/feature_importance.py)
-    Trains a CatBoost classifier on the stage-1 output and computes global
-    feature importance using the BoCSoR algorithm (Alfeo et al., 2023).
-    Both boundary directions (class 0→1 and class 1→0) are always computed.
-    Results are saved under <output-dir>/<states_tag>/<years_tag>/.
+  Stage 2 - feature importance  (src/feature_importance.py)
+    Trains a CatBoost classifier on the stage-1 output and computes global feature importance using the BoCSoR algorithm (Alfeo et al., 2023). Both boundary directions (class 0->1 and class 1->0) are always computed. Results are saved under <output-dir>/<states_tag>/<years_tag>/.
 
-  Stage 3 — macroscopic association rule mining  (src/macroscopic_data_mining.py)
-    Mines FP-Growth association rules on the feature *label* level (e.g.
-    {SCHL, WKHP}) using a grid search over support and confidence.
+  Stage 3 - macroscopic association rule mining  (src/macroscopic_data_mining.py)
+    Mines FP-Growth association rules on the feature *label* level (e.g. {SCHL, WKHP}) using a grid search over support and confidence.
 
-  Stage 4 — microscopic association rule mining  (src/microscopic_data_mining.py)
-    For each macroscopic rule, filters itemsets that contain all its labels
-    and mines value-level rules (e.g. {SCHL=Bachelors-Degree, WKHP=Full-Time}).
+  Stage 4 - microscopic association rule mining  (src/microscopic_data_mining.py)
+    For each macroscopic rule, filters itemsets that contain all its labels and mines value-level rules (e.g. {SCHL=Bachelors-Degree, WKHP=Full-Time}).
 
 Usage
-─────
+-----
 From the project root:
     python -m src.main [OPTIONS]
 
 Examples
-────────
-    # All stages — dataset created if missing, existing outputs skipped
+--------
+    # All stages -- dataset created if missing, existing outputs skipped
     python -m src.main --states northeast --years 2024
 
     # Custom BoCSoR settings
-    python -m src.main --states CA NY TX --columns ALL \\
-                        --k 11 --percentile 20
+    python -m src.main --states CA NY TX --columns ALL --k 11 --percentile 20
 
     # Multiple years
     python -m src.main --states ALL --years 2021 2022 2023 2024
@@ -59,7 +50,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from src.constants import (       # noqa: E402
+from src.constants import (  # noqa: E402
     USA_STATES,
     STATE_GROUPS,
     INCOME_FEATURES,
@@ -69,46 +60,43 @@ from src.constants import (       # noqa: E402
     resolve_default_margin,
 )
 from src.create_dataset import create_dataset, build_dataset_stem  # noqa: E402
-from src.macroscopic_data_mining import (      # noqa: E402
+from src.macroscopic_data_mining import ( # noqa: E402
     run_macroscopic_mining,
     add_arm_arguments,
 )
-from src.microscopic_data_mining import (      # noqa: E402
+from src.microscopic_data_mining import ( # noqa: E402
     run_microscopic_mining,
     add_micro_arguments,
 )
 
-VALID_HORIZONS   = ("1-Year", "5-Year")
-VALID_SURVEYS    = ("person", "household")
+VALID_HORIZONS = ("1-Year", "5-Year")
+VALID_SURVEYS = ("person", "household")
 _ALL_STATE_CODES: set[str] = set(USA_STATES) | {"AK", "DC", "PR"}
 
-# Default worker count used for both multi-year stage-1 parallelism and
-# BoCSoR stage-2 processing.  Formula: max(1, min(14, cpu_count - 2)).
-# Reserves 2 logical CPUs for the OS and the main process; caps at 14
-# to avoid competing CatBoost thread pools degrading throughput.
+# Default worker count used for both multi-year stage-1 parallelism and BoCSoR stage-2 processing.  Formula: max(1, min(14, cpu_count - 2)). Reserves 2 logical CPUs for the OS and the main process; caps at 14 to avoid competing CatBoost thread pools degrading throughput.
 _DEFAULT_WORKERS = max(1, min(14, (os.cpu_count() or 4) - 2))
 
 logger = logging.getLogger("src.main")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Argument resolution helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def resolve_states(raw: list[str], horizon: str) -> list[str] | None:
     """
     Convert the raw --states argument into a list of state codes or None.
 
     Accepted inputs
-    ───────────────
-    "ALL"         → None  (downstream uses the full USA_STATES list)
-    group name    → expanded via STATE_GROUPS
-    state codes   → validated against the full set of known state codes
+    ---------------
+    "ALL" -> None  (downstream uses the full USA_STATES list)
+    group name -> expanded via STATE_GROUPS
+    state codes -> validated against the full set of known state codes
 
     Parameters
     ----------
-    raw     : Unprocessed token list from argparse.
-    horizon : Survey horizon, used to validate Alaska compatibility.
+    raw: Unprocessed token list from argparse.
+    horizon: Survey horizon, used to validate Alaska compatibility.
 
     Returns
     -------
@@ -117,15 +105,14 @@ def resolve_states(raw: list[str], horizon: str) -> list[str] | None:
     Raises
     ------
     ValueError
-        On unrecognised state codes, mixed group/code input, or Alaska
-        with an incompatible horizon.
+        On unrecognised state codes, mixed group/code input, or Alaska with an incompatible horizon.
     """
     if raw == ["ALL"]:
         return None
 
     if len(raw) == 1 and raw[0].lower() in STATE_GROUPS:
         group_name = raw[0].lower()
-        states     = list(STATE_GROUPS[group_name])
+        states = list(STATE_GROUPS[group_name])
         logger.info("State group '%s' expanded to: %s", group_name, states)
     else:
         groups_found = [s for s in raw if s.lower() in STATE_GROUPS]
@@ -135,7 +122,7 @@ def resolve_states(raw: list[str], horizon: str) -> list[str] | None:
                 f"Group tokens found: {groups_found}."
             )
         normalized = [s.upper() for s in raw]
-        invalid    = [s for s in normalized if s not in _ALL_STATE_CODES]
+        invalid = [s for s in normalized if s not in _ALL_STATE_CODES]
         if invalid:
             raise ValueError(
                 f"Unrecognised state codes: {invalid}.\n"
@@ -158,10 +145,10 @@ def resolve_columns(raw: list[str] | None) -> list[str] | None:
     Convert the raw --columns argument into a column list or None.
 
     Mapping
-    ───────
-    None      → None  (retain all feature columns — default)
-    ["ALL"]   → None  (explicit alias for all feature columns)
-    list      → validated against INCOME_FEATURES
+    -------
+    None -> None (retain all feature columns - default)
+    ["ALL"] -> None (explicit alias for all feature columns)
+    list -> validated against INCOME_FEATURES
 
     Raises
     ------
@@ -190,20 +177,20 @@ def resolve_threshold(
     Return the income threshold to use for this pipeline run.
 
     Resolution order
-    ────────────────
-    1. Explicit --threshold CLI value  →  used as-is.
-    2. Recognised state group name     →  GROUP_THRESHOLDS lookup.
-    3. Single state code               →  STATE_THRESHOLDS lookup.
-    4. Multiple state codes or ALL     →  NATIONAL_THRESHOLD fallback.
+    ----------------
+    1. Explicit --threshold CLI value  ->  used as-is.
+    2. Recognised state group name ->  GROUP_THRESHOLDS lookup.
+    3. Single state code ->  STATE_THRESHOLDS lookup.
+    4. Multiple state codes or ALL ->  NATIONAL_THRESHOLD fallback.
 
     For any state or group not found in the lookup tables the national
     threshold ($94,200) is used and a warning is logged.
 
     Parameters
     ----------
-    explicit        : Value from --threshold, or None if not supplied.
-    raw_states_arg  : Raw token list from --states (e.g. ["NY"] or ["northeast"]).
-    states          : Resolved state-code list (None means all states).
+    explicit: Value from --threshold, or None if not supplied.
+    raw_states_arg: Raw token list from --states (e.g. ["NY"] or ["northeast"]).
+    states: Resolved state-code list (None means all states).
     """
     if explicit is not None:
         return explicit
@@ -234,7 +221,7 @@ def resolve_threshold(
         )
         return NATIONAL_THRESHOLD
 
-    # ALL states or multiple state codes → national fallback
+    # ALL states or multiple state codes -> national fallback
     logger.info(
         "Auto-threshold: national fallback -> $%.0f", NATIONAL_THRESHOLD
     )
@@ -259,8 +246,7 @@ def _process_year(
     """
     Worker function executed in a separate process for a single survey year.
 
-    Each worker configures its own logging handler because file descriptors
-    are not reliably inherited across processes on all platforms.
+    Each worker configures its own logging handler because file descriptors are not reliably inherited across processes on all platforms.
 
     Returns
     -------
@@ -268,7 +254,7 @@ def _process_year(
     """
     logging.basicConfig(
         level=getattr(logging, log_level),
-        format="%(asctime)s [%(levelname)s] %(name)s – %(message)s",
+        format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
         datefmt="%H:%M:%S",
     )
     _, train_df, test_df = create_dataset(
@@ -286,9 +272,9 @@ def _process_year(
     return year, len(train_df), len(test_df)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Stage 2 runner
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _run_feature_importance(
     train_path: Path,
@@ -309,28 +295,23 @@ def _run_feature_importance(
     """
     Invoke stage 2 (BoCSoR feature importance) programmatically.
 
-    Called after stage 1 completes for each survey year.
-    Both boundary directions (class 0→1 and class 1→0) are always computed
-    and saved to separate files (_class0 / _class1 suffixes).
+    Called after stage 1 completes for each survey year. Both boundary directions (class 0->1 and class 1->0) are always computed and saved to separate files (_class0 / _class1 suffixes).
 
     Parameters
     ----------
-    train_path           : Path to the train CSV produced by stage 1.
-    test_path            : Path to the test CSV produced by stage 1.
-    output_dir           : Directory where BoCSoR results will be written.
-    k                    : Raw list from --k (e.g. [11] or [1, 5, 11]).
-                           Passed to expand_k(): single value K is auto-expanded
-                           to all odd integers 1..K; multiple values used as-is.
-    percentile           : Percentile threshold for boundary instance selection.
-    cb_iterations        : Boosting rounds / training epochs.
-    cb_lr                : Learning rate.
-    cb_depth             : Tree depth / hidden layer size exponent.
-    cb_verbose           : Whether the classifier prints training progress.
-    cb_early_stopping    : Stop training if validation loss does not improve
-                           for this many rounds (0 = disabled).
-    classifier           : "catboost" or "mlp".
-    random_seed          : Random seed for the classifier.
-    log_level            : Logging level string (e.g. "INFO").
+    train_path: Path to the train CSV produced by stage 1.
+    test_path: Path to the test CSV produced by stage 1.
+    output_dir: Directory where BoCSoR results will be written.
+    k: Raw list from --k (e.g. [11] or [1, 5, 11]). Passed to expand_k(): single value K is auto-expanded to all odd integers 1..K; multiple values used as-is.
+    percentile: Percentile threshold for boundary instance selection.
+    cb_iterations: Boosting rounds / training epochs.
+    cb_lr: Learning rate.
+    cb_depth: Tree depth / hidden layer size exponent.
+    cb_verbose: Whether the classifier prints training progress.
+    cb_early_stopping: Stop training if validation loss does not improve for this many rounds (0 = disabled).
+    classifier: "catboost" or "mlp".
+    random_seed: Random seed for the classifier.
+    log_level: Logging level string (e.g. "INFO").
     """
     # Lazy import to keep stage-1-only runs free of catboost/sklearn overhead.
     from src.feature_importance import (
@@ -346,13 +327,13 @@ def _run_feature_importance(
 
     k_values = expand_k(k)
 
-    logger.info("═" * 62)
-    logger.info("  ACS INCOME PIPELINE  —  stage 2: feature importance (BoCSoR)")
-    logger.info("═" * 62)
-    logger.info("  k values             : %s  (from --k %s)", k_values, k)
-    logger.info("  Percentile threshold : %.1f%%", percentile)
-    logger.info("  Output directory     : %s", output_dir.resolve())
-    logger.info("═" * 62)
+    logger.info("=" * 62)
+    logger.info("  ACS INCOME PIPELINE - stage 2: feature importance (BoCSoR)")
+    logger.info("=" * 62)
+    logger.info("  k values: %s  (from --k %s)", k_values, k)
+    logger.info("  Percentile threshold: %.1f%%", percentile)
+    logger.info("  Output directory: %s", output_dir.resolve())
+    logger.info("=" * 62)
 
     X_train, X_test, y_train, y_test, target_col = load_split_data(
         train_path=train_path,
@@ -361,12 +342,10 @@ def _run_feature_importance(
         random_seed=random_seed,
     )
     feature_cols = list(X_train.columns)
-    logger.info("Train: %d rows  |  Test: %d rows  |  Features: %d",
-                len(X_train), len(X_test), len(feature_cols))
-    logger.info("Target: %s  |  Features: %s", target_col, feature_cols)
-
-    logger.info("Building rank maps from training data …")
-    rank_maps    = build_rank_maps(X_train[feature_cols])
+    logger.info("Train: %d rows | Test: %d rows | Features: %d", len(X_train), len(X_test), len(feature_cols))
+    logger.info("Target: %s | Features: %s", target_col, feature_cols)
+    logger.info("Building rank maps from training data ...")
+    rank_maps = build_rank_maps(X_train[feature_cols])
     nominal_maps = build_nominal_maps(X_train[feature_cols])
 
     model = train_model(
@@ -383,19 +362,17 @@ def _run_feature_importance(
         verbose=cb_verbose,
         early_stopping_rounds=cb_early_stopping if cb_early_stopping > 0 else None,
     )
-    y_pred_test  = model.predict(X_test).astype(int).ravel()
+    y_pred_test = model.predict(X_test).astype(int).ravel()
     y_pred_train = model.predict(X_train).astype(int).ravel()
-    test_acc  = (y_pred_test  == y_test.values).mean()
+    test_acc = (y_pred_test == y_test.values).mean()
     train_acc = (y_pred_train == y_train.values).mean()
     logger.info(
-        "%s accuracy — train: %.4f  |  test: %.4f",
-        classifier.capitalize(), train_acc, test_acc,
+        "%s accuracy - train: %.4f | test: %.4f", classifier.capitalize(), train_acc, test_acc,
     )
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Always explain both boundary directions (0→1 and 1→0).
-    # Each class gets its own _class0 / _class1 suffixed output files.
+    # Always explain both boundary directions (0->1 and 1->0). Each class gets its own _class0 / _class1 suffixed output files.
     orig_classes_requested = [0, 1]
     suffix_map = {c: f"_class{c}" for c in orig_classes_requested}
     orig_classes_todo = [
@@ -469,7 +446,7 @@ def _run_feature_importance(
         filter_stats_df.to_csv(fstats_path, index=False)
         logger.info("Filter stats -> %s", fstats_path)
 
-        # ── Distance histograms (saved to plots/ subfolder) ───────────────
+        # -- Distance histograms (saved to plots/ subfolder) ---------------
         plot_distance_histograms(
             distances_df, output_dir, suffix=suffix,
         )
@@ -481,15 +458,15 @@ def _run_feature_importance(
             for feat, score in top.items():
                 logger.info("    %-40s %.4f", feat, score)
 
-    logger.info("═" * 62)
+    logger.info("=" * 62)
     logger.info("  Stage 2 completed successfully.")
     logger.info("  Outputs in: %s", output_dir.resolve())
-    logger.info("═" * 62)
+    logger.info("=" * 62)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Argument parser
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
     groups_str = ", ".join(sorted(STATE_GROUPS))
@@ -497,7 +474,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
         prog="python -m src.main",
-        description="ACS Income pipeline — stage 1 (dataset creation) and/or stage 2 (BoCSoR feature importance)",
+        description="ACS Income pipeline -- stage 1 (dataset creation) and/or stage 2 (BoCSoR feature importance)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""
 Predefined state groups:
@@ -514,7 +491,7 @@ already exist that class is skipped.  Stage-3 and stage-4 outputs are also
 skipped if they already exist.  Re-runs are therefore always safe.
 
 Examples:
-  # Full pipeline — all columns (default), threshold auto-selected
+  # Full pipeline -- all columns (default), threshold auto-selected
   python -m src.main --states northeast --years 2024
 
   # Use only a subset of columns
@@ -526,11 +503,11 @@ Examples:
         """,
     )
 
-    # ── ACS parameters (stage 1) ──────────────────────────────────────────────
+    # -- ACS parameters (stage 1) ----------------------------------------------
     acs = parser.add_argument_group("ACS parameters  (stage 1)")
     acs.add_argument(
         "--years", nargs="+", type=int, default=[2024], metavar="YEAR",
-        help="Survey year(s) in the range 2014–2024.  Default: 2024.",
+        help="Survey year(s) in the range 2014-2024.  Default: 2024.",
     )
     acs.add_argument(
         "--horizon", choices=VALID_HORIZONS, default="1-Year",
@@ -551,7 +528,7 @@ Examples:
         ),
     )
 
-    # ── Task parameters (stage 1) ─────────────────────────────────────────────
+    # -- Task parameters (stage 1) ---------------------------------------------
     task = parser.add_argument_group("Task parameters  (stage 1)")
     task.add_argument(
         "--threshold", type=float, default=None, metavar="DOLLARS",
@@ -559,9 +536,9 @@ Examples:
             "Annual personal income threshold in U.S. dollars (PINCP field).  "
             "The binary target is 1 if PINCP > threshold.  "
             "Default: auto-selected from pre-computed Pew Research Center "
-            "upper-income thresholds (T = 2 × M_fam ÷ √3, ACS 2024) based "
-            "on the --states argument.  Single state → state-level threshold;  "
-            "group name → group threshold;  multiple states or ALL → national "
+            "upper-income thresholds (T = 2 * M_fam / sqrt3, ACS 2024) based "
+            "on the --states argument.  Single state -> state-level threshold;  "
+            "group name -> group threshold;  multiple states or ALL -> national "
             "fallback ($94,200).  Pass an explicit value to override."
         ),
     )
@@ -569,18 +546,18 @@ Examples:
         "--margin", type=float, default=None, metavar="DOLLARS",
         help=(
             "Dead zone half-width in dollars.  Individuals with income in "
-            "[threshold − margin, threshold + margin] are excluded from the "
-            "dataset — they are ambiguous cases where the binary label depends "
+            "[threshold - margin, threshold + margin] are excluded from the "
+            "dataset -- they are ambiguous cases where the binary label depends "
             "on noise rather than structural feature differences.  "
             "Default: auto-computed from the ACS Margin of Error for median "
             "family income, propagated through the Pew formula "
-            "(margin = 2 × MOE / √3).  "
+            "(margin = 2 * MOE / sqrt3).  "
             "Pass 0 to disable the dead zone entirely.  "
             "Pass an explicit dollar value to override the auto-selection."
         ),
     )
 
-    # ── Output column selection (stage 1) ─────────────────────────────────────
+    # -- Output column selection (stage 1) -------------------------------------
     cols = parser.add_argument_group("Output column selection  (stage 1)")
     cols.add_argument(
         "--columns", nargs="+", default=None, metavar="COL",
@@ -591,20 +568,20 @@ Examples:
         ),
     )
 
-    # ── Train / test split seed (stage 1) ────────────────────────────────────
+    # -- Train / test split seed (stage 1) ------------------------------------
     split = parser.add_argument_group("Train / test split  (stage 1)")
     split.add_argument(
         "--seed", type=int, default=42,
         help="Random seed for the stratified split and CatBoost.  Default: 42.",
     )
 
-    # ── Input / output ────────────────────────────────────────────────────────
+    # -- Input / output --------------------------------------------------------
     io = parser.add_argument_group("Input / output")
     io.add_argument(
         "--data-dir", type=Path, default=Path("data"), metavar="DIR",
         help=(
-            "Root output directory for stage 1.  Raw PUMS files → <dir>/raw/.  "
-            "Processed CSVs → <dir>/.  Default: data/."
+            "Root output directory for stage 1.  Raw PUMS files -> <dir>/raw/.  "
+            "Processed CSVs -> <dir>/.  Default: data/."
         ),
     )
     io.add_argument(
@@ -615,7 +592,7 @@ Examples:
         ),
     )
 
-    # ── BoCSoR hyperparameters (stage 2) ──────────────────────────────────────
+    # -- BoCSoR hyperparameters (stage 2) --------------------------------------
     boc = parser.add_argument_group("BoCSoR hyperparameters  (stage 2)")
     boc.add_argument(
         "--k", nargs="+", type=int, default=[11], metavar="K",
@@ -630,7 +607,7 @@ Examples:
     boc.add_argument(
         "--percentile", type=float, default=20.0, metavar="PCT",
         help=(
-            "Percentile threshold for boundary instance selection (0–100).  "
+            "Percentile threshold for boundary instance selection (0-100).  "
             "Instances whose distance to the nearest opposite-class instance "
             "is below this percentile are treated as boundary instances.  "
             "Default: 20."
@@ -647,8 +624,8 @@ Examples:
         ),
     )
 
-    # ── CatBoost / MLP hyperparameters (stage 2) ─────────────────────────────
-    cb = parser.add_argument_group("Classifier hyperparameters  (stage 2 — shared by CatBoost and MLP)")
+    # -- CatBoost / MLP hyperparameters (stage 2) -----------------------------
+    cb = parser.add_argument_group("Classifier hyperparameters  (stage 2 -- shared by CatBoost and MLP)")
     cb.add_argument("--cb-iterations", type=int,   default=500,  metavar="N",
                     help="Boosting rounds / training epochs.  Default: 500.")
     cb.add_argument("--cb-lr",         type=float, default=0.05, metavar="LR",
@@ -666,7 +643,7 @@ Examples:
     cb.add_argument("--cb-verbose",    action="store_true",
                     help="Print CatBoost training progress.")
 
-    # ── Performance (stage 1) ─────────────────────────────────────────────────
+    # -- Performance (stage 1) -------------------------------------------------
     perf = parser.add_argument_group("Performance  (stage 1)")
     perf.add_argument(
         "--workers", type=int, default=_DEFAULT_WORKERS, metavar="N",
@@ -678,10 +655,10 @@ Examples:
         ),
     )
 
-    # ── Stage 3: macroscopic ARM hyperparameters ──────────────────────────────
+    # -- Stage 3: macroscopic ARM hyperparameters ------------------------------
     add_arm_arguments(parser)
 
-    # ── Stage 4: microscopic ARM hyperparameters ──────────────────────────────
+    # -- Stage 4: microscopic ARM hyperparameters ------------------------------
     add_micro_arguments(parser)
 
     parser.add_argument(
@@ -694,9 +671,9 @@ Examples:
     return parser
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Helpers: infer stage-1 output paths
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _infer_split_paths(
     data_dir: Path,
@@ -749,28 +726,28 @@ def _build_output_dir(
 
     <states_tag> rules
     ------------------
-    - Recognised group name (e.g. "northeast") → used as-is.
-    - ALL states → "ALL".
-    - Individual codes → sorted and joined by "_" (e.g. "CA_NY_TX").
+    - Recognised group name (e.g. "northeast") -> used as-is.
+    - ALL states -> "ALL".
+    - Individual codes -> sorted and joined by "_" (e.g. "CA_NY_TX").
 
     <years_tag> rules
     -----------------
-    - Single year       → the year itself (e.g. "2024").
-    - Contiguous range  → "<first>-<last>" (e.g. "2021-2024").
-    - Non-contiguous    → years joined by "_" (e.g. "2021_2023").
+    - Single year       -> the year itself (e.g. "2024").
+    - Contiguous range  -> "<first>-<last>" (e.g. "2021-2024").
+    - Non-contiguous    -> years joined by "_" (e.g. "2021_2023").
 
     <cols_tag> rules
     ----------------
-    - keep_columns list → columns sorted and joined by "-" (e.g. "COW-SCHL-WKHP").
-    - None (all columns) → "ALL".
+    - keep_columns list -> columns sorted and joined by "-" (e.g. "COW-SCHL-WKHP").
+    - None (all columns) -> "ALL".
 
     <thr_tag> rules
     ---------------
-    - Threshold as integer (e.g. 94200 → "thr94200").
+    - Threshold as integer (e.g. 94200 -> "thr94200").
 
     <pct_tag> rules
     ---------------
-    - Percentile value as integer (e.g. 20 → "pct20").
+    - Percentile value as integer (e.g. 20 -> "pct20").
 
     <classifier>
     ------------
@@ -782,7 +759,7 @@ def _build_output_dir(
         results/ALL/2021-2024/colsCOW-OCCP-SCHL-WKHP/thr50000/pct10/mlp/
         results/CA_NY_TX/2024/colsALL/thr100000/pct20/catboost/
     """
-    # ── States tag ────────────────────────────────────────────────────────────
+    # -- States tag ------------------------------------------------------------
     if raw_states_arg == ["ALL"] or states is None:
         states_tag = "ALL"
     elif (len(raw_states_arg) == 1
@@ -792,7 +769,7 @@ def _build_output_dir(
     else:
         states_tag = "_".join(sorted(states))
 
-    # ── Years tag ─────────────────────────────────────────────────────────────
+    # -- Years tag -------------------------------------------------------------
     sorted_years = sorted(years)
     if len(sorted_years) == 1:
         years_tag = str(sorted_years[0])
@@ -802,13 +779,13 @@ def _build_output_dir(
     else:
         years_tag = "_".join(str(y) for y in sorted_years)
 
-    # ── Columns tag ───────────────────────────────────────────────────────────
+    # -- Columns tag -----------------------------------------------------------
     cols_tag = "-".join(sorted(keep_columns)) if keep_columns else "ALL"
 
-    # ── Threshold tag ─────────────────────────────────────────────────────────
+    # -- Threshold tag ---------------------------------------------------------
     thr_tag = f"thr{int(threshold)}"
 
-    # ── Percentile tag ────────────────────────────────────────────────────────
+    # -- Percentile tag --------------------------------------------------------
     pct_tag = f"pct{int(percentile)}"
 
     return base_dir / states_tag / years_tag / f"cols{cols_tag}" / thr_tag / pct_tag / classifier
@@ -831,9 +808,9 @@ def _resolve_states_label(raw_states_arg: list[str]) -> str | None:
     return None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Entry point
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def main() -> None:
     multiprocessing.set_start_method("spawn", force=True)
@@ -842,11 +819,11 @@ def main() -> None:
 
     logging.basicConfig(
         level=getattr(logging, args.log_level),
-        format="%(asctime)s [%(levelname)s] %(name)s – %(message)s",
+        format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
         datefmt="%H:%M:%S",
     )
 
-    # ── Argument validation ───────────────────────────────────────────────────
+    # -- Argument validation ---------------------------------------------------
     try:
         states       = resolve_states(args.states, args.horizon)
         keep_columns = resolve_columns(args.columns)
@@ -859,7 +836,7 @@ def main() -> None:
 
     threshold = resolve_threshold(args.threshold, args.states, states)
 
-    # Resolve dead zone margin: None → auto from ACS MOE, 0 → disabled.
+    # Resolve dead zone margin: None -> auto from ACS MOE, 0 -> disabled.
     if args.margin is None:
         margin = resolve_default_margin(states, args.states)
     else:
@@ -867,7 +844,7 @@ def main() -> None:
 
     invalid_years = [y for y in args.years if not (2014 <= y <= 2024)]
     if invalid_years:
-        logger.error("Year(s) out of supported range (2014–2024): %s", invalid_years)
+        logger.error("Year(s) out of supported range (2014-2024): %s", invalid_years)
         sys.exit(1)
 
     invalid_k = [v for v in args.k if v < 1]
@@ -879,33 +856,33 @@ def main() -> None:
         logger.error("--percentile must be in the range (0, 100].")
         sys.exit(1)
 
-    # ── Configuration summary ─────────────────────────────────────────────────
+    # -- Configuration summary -------------------------------------------------
     n_states = len(states) if states else len(USA_STATES)
     xai_output_dir = _build_output_dir(
         args.output_dir, states, args.states, args.years,
         keep_columns, threshold, args.percentile, args.classifier,
     )
 
-    # ── Log file handler: save a copy of all log output to the output dir ─────
+    # -- Log file handler: save a copy of all log output to the output dir -----
     xai_output_dir.mkdir(parents=True, exist_ok=True)
     _log_path = xai_output_dir / "pipeline.log"
     _file_handler = logging.FileHandler(_log_path, mode="a", encoding="utf-8")
     _file_handler.setLevel(getattr(logging, args.log_level))
     _file_handler.setFormatter(logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(name)s – %(message)s",
+        "%(asctime)s [%(levelname)s] %(name)s - %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     ))
     logging.getLogger().addHandler(_file_handler)
     logger.info("Log file: %s", _log_path.resolve())
-    logger.info("═" * 62)
+    logger.info("=" * 62)
     logger.info("  ACS INCOME PIPELINE")
-    logger.info("═" * 62)
+    logger.info("=" * 62)
     logger.info("  Year(s)        : %s", args.years)
     logger.info("  Horizon        : %s", args.horizon)
     logger.info("  Survey         : %s", args.survey)
     logger.info("  States         : %s (%d)", states or "ALL", n_states)
     logger.info("  Threshold      : $%.0f (auto)", threshold) if args.threshold is None else logger.info("  Threshold      : $%.0f (explicit)", threshold)
-    logger.info("  Dead zone      : ±$%.0f %s", margin, "(auto — ACS MOE)" if args.margin is None else "(explicit)") if margin > 0 else logger.info("  Dead zone      : disabled")
+    logger.info("  Dead zone      : +/-$%.0f %s", margin, "(auto -- ACS MOE)" if args.margin is None else "(explicit)") if margin > 0 else logger.info("  Dead zone      : disabled")
     logger.info("  Output columns : %s", keep_columns or "ALL")
     logger.info("  Workers        : %d (auto-detected: %d)", args.workers, _DEFAULT_WORKERS)
     logger.info("  Data dir       : %s", args.data_dir.resolve())
@@ -913,14 +890,14 @@ def main() -> None:
     logger.info("  BoCSoR pct     : %.1f%%", args.percentile)
     logger.info("  Classifier     : %s", args.classifier)
     logger.info("  XAI output dir : %s", xai_output_dir.resolve())
-    logger.info("═" * 62)
+    logger.info("=" * 62)
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     # Stage 1: dataset creation (skipped automatically if output exists)
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     if len(args.years) == 1:
         year = args.years[0]
-        logger.info("── Year %d ──────────────────────────────────────────", year)
+        logger.info("-- Year %d ------------------------------------------", year)
         try:
             dataset_df, train_df, test_df = create_dataset(
                 survey_year=year,
@@ -935,14 +912,14 @@ def main() -> None:
                 margin=margin,
             )
             logger.info(
-                "Year %d complete → train=%d rows, test=%d rows.",
+                "Year %d complete -> train=%d rows, test=%d rows.",
                 year, len(train_df), len(test_df),
             )
         except Exception as exc:
             logger.error("Error processing year %d: %s", year, exc)
             raise
 
-        # ── Stage 2 (single year) ─────────────────────────────────────────────
+        # -- Stage 2 (single year) ---------------------------------------------
         train_path, test_path = _infer_split_paths(
             args.data_dir, year, states, threshold,
             args.horizon, args.survey, keep_columns,
@@ -965,7 +942,7 @@ def main() -> None:
             log_level=args.log_level,
         )
 
-        # ── Stage 3: macroscopic ARM ──────────────────────────────────────────
+        # -- Stage 3: macroscopic ARM ------------------------------------------
         run_macroscopic_mining(
             output_dir=xai_output_dir,
             original_class=[0, 1],
@@ -981,7 +958,7 @@ def main() -> None:
             n_workers=args.arm_workers,
         )
 
-        # ── Stage 4: microscopic ARM ──────────────────────────────────────────
+        # -- Stage 4: microscopic ARM ------------------------------------------
         run_microscopic_mining(
             output_dir=xai_output_dir,
             original_class=[0, 1],
@@ -1032,7 +1009,7 @@ def main() -> None:
                     _, n_train, n_test = future.result()
                     completed[y] = (n_train, n_test)
                     logger.info(
-                        "Year %d complete → train=%d rows, test=%d rows.",
+                        "Year %d complete -> train=%d rows, test=%d rows.",
                         y, n_train, n_test,
                     )
                 except Exception as exc:
@@ -1043,9 +1020,9 @@ def main() -> None:
             logger.error("The following years encountered errors: %s", sorted(failed))
             sys.exit(1)
 
-        # ── Stage 2 (multi-year: one run per year, sequential) ────────────────
+        # -- Stage 2 (multi-year: one run per year, sequential) ----------------
         for year in sorted(completed):
-            logger.info("── Stage 2: year %d ─────────────────────────────────", year)
+            logger.info("-- Stage 2: year %d ---------------------------------", year)
             train_path, test_path = _infer_split_paths(
                 args.data_dir, year, states, threshold,
                 args.horizon, args.survey, keep_columns,
@@ -1069,7 +1046,7 @@ def main() -> None:
                 log_level=args.log_level,
             )
 
-            # ── Stage 3: macroscopic ARM ──────────────────────────────────────
+            # -- Stage 3: macroscopic ARM --------------------------------------
             run_macroscopic_mining(
                 output_dir=year_output_dir,
                 original_class=[0, 1],
@@ -1085,7 +1062,7 @@ def main() -> None:
                 n_workers=args.arm_workers,
             )
 
-            # ── Stage 4: microscopic ARM ──────────────────────────────────────
+            # -- Stage 4: microscopic ARM --------------------------------------
             run_microscopic_mining(
                 output_dir=year_output_dir,
                 original_class=[0, 1],
@@ -1101,9 +1078,9 @@ def main() -> None:
                 n_workers=args.micro_workers,
             )
 
-    logger.info("═" * 62)
+    logger.info("=" * 62)
     logger.info("  Pipeline completed successfully.")
-    logger.info("═" * 62)
+    logger.info("=" * 62)
 
 
 if __name__ == "__main__":
