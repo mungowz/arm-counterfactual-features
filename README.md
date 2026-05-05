@@ -1,16 +1,48 @@
-# ACS Income Dataset Pipeline
+# Feature-Driven Bias Detection — ACS Income Pipeline
 
-A four-stage command-line pipeline for building binary-classification datasets
-from the U.S. Census Bureau's American Community Survey (ACS) Public Use
-Microdata Sample (PUMS), computing global feature importance via the **BoCSoR**
-algorithm, mining macroscopic association rules via **FP-Growth**, and drilling
-down into value-level microscopic rules anchored to the macroscopic findings.
+> Implementation of my Master's thesis: ***Feature-Driven Bias Detection: An Association Rule Mining Approach to Analyze Feature Importance***
+>
+> University of Naples "Parthenope" — CI&SS Lab · Defended April 23, 2026 · **110/110 Summa Cum Laude**
+>
+> 📄 **Thesis (PDF + LaTeX sources):** [mungowz/master_thesis](https://github.com/mungowz/master_thesis)
 
-The pipeline predicts whether an individual's annual personal income (`PINCP`)
-exceeds a configurable threshold.  All categorical features are decoded from
-numeric ACS codes to human-readable string labels, and continuous features are
-discretised into meaningful bands.  Occupation codes (`OCCP`) are aggregated
-into the 23 major groups defined by the
+This repository contains the complete Python implementation of the methodology described in the thesis: a four-stage command-line pipeline that builds binary-classification datasets from the U.S. Census ACS, computes counterfactual-based global feature importance (**BoCSoR**, adapted to fully categorical data), and mines two-level association rules (macroscopic at the feature-name level, microscopic at the `LABEL=value` level) to produce human-readable explanations of tabular classifiers. The pipeline supports two structurally different classifiers (**CatBoost**, **MLP**) for verifying model-agnosticity, and is validated on five U.S. Census ACS 2024 benchmarks (~1.75M records).
+
+The pipeline predicts whether an individual's annual personal income (`PINCP`) exceeds a configurable threshold and is designed to surface both *actionable* dependencies (modifiable attributes) and *biased* rules involving protected demographic features.
+
+## Citation
+
+If this work is useful for your research, please consider citing both the thesis and the foundational BoCSoR paper:
+
+```bibtex
+@mastersthesis{mungari2026biasdetection,
+  author  = {Mungari, Alfredo},
+  title   = {Feature-Driven Bias Detection: An Association Rule Mining
+             Approach to Analyze Feature Importance},
+  school  = {University of Naples "Parthenope"},
+  year    = {2026},
+  type    = {Master's Thesis},
+  address = {Naples, Italy}
+}
+
+@article{alfeo2023bocsor,
+  author  = {Alfeo, Antonio Luca and Zippo, Antonio G. and Catrambone, Vincenzo
+             and Cimino, Mario G.C.A. and Toschi, Nicola and Valenza, Gaetano},
+  title   = {From local counterfactuals to global feature importance: efficient,
+             robust, and model-agnostic explanations for brain connectivity networks},
+  journal = {Computer Methods and Programs in Biomedicine},
+  volume  = {236},
+  pages   = {107550},
+  year    = {2023},
+  doi     = {10.1016/j.cmpb.2023.107550}
+}
+```
+
+---
+
+## Pipeline overview
+
+All categorical features are decoded from numeric ACS codes to human-readable string labels, and continuous features are discretised into meaningful bands. Occupation codes (`OCCP`) are aggregated into the 23 major groups defined by the
 [BLS Occupational Employment and Wage Statistics (OEWS)](https://www.bls.gov/oes/2023/may/oes_stru.htm)
 program.
 
