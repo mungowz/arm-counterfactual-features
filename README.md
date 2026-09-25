@@ -1,17 +1,17 @@
 # Feature-Driven Bias Detection — ACS Income Pipeline
 
-\iffalse
+<!--
 > Implementation of my Master's thesis: ***Feature-Driven Bias Detection: An Association Rule Mining Approach to Analyze Feature Importance***
 >
 > University of Naples "Parthenope" — CI&SS Lab · Defended April 23, 2026 · **110/110 Summa Cum Laude**
 >
 > 📄 **Thesis (PDF + LaTeX sources):** [mungowz/master_thesis](https://github.com/mungowz/master_thesis)
-\fi
+-->
 
-This repository contains the complete Python implementation of the methodology described in the thesis: a four-stage command-line pipeline that builds binary-classification datasets from the U.S. Census ACS, computes counterfactual-based global feature importance (**BoCSoR**, adapted to fully categorical data), and mines two-level association rules (macroscopic at the feature-name level, microscopic at the `LABEL=value` level) to produce human-readable explanations of tabular classifiers. The pipeline supports two structurally different classifiers (**CatBoost**, **MLP**) for verifying model-agnosticity, and is validated on five U.S. Census ACS 2024 benchmarks (~1.75M records).
+This repository contains a four-stage command-line pipeline that builds binary-classification datasets from the U.S. Census ACS, computes counterfactual-based global feature importance (**BoCSoR**, adapted to fully categorical data), and mines two-level association rules (macroscopic at the feature-name level, microscopic at the `LABEL=value` level) to produce human-readable explanations of tabular classifiers. The pipeline supports two structurally different classifiers (**CatBoost**, **MLP**) for verifying model-agnosticity, and is validated on five U.S. Census ACS 2024 benchmarks (~1.75M records).
 
 The pipeline predicts whether an individual's annual personal income (`PINCP`) exceeds a configurable threshold and is designed to surface both *actionable* dependencies (modifiable attributes) and *biased* rules involving protected demographic features.
-
+<!--
 ## Citation
 
 If this work is useful for your research, please consider citing both the thesis and the foundational BoCSoR paper:
@@ -41,7 +41,7 @@ If this work is useful for your research, please consider citing both the thesis
 ```
 
 ---
-
+-->
 ## Pipeline overview
 
 All categorical features are decoded from numeric ACS codes to human-readable string labels, and continuous features are discretised into meaningful bands. Occupation codes (`OCCP`) are aggregated into the 23 major groups defined by the
